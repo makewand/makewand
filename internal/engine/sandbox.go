@@ -54,6 +54,12 @@ type ExecPlan struct {
 	// env holds KEY=VALUE settings added to the command's environment. Only
 	// verification's own adaptations of a plan set it.
 	env []string
+	// binds are host paths outside the workspace bound read-only into a
+	// loopback step (the wheelhouse of a pip install's offline build).
+	binds []string
+	// stage is the manifest-only fetch directory of the networked stage of a
+	// split dependency plan (planDependencyStages).
+	stage *fetchStage
 }
 
 // DisplayCommand renders a shell-like command summary for user confirmation.
@@ -222,7 +228,7 @@ func (p *Project) RunVerificationPlan(ctx context.Context, plan ExecPlan) (*Exec
 	}
 	if guardErr := guard.enforce(); guardErr != nil {
 		if err != nil {
-			return result, fmt.Errorf("%w; %v", guardErr, err)
+			return result, fmt.Errorf("%w; %w", guardErr, err)
 		}
 		return result, guardErr
 	}
@@ -240,17 +246,19 @@ func verificationPlanAllowsNetwork(plan ExecPlan) bool {
 	return false
 }
 
-// execVerification runs plan inside the bubblewrap sandbox. It also returns
-// the network the command had, for a dependency install whose registry turns
-// out to be unreachable.
+// execVerification runs plan inside the bubblewrap sandbox. A dependency plan
+// is split into a networked fetch that runs no project code and sees no part
+// of the workspace, and a loopback-only build/install that may run project
+// code (execDependencyPlan); every other step runs loopback-only. It also
+// returns the network the command had, for a dependency install whose
+// registry turns out to be unreachable.
 func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly []string) (*ExecResult, sandboxNetwork, error) {
 	none := sandboxNetwork{kind: sandboxNetworkNone}
-	command, args := plan.Command, plan.Args
-	if err := validateCommandName(command); err != nil {
+	if err := validateCommandName(plan.Command); err != nil {
 		return nil, none, err
 	}
-	if _, ok := restrictedAllowedCommands[command]; !ok {
-		return nil, none, fmt.Errorf("command %q is blocked by execution policy", command)
+	if _, ok := restrictedAllowedCommands[plan.Command]; !ok {
+		return nil, none, fmt.Errorf("command %q is blocked by execution policy", plan.Command)
 	}
 
 	env, err := resolveVerifyExecEnvironment(p.unsafeHostAuth)
@@ -265,58 +273,261 @@ func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly 
 	if err != nil {
 		return nil, none, err
 	}
-	// The sandbox HOME lives inside the writable workspace so dependency
-	// installs can populate tool caches that network-isolated test steps reuse.
-	if err := os.MkdirAll(filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath)), 0o700); err != nil {
-		return nil, none, fmt.Errorf("create sandbox home: %w", err)
+	if err := p.prepareSandboxHome(projectDir); err != nil {
+		return nil, none, err
 	}
 
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(env.bwrapPath, projectDir, command, args, verificationPlanAllowsNetwork(plan), readOnly)
+	if verificationPlanUsesUserNetwork(plan) {
+		return p.execDependencyPlan(ctx, env, projectDir, plan, readOnly)
+	}
+	result, err := p.execLoopbackStep(ctx, env, projectDir, plan, readOnly, false)
+	return result, none, err
+}
+
+// prepareSandboxHome creates the workspace-relative sandbox HOME of the
+// loopback steps and turns Go telemetry off there.
+func (p *Project) prepareSandboxHome(projectDir string) error {
+	home, err := openSandboxHome(projectDir)
 	if err != nil {
-		return nil, none, fmt.Errorf("verification sandbox: %w", err)
+		return err
 	}
-	if acceptancePolicy(ctx) != nil {
-		// Local diagnostics must not introduce undeclared cache files into the
-		// execution tree later sealed by independent acceptance.
-		settings := []string{"--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv", "PYTHONPYCACHEPREFIX", "/tmp/makewand-bytecode", "--setenv", "PYTEST_ADDOPTS", "-p no:cacheprovider", "--setenv", "CARGO_TARGET_DIR", filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), "cargo-target")}
-		wrappedArgs = insertBeforeCommand(wrappedArgs, len(args), settings...)
+	defer home.Close()
+	return disableGoTelemetry(home)
+}
+
+// openSandboxHome creates the sandbox HOME inside the workspace and returns
+// an os.Root handle of it, through which every host-side write into it goes.
+// A loopback step (running project code) can write anywhere in the
+// workspace, so .makewand or sandbox-home may have been replaced with a
+// symlink: each component is created and opened through handles confined to
+// the directory above it, and a symlink is refused rather than followed. The
+// handle is never traded for a path that would be reopened.
+func openSandboxHome(projectDir string) (*os.Root, error) {
+	dir, err := os.OpenRoot(projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("create sandbox home: %w", err)
 	}
-	for _, setting := range plan.env {
-		if key, value, ok := strings.Cut(setting, "="); ok {
-			wrappedArgs = insertBeforeCommand(wrappedArgs, len(args), "--setenv", key, value)
+	for _, name := range strings.Split(sandboxHomeRelPath, "/") {
+		if err := mkdirNoSymlink(dir, name, 0o700); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("create sandbox home: %w", err)
+		}
+		next, err := openDirNoSymlink(dir, name)
+		_ = dir.Close()
+		if err != nil {
+			return nil, fmt.Errorf("create sandbox home: %w", err)
+		}
+		dir = next
+	}
+	return dir, nil
+}
+
+// openDirNoSymlink opens the directory name directly below root as a root of
+// its own. A symlink there is refused, and so is a directory replaced between
+// the check and the open.
+func openDirNoSymlink(root *os.Root, name string) (*os.Root, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("refusing to use %s: it is not a directory", name)
+	}
+	sub, err := root.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := sub.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		_ = sub.Close()
+		return nil, fmt.Errorf("refusing to use %s: it changed while makewand opened it", name)
+	}
+	return sub, nil
+}
+
+// disableGoTelemetry writes the mode file `go telemetry off` writes (verified
+// against go1.27) into a sandbox HOME, through its os.Root handle. In its
+// default "local" mode a sandboxed go command collects counters and can spawn
+// an upload child that writes under <home>/.config/go/telemetry after the
+// step returns; such a late write races t.TempDir's RemoveAll and reddens
+// otherwise-green runs. "off" stops the collection, so no telemetry or
+// upload.token files are ever created. A .config/go/telemetry component a
+// loopback step replaced with a symlink is refused rather than followed.
+func disableGoTelemetry(home *os.Root) error {
+	dir := home
+	for _, name := range []string{".config", "go", "telemetry"} {
+		if err := mkdirNoSymlink(dir, name, 0o700); err != nil {
+			return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+		}
+		next, err := openDirNoSymlink(dir, name)
+		if dir != home {
+			_ = dir.Close()
+		}
+		if err != nil {
+			return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+		}
+		dir = next
+	}
+	defer dir.Close()
+	if info, err := dir.Lstat("mode"); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("disable go telemetry for the sandbox: refusing to write mode: it is not a regular file")
+	}
+	f, err := dir.OpenFile("mode", os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, "off\n"); err != nil {
+		return fmt.Errorf("disable go telemetry for the sandbox: %w", err)
+	}
+	return nil
+}
+
+// pipBuildSystemRequires returns the build-system requirements pip installs
+// into an isolated build environment for the local project in dir: the
+// pyproject.toml [build-system] requires, or the PEP 518 default
+// (setuptools and wheel) when a pyproject.toml has no [build-system] table or
+// the project builds from a setup.py. The offline install needs these wheels
+// in the wheelhouse to build the project without the network.
+func (p *Project) pipBuildSystemRequires(dir string) []string {
+	if content, err := p.ReadFile(filepath.Join(dir, "pyproject.toml")); err == nil {
+		doc := parseTOML(content)
+		if value, ok := doc.value("build-system", "requires"); ok {
+			return tomlStrings(value)
+		}
+		if doc.hasTable("build-system") {
+			return nil // pip reports a [build-system] without requires during the build
+		}
+		return []string{"setuptools>=40.8.0", "wheel"}
+	}
+	if _, err := p.ReadFile(filepath.Join(dir, "setup.py")); err == nil {
+		return []string{"setuptools>=40.8.0", "wheel"}
+	}
+	return nil
+}
+
+// pipOfflineInstallArgs turns a `pip install` command line into one that
+// installs from the wheelhouse only, keeping its other arguments (--user,
+// -e ., -r, --use-pep517). Build isolation then takes its build requirements
+// from the wheelhouse too.
+func pipOfflineInstallArgs(origArgs []string, wheelhouse string) []string {
+	out := make([]string, 0, len(origArgs)+3)
+	out = append(out, origArgs[0]) // "install"
+	out = append(out, "--no-index", "--find-links", wheelhouse)
+	return append(out, origArgs[1:]...)
+}
+
+// ensureArg appends flag to args unless it is already present.
+func ensureArg(args []string, flag string) []string {
+	if slices.Contains(args, flag) {
+		return args
+	}
+	return append(slices.Clone(args), flag)
+}
+
+// dependencyOutageSuspected reports whether a failed dependency step printed a
+// package manager diagnostic that a registry could not be reached. It only
+// raises the suspicion; RunVerificationPlan's own connectivity check decides
+// the verdict.
+func (p *Project) dependencyOutageSuspected(plan ExecPlan, result *ExecResult) bool {
+	return p.registryFailureEvidence(plan, result) != ""
+}
+
+// unfetchableDependency reports, for a failed pip step, that a required
+// distribution could not be obtained as a wheel: the networked fetch downloads
+// wheels only so no project code runs with the network, and the offline
+// install reads only what was fetched. A source-only (sdist) distribution, or
+// one pip would build from a repository, therefore cannot be installed. It is
+// an environment limitation of fetch-only networking, not the candidate's
+// failure. "" when no such distribution is reported.
+func (p *Project) unfetchableDependency(plan ExecPlan, result *ExecResult) string {
+	if plan.Command != "pip" && plan.Command != "pip3" {
+		return ""
+	}
+	if name := pipMissingDistribution(result); name != "" {
+		return "no installable wheel for " + name + "; makewand downloads wheels only so no project code runs while the network is available, so a source-only or repository-built dependency cannot be installed - provide it as a wheel or install the project's dependencies outside makewand"
+	}
+	return ""
+}
+
+// pipUnfetchedRemoteTarget returns the first requirement a pip install plan
+// declares that only a download from a location the project names could
+// provide (pipRemoteReference), with where it is declared: on the command
+// line, in a requirement file, or in the [project] dependencies, the
+// optional-dependency groups its extras select or the [build-system] requires
+// of an isolated build of a local project it builds. The networked fetch never
+// gets such a reference (pip may build it to read its metadata), so the
+// offline install cannot obtain it. It reads only what the project declares,
+// never output, and evaluates a reference's environment marker for the fetch's
+// interpreter first: a reference whose marker does not hold, or cannot be
+// evaluated, is not counted, so it never earns the environment verdict unless
+// it certainly applies. "" when there is none.
+func (p *Project) pipUnfetchedRemoteTarget(plan ExecPlan) string {
+	if plan.Command != "pip" && plan.Command != "pip3" {
+		return ""
+	}
+	install, ok := p.parsePipInstall(plan.Args)
+	if !ok {
+		return ""
+	}
+	var env pipMarkerEnv
+	loaded := false
+	applies := func(text string) bool {
+		if !strings.Contains(text, ";") {
+			return true
+		}
+		if !loaded {
+			if projectDir, err := p.execWorkingDir(); err == nil {
+				env = pipMarkerEnvironment(pipFetchInterpreter(projectDir, plan.Command))
+			}
+			loaded = true
+		}
+		holds, known := pipRequirementApplies(text, env)
+		return known && holds
+	}
+	for _, target := range install.remoteTargets {
+		if applies(target.requirement) {
+			return target.display + " (" + target.source + ")"
 		}
 	}
-	if command == "go" {
-		// The sandbox pins GOTOOLCHAIN=local; report an unsatisfiable go.mod
-		// requirement as an environment problem instead of letting it surface
-		// as a failed (candidate-attributed) test run.
-		if err := checkSandboxGoToolchain(projectDir, verifyHomeLayout(projectDir, sandboxPathEnv()).goVersion); err != nil {
-			return nil, none, err
+	for _, project := range install.projects {
+		texts, manifest := p.pipStaticDependencyTexts(project.dir)
+		for _, text := range texts {
+			if pipRemoteReference(text) && applies(text) {
+				return text + " (dependencies in " + manifest + ")"
+			}
+		}
+		optional, _, err := p.pipOptionalDependencyTexts(project)
+		if err != nil {
+			return ""
+		}
+		for _, text := range optional {
+			if pipRemoteReference(text) && applies(text) {
+				return text + " (optional dependencies in " + manifest + ")"
+			}
+		}
+		if install.noIsolation {
+			continue // pip installs no build requirements then
+		}
+		for _, text := range p.pipBuildSystemRequires(project.dir) {
+			if pipRemoteReference(text) && applies(text) {
+				return text + " (build requirement for " + manifest + ")"
+			}
 		}
 	}
-	if !verificationPlanUsesUserNetwork(plan) {
-		result, err := p.execSandboxed(ctx, wrappedCmd, wrappedArgs, nil)
-		return result, none, err
+	return ""
+}
+
+// pipMissingDistribution returns the first requirement pip reported it could
+// not find a distribution for, from pip's own lines (a build backend's relayed
+// output cannot forge it). "".
+func pipMissingDistribution(result *ExecResult) string {
+	for _, line := range pipOwnLines(result) {
+		if m := pipMissingDistRe.FindStringSubmatch(line); m != nil {
+			return m[1]
+		}
 	}
-	offlineArgs := insertBeforeCommand(wrappedArgs, len(args), offlineDependencySettings()...)
-	userNet, network := prepareUserNetwork(wrappedArgs)
-	if userNet == nil {
-		result, err := p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
-		return result, network, err
-	}
-	defer userNet.release()
-	result, err := p.execSandboxed(ctx, wrappedCmd, insertBeforeCommand(wrappedArgs, len(args), userNet.bwrapArgs()...), userNet)
-	if err != nil || userNet.attached {
-		return result, network, err
-	}
-	// The helper is installed but could not be attached, so the sandbox was
-	// stopped instead of running the install without the network it was
-	// meant to have (execWithPolicyLaunch). Run the step again the way an
-	// install without the helper runs: an install that needs no download
-	// still succeeds, and one that does fails fast and reports the stage that
-	// could not be set up instead of advice to install the helper.
-	result, err = p.execSandboxed(ctx, wrappedCmd, offlineArgs, nil)
-	return result, userNet.network(), err
+	return ""
 }
 
 // execSandboxed launches a wrapped verification command (see
@@ -324,7 +535,7 @@ func (p *Project) execVerification(ctx context.Context, plan ExecPlan, readOnly 
 // an error.
 func (p *Project) execSandboxed(ctx context.Context, wrappedCmd string, wrappedArgs []string, userNet *userNetLaunch) (*ExecResult, error) {
 	result, err := p.execWithPolicyLaunch(ctx, wrappedCmd, wrappedArgs, isolatedExecPolicy(), userNet)
-	if err == nil && isBwrapSetupFailure(result) {
+	if isBwrapSetupFailure(result) {
 		// bubblewrap itself failed before the command started; this is a
 		// sandbox/environment problem, not a failing project command, so it
 		// must not reach auto-fix or quality statistics as a test failure.
@@ -384,13 +595,21 @@ func (p *Project) dependencyRegistryError(ctx context.Context, env verifyExecEnv
 		return fmt.Errorf("%w (%s): %s", ErrDependencyNetworkUnavailable, evidence, guidance)
 	}
 	const ownFailure = ", so this is reported as a failure of the install itself"
+	if network.prefetched {
+		// The loopback build/install stage of a split plan: its dependencies
+		// were prefetched into the wheelhouse, so it reached no registry. Its
+		// output cannot reclassify it (a build backend can print pip's lines),
+		// and offlineRegistryNeed is stale (declared deps are prefetched), so
+		// the failure stays the candidate's.
+		return registryOutageNote + "the dependencies were prefetched and the build installed from them offline" + ownFailure, nil
+	}
 	if network.kind == sandboxNetworkNone {
 		if p.offlineRegistryNeed(plan, evidence) == "" {
 			return registryOutageNote + "the install ran without outbound network and makewand found nothing it had to download from a package registry" + ownFailure, nil
 		}
 		return "", unavailable(network.guidance())
 	}
-	check := checkRegistry(ctx, env, plan.Command)
+	check := checkRegistry(ctx, env, plan.Command, p.Path)
 	switch {
 	case check.done && len(check.unreachable) > 0:
 		return "", unavailable(network.unreachableGuidance(check.unreachable))
@@ -520,6 +739,10 @@ var (
 	// pipNoDistributionRe matches pip's verdict for a requirement whose index
 	// page offered no usable version.
 	pipNoDistributionRe = regexp.MustCompile(`^ERROR: (?:Could not find a version that satisfies the requirement|No matching distribution found for) `)
+	// pipMissingDistRe captures the requirement pip could not find a
+	// distribution for (under --only-binary, a source-only distribution reads
+	// as none available).
+	pipMissingDistRe = regexp.MustCompile(`^ERROR: (?:Could not find a version that satisfies the requirement|No matching distribution found for) (\S+)`)
 	// pipSubprocessHeaderRe matches the header of a subprocess failure box.
 	pipSubprocessHeaderRe = regexp.MustCompile(`^× (.+) did not run successfully\.$`)
 	// pipOwnSubprocessRe matches the subprocesses that are pip itself
@@ -729,7 +952,7 @@ type goModFile struct {
 	Go      string
 	Require []goModVersion
 	Exclude []goModVersion
-	Replace []struct{ Old, New goModVersion }
+	Replace []goModReplacement
 	Tool    []struct{ Path string }
 	Ignore  []struct{ Path string }
 }
@@ -738,6 +961,13 @@ type goModFile struct {
 // without a version is a local directory.
 type goModVersion struct {
 	Path, Version string
+}
+
+type goModReplacement = struct{ Old, New goModVersion }
+
+type goWorkFile struct {
+	Use     []struct{ DiskPath string }
+	Replace []goModReplacement
 }
 
 // goModParse parses go.mod content with the host go toolchain goBin (the one
@@ -749,7 +979,7 @@ var goModParse = parseGoModWithGoCommand
 // the workspace: a copy of the file is parsed from the root directory with
 // GOTOOLCHAIN=local, so the file can neither switch toolchains nor make the
 // go command fetch anything (go mod edit resolves no version).
-func parseGoModWithGoCommand(goBin string, data []byte) (*goModFile, error) {
+func parseGoModWithGoCommand(goBin, pathEnv string, data []byte) (*goModFile, error) {
 	dir, err := os.MkdirTemp("", "makewand-gomod-*")
 	if err != nil {
 		return nil, err
@@ -764,7 +994,7 @@ func parseGoModWithGoCommand(goBin string, data []byte) (*goModFile, error) {
 	//nolint:gosec // G204: goBin is the host toolchain resolved from the sandbox PATH; fixed argv, no shell.
 	cmd := exec.CommandContext(ctx, goBin, "mod", "edit", "-json", file)
 	cmd.Dir = string(filepath.Separator)
-	cmd.Env = append(os.Environ(), "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("go mod edit: %w", err)
@@ -774,6 +1004,36 @@ func parseGoModWithGoCommand(goBin string, data []byte) (*goModFile, error) {
 		return nil, fmt.Errorf("parse go mod edit output: %w", err)
 	}
 	return &mod, nil
+}
+
+// parseGoWorkWithGoCommand reads use and replace directives using the same
+// trusted tool/PATH and offline, out-of-workspace parsing as go.mod. Work
+// edit resolves no versions and cannot switch toolchains or run project code.
+func parseGoWorkWithGoCommand(goBin, pathEnv string, data []byte) (*goWorkFile, error) {
+	dir, err := os.MkdirTemp("", "makewand-gowork-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	file := filepath.Join(dir, "go.work")
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	//nolint:gosec // G204: validated host toolchain/PATH, fixed edit-only argv, no shell.
+	cmd := exec.CommandContext(ctx, goBin, "work", "edit", "-json", file)
+	cmd.Dir = string(filepath.Separator)
+	cmd.Env = append(os.Environ(), "PATH="+pathEnv, "GOTOOLCHAIN=local", "GOFLAGS=", "GOWORK=off")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go work edit: %w", err)
+	}
+	var work goWorkFile
+	if err := json.Unmarshal(out, &work); err != nil {
+		return nil, fmt.Errorf("parse go work edit output: %w", err)
+	}
+	return &work, nil
 }
 
 // goRegistryNeed returns a module that the go plan - `go mod tidy`, or `go
@@ -827,15 +1087,16 @@ func (p *Project) goRegistryNeed(plan ExecPlan) string {
 	if err != nil {
 		return ""
 	}
-	goBin := lookPathIn("go", sandboxPathEnv())
-	if goBin == "" {
+	pathEnv := fetchPathEnv(projectDir)
+	goBin := trustedToolPath("go", projectDir, pathEnv)
+	if !filepath.IsAbs(goBin) {
 		return ""
 	}
-	mod, err := goModParse(goBin, []byte(data))
+	mod, err := goModParse(goBin, pathEnv, []byte(data))
 	if err != nil || !goImportPathOK(mod.Module.Path) {
 		return ""
 	}
-	hostEnv, err := sandboxGoEnvProbe(goBin)
+	hostEnv, err := sandboxGoEnvProbe(goBin, pathEnv)
 	if err != nil {
 		hostEnv = hostGoEnv{} // the sandbox then leaves the go command its defaults
 	}
@@ -1004,6 +1265,12 @@ func newGoOfflineFacts(projectDir string, hostEnv hostGoEnv, sum string) *goOffl
 		noSumDB:      goNoSumDBPatterns(hostEnv),
 	}
 	f.caches = []string{f.sandboxCache}
+	// The module cache the networked fetches fill is the first local GOPROXY
+	// entry of every loopback step (loopbackFetchCache).
+	if area, err := openDepFetchArea(projectDir); err == nil {
+		f.caches = append(f.caches, filepath.Join(area.cacheDir(fetchCacheGo), "cache", "download"))
+		area.close()
+	}
 	_, hostCache := sandboxGoProxy(hostEnv)
 	if hostCache != "" {
 		f.caches = append(f.caches, hostCache)
@@ -1541,6 +1808,47 @@ func goModTokens(text string, add func(string)) {
 // npmPackageNameRe matches a valid npm package name, scoped or not.
 var npmPackageNameRe = regexp.MustCompile(`^(?:@[A-Za-z0-9][A-Za-z0-9._~-]*/)?[A-Za-z0-9][A-Za-z0-9._~-]*$`)
 
+// networkFetchUnavailable returns, for a dependency plan whose networked fetch
+// would otherwise run project code (or fetch a dependency it cannot get from a
+// registry), why that cannot be done under fetch-only networking, or "". npm
+// is affected by its command line and what the project depends on
+// (npmFetchUnavailable), cargo by the rustup toolchain the workspace selects
+// (cargoFetchToolchain), go by its subcommand (the fetch directory holds no
+// source); pnpm and yarn, which makewand's dependency plans never run, are
+// refused outright. pip is split so the networked stage builds nothing.
+// It applies only when outbound network is actually available: without the
+// user-mode network helper the fetch runs loopback, so code it runs cannot
+// exfiltrate and the offline classifier (offlineRegistryNeed) decides instead,
+// as it did before this change.
+func (p *Project) networkFetchUnavailable(plan ExecPlan) string {
+	if _, err := userNetLookPath(userNetHelperName); err != nil {
+		return "" // no outbound network: the fetch runs loopback, nothing to refuse
+	}
+	switch plan.Command {
+	case "npm":
+		return p.npmFetchUnavailable(plan)
+	case "pnpm", "yarn":
+		return "makewand fetches JavaScript dependencies with the network only through npm, whose fetch it has checked to run no project code, and never runs " + plan.Command + " as a dependency step; install the project's dependencies outside makewand"
+	case "cargo":
+		projectDir, err := p.execWorkingDir()
+		if err != nil {
+			return ""
+		}
+		_, refusal := p.cargoFetchToolchain(projectDir)
+		return refusal
+	case "go":
+		// The networked go fetch sees only go.mod, go.sum and import stubs, so it
+		// runs only the subcommands that need nothing else.
+		if len(plan.Args) < 2 || plan.Args[0] != "mod" || (plan.Args[1] != "download" && plan.Args[1] != "tidy") {
+			return "makewand runs only `go mod download` or `go mod tidy` as a networked go dependency fetch, which sees the module files and no source; install the project's dependencies outside makewand"
+		}
+	case "pip", "pip3":
+	default:
+		return "makewand runs only npm, pip, go or cargo as a networked dependency fetch, and never runs " + plan.Command + " as a dependency step; install the project's dependencies outside makewand"
+	}
+	return ""
+}
+
 // npmRegistryNeed returns a registry dependency that package.json declares and
 // node_modules does not hold, or "". devDependencies count unless an .npmrc
 // may leave them out; optional and peer dependencies never count (a failed
@@ -1619,8 +1927,29 @@ func (p *Project) npmMayOmitDevDependencies() bool {
 type pipInstall struct {
 	// requirements are the named requirements, resolved from the index.
 	requirements []pipRequirement
-	// projects are the local project directories it builds (project-relative).
-	projects []string
+	// downloadReqs is the text of every named index requirement (command line
+	// and readable requirement files), markers kept, for the networked
+	// `pip download`. A buildable target is never recorded here.
+	downloadReqs []string
+	// sources are the package sources the command line and the requirement
+	// files name (pipFetchSourceArgs adds pip configuration).
+	sources pipSourceOptions
+	// constraintPins are the named version pins of the install's constraint
+	// files (-c, nested ones included), for a sanitised constraints file the
+	// fetch resolves against, so the fetch and the offline install pick the
+	// same versions. A buildable constraint target is never recorded.
+	constraintPins []string
+	// remoteTargets are the command-line and requirement-file targets only a
+	// download from a location the project names could provide
+	// (pipRemoteReference), each with where it is declared. The networked
+	// fetch never gets them, so the offline install cannot obtain them.
+	remoteTargets []pipDeclared
+	// projects are the local projects it builds.
+	projects []pipLocalProject
+	// wheels are the local .whl targets it installs (project-relative) with the
+	// extras each selects. A wheel runs no code when installed, but its
+	// Requires-Dist must be fetched so the offline install can resolve them.
+	wheels []pipLocalProject
 	// localCode is set when it builds a local project or source archive, or
 	// reads requirements makewand cannot see: project code may run then.
 	localCode bool
@@ -1630,14 +1959,51 @@ type pipInstall struct {
 	noIsolation  bool // --no-build-isolation
 	pep517       bool // --use-pep517
 	noPEP517     bool // --no-use-pep517
-	// read holds the requirement files read so far.
+	// refusal explains why an input requirement or constraint file could not
+	// be inspected within regular-file and nesting limits.
+	refusal string
+	// read holds the requirement and constraint files read so far.
 	read map[string]bool
+}
+
+// pipDeclared is a requirement as declared: how a message shows it, the
+// requirement text whose marker decides whether it applies, and where it is
+// declared.
+type pipDeclared struct {
+	display, requirement, source string
+}
+
+// pipSourceOptions are the package source options of a pip install: its
+// index, extra indexes, trusted hosts, find-links locations (each with the
+// directory a relative local one resolves against) and --no-index. index and
+// extra may hold any URL or path; pipFetchSourceArgs decides what the fetch
+// can be given.
+type pipSourceOptions struct {
+	index     string
+	extra     []string
+	trusted   []string
+	findLinks []pipFindLinks
+	noIndex   bool
+}
+
+// pipFindLinks is a find-links location and the directory a relative local
+// path resolves against first (a requirement file's directory).
+type pipFindLinks struct {
+	value, base string
 }
 
 // pipRequirement is a named requirement: its normalized project name, the
 // requirement as written, and where it is declared.
 type pipRequirement struct {
 	name, text, source string
+}
+
+// pipLocalProject is a local project directory a pip install builds
+// (project-relative) and the extras it selects, normalized: `.[dev]`,
+// `-e ./sub[a,b]`.
+type pipLocalProject struct {
+	dir    string
+	extras []string
 }
 
 // pipOptionsWithValue are the pip install options that take a value.
@@ -1665,6 +2031,14 @@ var (
 	// pipRequirementRe matches a requirement (PEP 508): the project name, then
 	// extras, a version specifier, a direct reference or markers.
 	pipRequirementRe = regexp.MustCompile(`^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(.*)$`)
+	// pipNamedReqRe matches a requirement that resolves purely from a package
+	// index - a PEP 503 name, optional extras, optional version specifiers -
+	// and nothing else (no URL scheme, VCS prefix, file:, path or direct
+	// reference). The environment marker is split off before matching.
+	pipNamedReqRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?` + // name
+		`(?:\s*\[\s*[A-Za-z0-9](?:[A-Za-z0-9._,\s-]*[A-Za-z0-9])?\s*\])?` + // extras
+		`(?:\s*(?:===|==|!=|~=|<=|>=|<|>)\s*[A-Za-z0-9][A-Za-z0-9.*+!_-]*\s*,?)*` + // version specifiers
+		`\s*$`)
 	// pipDirectReferenceRe matches a requirement with a direct reference
 	// (name @ url).
 	pipDirectReferenceRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\s*(?:\[[^\]]*\])?\s*@`)
@@ -1691,14 +2065,19 @@ func (p *Project) pipRegistryNeed(plan ExecPlan, evidence string) string {
 	case install.otherSources || p.pipConfigMayAvoidIndex():
 		return ""
 	}
-	for _, dir := range install.projects {
-		if need := p.pipBuildRequirementNeed(install, dir); need != "" {
+	for _, project := range install.projects {
+		if need := p.pipBuildRequirementNeed(install, project.dir); need != "" {
 			return need
 		}
 	}
 	requirements := install.requirements
-	for _, dir := range install.projects {
-		requirements = append(requirements, p.pipStaticDependencies(dir)...)
+	for _, project := range install.projects {
+		requirements = append(requirements, p.pipStaticDependencies(project.dir)...)
+		optional, manifest, err := p.pipOptionalDependencyTexts(project)
+		if err != nil {
+			return ""
+		}
+		requirements = append(requirements, pipRequirementsOf(optional, "optional dependencies in "+manifest)...)
 	}
 	if len(requirements) == 0 {
 		return ""
@@ -1745,15 +2124,36 @@ func (p *Project) addPipArguments(install *pipInstall, args []string, source, di
 				value = filepath.Join(dir, value)
 			}
 			p.addPipRequirementsFile(install, value, depth+1)
+		case "-c", "--constraint":
+			if !filepath.IsAbs(value) {
+				value = filepath.Join(dir, value)
+			}
+			p.addPipConstraintsFile(install, value, depth+1)
 		case "-e", "--editable":
 			if !strings.Contains(value, "://") && !pipVCSRe.MatchString(value) {
 				p.addPipLocal(install, value)
+			} else if pipRemoteReference(value) {
+				install.remoteTargets = append(install.remoteTargets, pipDeclared{display: "-e " + value, requirement: value, source: source})
 			}
-		case "--no-index", "-f", "--find-links":
+		case "--no-index":
 			install.otherSources = true
-		case "-i", "--index-url", "--extra-index-url":
-			if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
+			install.sources.noIndex = true
+		case "-f", "--find-links":
+			install.otherSources = true
+			install.sources.findLinks = append(install.sources.findLinks, pipFindLinks{value: value, base: dir})
+		case "-i", "--index-url":
+			if !pipHTTPURL(value) {
 				install.otherSources = true
+			}
+			install.sources.index = value
+		case "--extra-index-url":
+			if !pipHTTPURL(value) {
+				install.otherSources = true
+			}
+			install.sources.extra = append(install.sources.extra, value)
+		case "--trusted-host":
+			if pipTrustedHost(value) {
+				install.sources.trusted = append(install.sources.trusted, value)
 			}
 		case "--no-build-isolation":
 			install.noIsolation = true
@@ -1770,16 +2170,20 @@ func (p *Project) addPipArguments(install *pipInstall, args []string, source, di
 // hold anything.
 func (p *Project) addPipRequirementsFile(install *pipInstall, file string, depth int) {
 	file = filepath.Clean(file)
-	if install.read[file] {
+	key := "r:" + file
+	if install.read[key] {
 		return
 	}
 	if install.read == nil {
 		install.read = map[string]bool{}
 	}
-	install.read[file] = true
+	install.read[key] = true
 	content, err := p.ReadFile(file)
 	if err != nil || depth > 8 {
 		install.localCode = true
+		if install.refusal == "" {
+			install.refusal = "makewand cannot inspect the pip requirement file " + truncateForNote(file) + " within its regular-file and nesting limits; refusing the networked fetch rather than downloading with incomplete package sources or requirements"
+		}
 		return
 	}
 	for _, line := range pipRequirementLines(content) {
@@ -1792,6 +2196,66 @@ func (p *Project) addPipRequirementsFile(install *pipInstall, file string, depth
 		}
 		p.addPipTarget(install, line, file)
 	}
+}
+
+// addPipConstraintsFile reads a constraint file (-c) of the project and
+// records its named version pins for the sanitised constraints file the
+// networked fetch resolves against. A constraint file may name a buildable
+// target (a path, URL or VCS reference) too; those are never recorded, so the
+// fetch never builds one. Like pip it follows a nested -c (constraints) and -r
+// (requirements, as pip reads a -r inside a constraints file) and honours the
+// index options a constraint file sets, up to the same depth as requirement
+// files. A file makewand cannot read refuses the networked fetch.
+func (p *Project) addPipConstraintsFile(install *pipInstall, file string, depth int) {
+	file = filepath.Clean(file)
+	key := "c:" + file
+	if install.read[key] {
+		return
+	}
+	if install.read == nil {
+		install.read = map[string]bool{}
+	}
+	install.read[key] = true
+	content, err := p.ReadFile(file)
+	if err != nil || depth > 8 {
+		if install.refusal == "" {
+			install.refusal = "makewand cannot inspect the pip constraint file " + truncateForNote(file) + " within its regular-file and nesting limits; refusing the networked fetch rather than downloading with incomplete package sources or constraints"
+		}
+		return
+	}
+	for _, line := range pipRequirementLines(content) {
+		if strings.HasPrefix(line, "-") {
+			if fields := strings.Fields(line); len(fields) > 0 && !pipEditableOption(fields[0]) {
+				p.addPipArguments(install, fields, file, filepath.Dir(file), depth)
+			}
+			continue
+		}
+		if loc := pipTrailingOptionsRe.FindStringIndex(line); loc != nil {
+			line = strings.TrimSpace(line[:loc[0]])
+		}
+		if named, ok := pipNamedRequirementText(line); ok {
+			install.constraintPins = append(install.constraintPins, named)
+		}
+	}
+}
+
+// pipEditableOption reports whether a requirement-file option is -e, which
+// pip refuses in a constraints file.
+func pipEditableOption(option string) bool {
+	return option == "-e" || option == "--editable" || strings.HasPrefix(option, "-e") || strings.HasPrefix(option, "--editable=")
+}
+
+// pipHTTPURL reports whether value is an http(s) URL (the only index source a
+// networked fetch is handed).
+func pipHTTPURL(value string) bool {
+	return strings.HasPrefix(value, "https://") || strings.HasPrefix(value, "http://")
+}
+
+// pipTrustedHost reports whether value is a bare host[:port] (what
+// --trusted-host takes), not a URL or path.
+func pipTrustedHost(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && !strings.Contains(value, "://") && !strings.ContainsAny(value, "/\\@ \t")
 }
 
 // pipRequirementLines returns the logical lines of a requirements file:
@@ -1819,6 +2283,9 @@ func pipRequirementLines(content string) []string {
 // project or archive, or a URL (a download the project names itself, not a
 // registry's).
 func (p *Project) addPipTarget(install *pipInstall, target, source string) {
+	if pipRemoteReference(target) {
+		install.remoteTargets = append(install.remoteTargets, pipDeclared{display: target, requirement: target, source: source})
+	}
 	switch {
 	case strings.HasPrefix(target, "file:"):
 		p.addPipLocal(install, strings.TrimPrefix(strings.TrimPrefix(target, "file:"), "//"))
@@ -1833,6 +2300,9 @@ func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 	case strings.HasPrefix(target, ".") || strings.HasPrefix(target, "~") || strings.ContainsAny(target, "/\\") || pipArchiveRe.MatchString(target):
 		p.addPipLocal(install, target)
 	default:
+		if named, ok := pipNamedRequirementText(target); ok {
+			install.downloadReqs = append(install.downloadReqs, named)
+		}
 		if requirement, ok := parsePipRequirement(target); ok {
 			requirement.source = source
 			install.requirements = append(install.requirements, requirement)
@@ -1840,10 +2310,16 @@ func (p *Project) addPipTarget(install *pipInstall, target, source string) {
 	}
 }
 
-// addPipLocal adds a local project directory or archive. A wheel runs no code
-// when it is installed; anything else does.
+// addPipLocal adds a local project directory or archive, with the extras a
+// trailing [...] selects (`.[dev]`, `./sub[a,b]`, as pip strips them). A wheel
+// runs no code when it is installed (its named Requires-Dist are read
+// statically and fetched, pipDownloadArgs); anything else does.
 func (p *Project) addPipLocal(install *pipInstall, path string) {
+	path, extras := splitPipExtras(path)
 	if strings.HasSuffix(strings.ToLower(path), ".whl") {
+		if rel, ok := p.pipLocalFile(path); ok {
+			install.wheels = append(install.wheels, pipLocalProject{dir: rel, extras: extras})
+		}
 		return
 	}
 	install.localCode = true
@@ -1857,7 +2333,51 @@ func (p *Project) addPipLocal(install *pipInstall, path string) {
 			return
 		}
 	}
-	install.projects = append(install.projects, path)
+	install.projects = append(install.projects, pipLocalProject{dir: path, extras: extras})
+}
+
+// pipLocalFile validates a project-relative path to a regular file (a local
+// wheel) and returns it cleaned. A path outside the project, or not a regular
+// file, is not recorded.
+func (p *Project) pipLocalFile(path string) (string, bool) {
+	path = filepath.Clean(path)
+	full, err := p.validatePath(path, false)
+	if err != nil {
+		return "", false
+	}
+	if info, err := os.Stat(full); err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return path, true
+}
+
+var (
+	// pipExtrasSuffixRe matches the extras suffix pip's _strip_extras splits
+	// off a local project path.
+	pipExtrasSuffixRe = regexp.MustCompile(`^(.+)\[([^\]]+)\]$`)
+	// pipExtraNameRe matches an extra's name (PEP 508).
+	pipExtraNameRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
+)
+
+// splitPipExtras splits a local project path into the path and its extras,
+// normalized (PEP 685).
+func splitPipExtras(path string) (string, []string) {
+	m := pipExtrasSuffixRe.FindStringSubmatch(path)
+	if m == nil {
+		return path, nil
+	}
+	return m[1], pipExtraNames(m[2])
+}
+
+// pipExtraNames returns the valid extras of a comma-separated list, normalized.
+func pipExtraNames(list string) []string {
+	var extras []string
+	for _, extra := range strings.Split(list, ",") {
+		if extra = strings.TrimSpace(extra); pipExtraNameRe.MatchString(extra) {
+			extras = append(extras, normalizePipName(extra))
+		}
+	}
+	return extras
 }
 
 // parsePipRequirement parses a requirement that pip resolves from the index.
@@ -1865,11 +2385,75 @@ func (p *Project) addPipLocal(install *pipInstall, path string) {
 // (name @ url) does not count.
 func parsePipRequirement(text string) (pipRequirement, bool) {
 	text = strings.Join(strings.Fields(text), " ")
+	text = normalizePipRequirementParens(text)
 	m := pipRequirementRe.FindStringSubmatch(text)
 	if m == nil || strings.ContainsAny(m[2], ";@") {
 		return pipRequirement{}, false
 	}
 	return pipRequirement{name: normalizePipName(m[1]), text: text}, true
+}
+
+// pipNamedRequirementText returns the text of a strict PEP 508 named
+// requirement a `pip download` resolves from a package index: a name, optional
+// extras and version specifiers, and an optional environment marker (pip
+// evaluates markers itself and, under --only-binary=:all:, fetches only
+// wheels). It is the only shape the networked fetch may safely be handed.
+//
+// Everything else is rejected, because pip builds it to read its metadata even
+// under --only-binary=:all: - running project code while the network is up
+// (confirmed on pip 24 and 26): a URL scheme, a VCS prefix (git+/hg+/svn+/bzr+),
+// a file:, a path, and a direct reference (name @ url). The part before the
+// marker must match pipNamedReqRe exactly (no ':', '/', '@' or space can
+// smuggle a URL), and any '@' anywhere rejects a direct reference outright.
+func pipNamedRequirementText(text string) (string, bool) {
+	text = strings.Join(strings.Fields(text), " ")
+	text = normalizePipRequirementParens(text)
+	if text == "" || strings.Contains(text, "@") {
+		return "", false
+	}
+	head := text
+	if i := strings.IndexByte(text, ';'); i >= 0 {
+		head = strings.TrimSpace(text[:i]) // the environment marker follows; pip evaluates it
+	}
+	if !pipNamedReqRe.MatchString(head) {
+		return "", false
+	}
+	return text, true
+}
+
+// Parenthesized PEP 508 specifiers are valid in every requirement source.
+// Only the name/specifier head is normalized; strict validation still rejects
+// paths, URLs, direct references and malformed trailing text.
+func normalizePipRequirementParens(text string) string {
+	head, marker, hasMarker := strings.Cut(text, ";")
+	m := pipParenSpecifierRe.FindStringSubmatch(strings.TrimSpace(head))
+	if m == nil {
+		return text
+	}
+	normalized := strings.TrimSpace(m[1]) + strings.TrimSpace(m[2])
+	if hasMarker {
+		normalized += " ; " + strings.TrimSpace(marker)
+	}
+	return normalized
+}
+
+// pipRemoteReference reports whether a requirement is one only a download
+// from a location the project names could provide: a VCS reference or a URL,
+// directly or as a name @ url direct reference, other than a local file: one.
+func pipRemoteReference(text string) bool {
+	text = strings.TrimSpace(text)
+	if pipDirectReferenceRe.MatchString(text) {
+		_, text, _ = strings.Cut(text, "@")
+		text = strings.TrimSpace(text)
+	}
+	vcs := pipVCSRe.MatchString(text)
+	if vcs {
+		_, text, _ = strings.Cut(text, "+")
+	}
+	if strings.HasPrefix(strings.ToLower(text), "file:") {
+		return false
+	}
+	return vcs || strings.Contains(text, "://")
 }
 
 // normalizePipName normalizes a Python project name (PEP 503).
@@ -1917,29 +2501,181 @@ func (p *Project) pipBuildRequirementNeed(install pipInstall, dir string) string
 
 // pipStaticDependencies returns the dependencies the pyproject.toml of the
 // local project in dir declares statically ([project] dependencies that are
-// not dynamic). Those a setup.py computes are unknown.
+// not dynamic) and that certainly apply (no marker). Those a setup.py computes
+// are unknown.
 func (p *Project) pipStaticDependencies(dir string) []pipRequirement {
-	manifest := filepath.Join(dir, "pyproject.toml")
-	content, err := p.ReadFile(manifest)
-	if err != nil {
-		return nil
-	}
-	doc := parseTOML(content)
-	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "dependencies") {
-		return nil
-	}
-	value, ok := doc.value("project", "dependencies")
-	if !ok {
-		return nil
-	}
+	texts, manifest := p.pipStaticDependencyTexts(dir)
+	return pipRequirementsOf(texts, "dependencies in "+manifest)
+}
+
+// pipRequirementsOf parses the requirements among texts that certainly apply
+// (parsePipRequirement), declared in source.
+func pipRequirementsOf(texts []string, source string) []pipRequirement {
 	var requirements []pipRequirement
-	for _, text := range tomlStrings(value) {
+	for _, text := range texts {
 		if requirement, ok := parsePipRequirement(text); ok {
-			requirement.source = "dependencies in " + manifest
+			requirement.source = source
 			requirements = append(requirements, requirement)
 		}
 	}
 	return requirements
+}
+
+// pipStaticDependencyTexts returns the [project] dependencies the
+// pyproject.toml of the local project in dir declares statically, as written,
+// and the manifest's path.
+func (p *Project) pipStaticDependencyTexts(dir string) ([]string, string) {
+	manifest := filepath.Join(dir, "pyproject.toml")
+	content, err := p.ReadFile(manifest)
+	if err != nil {
+		return nil, manifest
+	}
+	doc := parseTOML(content)
+	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "dependencies") {
+		return nil, manifest
+	}
+	value, ok := doc.value("project", "dependencies")
+	if !ok {
+		return nil, manifest
+	}
+	return tomlStrings(value), manifest
+}
+
+// pipOptionalDependencyTexts returns the [project.optional-dependencies]
+// requirements the extras of a local project select in its pyproject.toml, as
+// written, and the manifest's path. A self-reference - the project's own name
+// with extras, such as "proj[test]" - is the local project, not an index
+// requirement: it is never returned, the groups it names are, and its
+// environment marker is joined to theirs. Distinct conditions are retained;
+// ancestor paths stop cycles and bounded expansion refuses excessive graphs.
+// Dynamic optional dependencies, or those a
+// setup.py computes, are unknown.
+func (p *Project) pipOptionalDependencyTexts(project pipLocalProject) ([]string, string, error) {
+	manifest := filepath.Join(project.dir, "pyproject.toml")
+	if len(project.extras) == 0 {
+		return nil, manifest, nil
+	}
+	content, err := p.ReadFile(manifest)
+	if err != nil {
+		return nil, manifest, nil
+	}
+	doc := parseTOML(content)
+	if dynamic, ok := doc.value("project", "dynamic"); ok && slices.Contains(tomlStrings(dynamic), "optional-dependencies") {
+		return nil, manifest, nil
+	}
+	groups := map[string][]string{}
+	for _, entry := range doc.entries {
+		key := entry.key
+		if table := tomlKey(entry.table); table != "" {
+			key = table + "." + key
+		}
+		if group, ok := strings.CutPrefix(key, "project.optional-dependencies."); ok {
+			groups[normalizePipName(group)] = tomlStrings(entry.value)
+		} else if key == "project.optional-dependencies" {
+			for group, value := range tomlInlineTable(entry.value) {
+				groups[normalizePipName(group)] = tomlStrings(value)
+			}
+		}
+	}
+	self := ""
+	if name, ok := doc.value("project", "name"); ok {
+		self = normalizePipName(firstTOMLString(name))
+	}
+
+	type visit struct {
+		group, marker string
+		ancestors     []string
+	}
+	const maxVisits, maxRequirements, maxMarkerBytes = 1024, 16384, 1 << 20
+	limit := &fetchRefusal{reason: "the optional dependencies in " + manifest +
+		" exceed makewand's bounded static expansion; simplify the extras graph or install dependencies outside makewand"}
+	var queue []visit
+	queued := map[string]bool{}
+	markerBytes := 0
+	enqueue := func(v visit) error {
+		// A cycle adds conjunctions and cannot enable anything the earlier,
+		// weaker prefix of this path did not already select.
+		if slices.Contains(v.ancestors, v.group) {
+			return nil
+		}
+		key := v.group + "\x00" + v.marker
+		if queued[key] {
+			return nil
+		}
+		if len(queued) >= maxVisits || len(v.marker) > 64<<10 ||
+			len(key) > maxMarkerBytes-markerBytes {
+			return limit
+		}
+		markerBytes += len(key)
+		queued[key] = true
+		queue = append(queue, v)
+		return nil
+	}
+	for _, extra := range project.extras {
+		if err := enqueue(visit{group: extra}); err != nil {
+			return nil, manifest, err
+		}
+	}
+	unconditional := map[string]bool{}
+	seen := map[string]bool{}
+	var texts []string
+	requirements, textBytes := 0, 0
+	for len(queue) > 0 {
+		v := queue[0]
+		queue = queue[1:]
+		if unconditional[v.group] && v.marker != "" {
+			continue
+		}
+		if v.marker == "" {
+			unconditional[v.group] = true
+		}
+		ancestors := append(slices.Clone(v.ancestors), v.group)
+		for _, text := range groups[v.group] {
+			requirements++
+			if requirements > maxRequirements {
+				return nil, manifest, limit
+			}
+			text = strings.Join(strings.Fields(text), " ")
+			head, marker, _ := strings.Cut(text, ";")
+			if m := pipRequirementRe.FindStringSubmatch(strings.TrimSpace(head)); m != nil &&
+				self != "" && normalizePipName(m[1]) == self {
+				if rest := strings.TrimSpace(m[2]); strings.HasPrefix(rest, "[") {
+					if end := strings.IndexByte(rest, ']'); end > 0 {
+						for _, extra := range pipExtraNames(rest[1:end]) {
+							next := visit{group: extra, marker: pipAndMarkers(v.marker, strings.TrimSpace(marker)), ancestors: ancestors}
+							if err := enqueue(next); err != nil {
+								return nil, manifest, err
+							}
+						}
+					}
+				}
+				continue
+			}
+			if v.marker != "" {
+				text = strings.TrimSpace(head) + " ; " + pipAndMarkers(strings.TrimSpace(marker), v.marker)
+			}
+			if !seen[text] {
+				if len(text) > 64<<10 || len(text) > maxMarkerBytes-textBytes {
+					return nil, manifest, limit
+				}
+				textBytes += len(text)
+				seen[text] = true
+				texts = append(texts, text)
+			}
+		}
+	}
+	return texts, manifest, nil
+}
+
+// pipAndMarkers joins two environment markers with "and" ("" is always true).
+func pipAndMarkers(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return "(" + a + ") and (" + b + ")"
 }
 
 // pipInstalledDistributions returns the normalized names of the distributions
@@ -2032,10 +2768,9 @@ func scriptInterpreter(script, pathEnv string) string {
 	return exe
 }
 
-// pipConfigMayAvoidIndex reports whether a pip configuration file the
-// sandbox's pip reads (site-wide, or in the sandbox HOME) sets no-index,
-// find-links, a local index-url or no-build-isolation.
-func (p *Project) pipConfigMayAvoidIndex() bool {
+// pipConfigContents returns the pip configuration files the sandbox's pip
+// reads: site-wide, and in the sandbox HOME.
+func (p *Project) pipConfigContents() []string {
 	var contents []string
 	for _, file := range []string{"/etc/pip.conf", "/etc/xdg/pip/pip.conf"} {
 		if data, err := os.ReadFile(file); err == nil { //nolint:gosec // G304: fixed pip configuration paths
@@ -2048,24 +2783,39 @@ func (p *Project) pipConfigMayAvoidIndex() bool {
 			contents = append(contents, content)
 		}
 	}
-	for _, content := range contents {
+	return contents
+}
+
+// pipConfigKeyValues calls visit with the normalized key and trimmed value of
+// each `key = value` / `key: value` line of the pip configuration.
+func (p *Project) pipConfigKeyValues(visit func(key, value string)) {
+	for _, content := range p.pipConfigContents() {
 		for _, line := range strings.Split(content, "\n") {
 			i := strings.IndexAny(line, "=:")
 			if i < 0 {
 				continue
 			}
-			value := strings.TrimSpace(line[i+1:])
-			switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(line[:i])), "_", "-") {
-			case "no-index", "find-links", "no-build-isolation":
-				return true
-			case "index-url", "extra-index-url":
-				if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
-					return true
-				}
-			}
+			visit(strings.ReplaceAll(strings.ToLower(strings.TrimSpace(line[:i])), "_", "-"), strings.TrimSpace(line[i+1:]))
 		}
 	}
-	return false
+}
+
+// pipConfigMayAvoidIndex reports whether a pip configuration file the
+// sandbox's pip reads (site-wide, or in the sandbox HOME) sets no-index,
+// find-links, a local index-url or no-build-isolation.
+func (p *Project) pipConfigMayAvoidIndex() bool {
+	avoids := false
+	p.pipConfigKeyValues(func(key, value string) {
+		switch key {
+		case "no-index", "find-links", "no-build-isolation":
+			avoids = true
+		case "index-url", "extra-index-url":
+			if !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "http://") {
+				avoids = true
+			}
+		}
+	})
+	return avoids
 }
 
 // cargoDependency is a dependency a Cargo.toml declares.
@@ -2142,12 +2892,25 @@ func (p *Project) cargoRegistryNeed(plan ExecPlan) string {
 	if err != nil {
 		return ""
 	}
-	cache := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache")
+	// The cargo steps read the shared cargo cache the fetches fill
+	// (loopbackFetchCache), or the sandbox HOME's own without one.
+	caches := []string{filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath), ".cargo", "registry", "cache")}
+	if area, err := openDepFetchArea(projectDir); err == nil {
+		caches = append(caches, filepath.Join(area.cacheDir(fetchCacheCargo), "registry", "cache"))
+		area.close()
+	}
 	for _, pkg := range wanted {
 		if !pkg.fromRegistry() || !cargoCrateFileRe.MatchString(pkg.name) || !cargoCrateFileRe.MatchString(pkg.version) {
 			continue
 		}
-		if matches, _ := filepath.Glob(filepath.Join(cache, "*", pkg.name+"-"+pkg.version+".crate")); len(matches) == 0 {
+		cached := false
+		for _, cache := range caches {
+			if matches, _ := filepath.Glob(filepath.Join(cache, "*", pkg.name+"-"+pkg.version+".crate")); len(matches) > 0 {
+				cached = true
+				break
+			}
+		}
+		if !cached {
 			return pkg.name + " " + pkg.version + " (Cargo.lock; not in the sandbox's cargo cache)"
 		}
 	}
@@ -2829,6 +3592,38 @@ func restrictedExecContext(ctx context.Context) (context.Context, context.Cancel
 	return context.WithTimeout(ctx, RestrictedPlanTimeout)
 }
 
+// commandUnknownOutcomeError wraps an execution failure where the command outcome
+// is unknown (timeout/cancellation, output limit exceeded, WaitDelay expiry, or
+// non-ExitError wait failure). Started records whether the command actually began
+// executing before the failure occurred.
+type commandUnknownOutcomeError struct {
+	Err     error
+	Started bool
+}
+
+func (e *commandUnknownOutcomeError) Error() string {
+	if e == nil || e.Err == nil {
+		return execution.ErrUnknownOutcome.Error()
+	}
+	return fmt.Sprintf("%s: %v", execution.ErrUnknownOutcome, e.Err)
+}
+
+func (e *commandUnknownOutcomeError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *commandUnknownOutcomeError) Is(target error) bool {
+	return target == execution.ErrUnknownOutcome
+}
+
+func isStartedCommandUnknownOutcome(err error) bool {
+	var startedErr *commandUnknownOutcomeError
+	return errors.As(err, &startedErr) && startedErr.Started
+}
+
 func (p *Project) execWithPolicy(ctx context.Context, command string, args []string, policy execPolicy) (*ExecResult, error) {
 	return p.execWithPolicyLaunch(ctx, command, args, policy, nil)
 }
@@ -2905,7 +3700,7 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 	}
 	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
-			return nil, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err))}
+			return nil, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, errors.Join(contextErr, err)), Started: false}
 		}
 		return nil, fmt.Errorf("exec %s: %w", command, err)
 	}
@@ -2950,17 +3745,18 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 		StdoutDroppedBytes: stdoutDropped,
 		StderrDroppedBytes: stderrDropped,
 	}
+	started := userNet == nil || userNet.attached
 	if capture.Exceeded() {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: processjob.OutputLimitError()}
+		return result, &commandUnknownOutcomeError{Err: processjob.OutputLimitError(), Started: started}
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, ctxErr)}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s interrupted: %w", command, ctxErr), Started: started}
 	}
 	if errors.Is(err, exec.ErrWaitDelay) {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("exec %s inherited output pipes did not close: %w", command, err)}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s inherited output pipes did not close: %w", command, err), Started: started}
 	}
 
 	if err != nil {
@@ -2968,7 +3764,8 @@ func (p *Project) execWithPolicyLaunch(ctx context.Context, command string, args
 		if errors.As(err, &exitErr) {
 			result.ExitCode = exitErr.ExitCode()
 		} else {
-			return result, fmt.Errorf("exec %s: %w", command, err)
+			result.ExitCode = -1
+			return result, &commandUnknownOutcomeError{Err: fmt.Errorf("exec %s: %w", command, err), Started: started}
 		}
 	}
 

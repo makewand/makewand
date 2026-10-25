@@ -14,11 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/makewand/makewand/execution"
 	"github.com/makewand/makewand/internal/processjob"
 )
 
@@ -260,48 +260,48 @@ func wrapTrustedAcceptanceCommand(bwrapPath, workspace string, policy *frozenTru
 	return command, wrapped, nil
 }
 
-func (p *Project) runTrustedAcceptance(ctx context.Context, policy *frozenTrustedAcceptance, workspaceDigest, artifactDigest string) (*TrustedAcceptanceRecord, string, bool) {
+func (p *Project) runTrustedAcceptance(ctx context.Context, policy *frozenTrustedAcceptance, workspaceDigest, artifactDigest string) (*TrustedAcceptanceRecord, string, bool, bool) {
 	if policy == nil {
-		return nil, "", false
+		return nil, "", false, false
 	}
 	env, err := resolveVerifyExecEnvironment(UnsafeHostExecAuthorization{})
 	if err != nil || env.mode != verifyExecIsolated {
-		return nil, "trusted acceptance requires working sandbox isolation; host execution cannot grant Strength 2", true
+		return nil, "trusted acceptance requires working sandbox isolation; host execution cannot grant Strength 2", true, false
 	}
 	actualRuntime, runtimeErr := trustedCommandDigest(policy.commandPath)
 	if runtimeErr != nil || actualRuntime != policy.commandDigest {
-		return nil, "trusted acceptance runtime changed before execution", true
+		return nil, "trusted acceptance runtime changed before execution", true, false
 	}
 	if err := os.MkdirAll(filepath.Join(p.Path, filepath.FromSlash(sandboxHomeRelPath)), 0o700); err != nil {
-		return nil, fmt.Sprintf("create trusted acceptance sandbox home: %v", err), true
+		return nil, fmt.Sprintf("create trusted acceptance sandbox home: %v", err), true, false
 	}
 	ctx, cancel := context.WithTimeout(ctx, policy.timeout)
 	defer cancel()
 	for _, test := range policy.spec.Cases {
 		result, err := p.runTrustedAcceptanceCase(ctx, env.bwrapPath, policy, test.Stdin)
 		if err != nil {
-			return nil, fmt.Sprintf("trusted acceptance case %q could not execute: %v", test.Name, err), true
-		}
-		if isBwrapSetupFailure(result) {
-			return nil, fmt.Sprintf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr)), true
+			if isStartedCommandUnknownOutcome(err) {
+				return nil, fmt.Sprintf("trusted acceptance case %q did not complete: %v", test.Name, err), false, true
+			}
+			return nil, fmt.Sprintf("trusted acceptance case %q could not execute: %v", test.Name, err), true, false
 		}
 		if result.StdoutDroppedBytes > 0 || result.StderrDroppedBytes > 0 || len(result.Stdout)+len(result.Stderr) > policy.spec.MaxOutputBytes {
-			return nil, fmt.Sprintf("trusted acceptance case %q exceeded the output limit", test.Name), false
+			return nil, fmt.Sprintf("trusted acceptance case %q exceeded the output limit", test.Name), false, true
 		}
 		if result.ExitCode != test.ExitCode || result.Stdout != test.Stdout || result.Stderr != test.Stderr {
 			// Never echo expected values into logs that a later candidate sees.
-			return nil, fmt.Sprintf("trusted acceptance case %q did not match the required behavior", test.Name), false
+			return nil, fmt.Sprintf("trusted acceptance case %q did not match the required behavior", test.Name), false, false
 		}
 	}
 	actualRuntime, runtimeErr = trustedCommandDigest(policy.commandPath)
 	if runtimeErr != nil || actualRuntime != policy.commandDigest {
-		return nil, "trusted acceptance runtime changed during execution", true
+		return nil, "trusted acceptance runtime changed during execution", true, false
 	}
 	return &TrustedAcceptanceRecord{
 		Schema: 1, Driver: "makewand-stdio-v1", SpecDigest: policy.digest,
 		WorkspaceDigest: workspaceDigest, ArtifactDigest: artifactDigest,
 		CasesPassed: len(policy.spec.Cases), Isolated: true,
-	}, "", false
+	}, "", false, false
 }
 
 func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string, policy *frozenTrustedAcceptance, input string) (*ExecResult, error) {
@@ -309,7 +309,7 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 		return nil, err
 	}
 	if policy.spec.Command == "go" {
-		if err := checkSandboxGoToolchain(p.Path, verifyHomeLayout(p.Path, sandboxPathEnv()).goVersion); err != nil {
+		if err := checkSandboxGoToolchain(p.Path, verifyHomeLayout(p.Path, sandboxPathEnv(), false).goVersion); err != nil {
 			return nil, err
 		}
 	}
@@ -331,16 +331,35 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	if err != nil {
 		return nil, err
 	}
+	statusR, statusW, err := os.Pipe()
+	if err != nil {
+		closeSeccomp()
+		return nil, err
+	}
+	statusFD := 3 + len(cmd.ExtraFiles)
+	cmd.ExtraFiles = append(cmd.ExtraFiles, statusW)
+	cmd.Args = append([]string{command}, insertBeforeCommand(args, len(policy.spec.Args), "--json-status-fd", strconv.Itoa(statusFD))...)
 	started := time.Now()
 	cleanupProcess, err := processjob.StartSandboxed(cmd)
 	closeSeccomp()
+	_ = statusW.Close()
 	if err != nil {
+		_ = statusR.Close()
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, errors.Join(contextErr, err)
 		}
 		return nil, err
 	}
 	defer cleanupProcess()
+	type bwrapStatus struct {
+		started bool
+		exited  bool
+	}
+	statusDone := make(chan bwrapStatus, 1)
+	go func() {
+		childStarted, childExited := readBwrapStatusFD(statusR)
+		statusDone <- bwrapStatus{started: childStarted, exited: childExited}
+	}()
 	done := make(chan struct{})
 	go func() {
 		select {
@@ -354,23 +373,52 @@ func (p *Project) runTrustedAcceptanceCase(ctx context.Context, bwrapPath string
 	// Even a normally exiting leader must not leave writers or descendants
 	// alive. bwrap's PID namespace also reaps candidate descendants on exit.
 	killProcessGroup(cmd)
+	status := <-statusDone
 	stdoutDropped, stderrDropped := capture.DroppedBytes()
 	result := &ExecResult{Stdout: capture.StdoutString(), Stderr: capture.StderrString(), Duration: time.Since(started), StdoutDroppedBytes: stdoutDropped, StderrDroppedBytes: stderrDropped}
 	if capture.Exceeded() {
 		result.ExitCode = -1
-		return result, &execution.UnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes)}
+		return result, &commandUnknownOutcomeError{Err: fmt.Errorf("trusted acceptance output exceeded its combined %d-byte limit", policy.spec.MaxOutputBytes), Started: status.started}
 	}
 	if err := ctx.Err(); err != nil {
-		return result, err
+		result.ExitCode = -1
+		return result, &commandUnknownOutcomeError{Err: err, Started: status.started}
 	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(waitErr, &exitErr) {
-			return result, waitErr
+			result.ExitCode = -1
+			return result, &commandUnknownOutcomeError{Err: waitErr, Started: status.started}
 		}
 		result.ExitCode = exitErr.ExitCode()
 	}
+	if !status.exited && isBwrapSetupFailure(result) {
+		return result, fmt.Errorf("trusted acceptance sandbox could not start: %s", firstLine(result.Stderr))
+	}
 	return result, nil
+}
+
+type bwrapStatusEntry struct {
+	ChildPID int  `json:"child-pid"`
+	ExitCode *int `json:"exit-code"`
+}
+
+func readBwrapStatusFD(r *os.File) (childStarted, childExited bool) {
+	defer func() { _ = r.Close() }()
+	dec := json.NewDecoder(io.LimitReader(r, 4096))
+	for {
+		var entry bwrapStatusEntry
+		if err := dec.Decode(&entry); err != nil {
+			break
+		}
+		if entry.ChildPID > 0 {
+			childStarted = true
+		}
+		if entry.ExitCode != nil {
+			childExited = true
+		}
+	}
+	return childStarted, childExited
 }
 
 func (p *Project) applyTrustedAcceptance(ctx context.Context, report *CandidateVerification, before, baseline string, files []ExtractedFile) {
@@ -400,12 +448,13 @@ func (p *Project) applyTrustedAcceptance(ctx context.Context, report *CandidateV
 		report.AcceptanceError = "local checks changed execution inputs outside the sealed candidate; include those inputs in the candidate and verify again"
 		return
 	}
-	record, failure, environment := p.runTrustedAcceptance(ctx, policy, before, calculateFilesDigest(files))
+	record, failure, environment, incomplete := p.runTrustedAcceptance(ctx, policy, before, calculateFilesDigest(files))
 	if failure != "" {
 		report.Passed = false
 		report.Strength = 0
 		report.AcceptanceError = failure
 		report.EnvironmentError = environment
+		report.ExecutionIncomplete = report.ExecutionIncomplete || incomplete
 		return
 	}
 	if record != nil {

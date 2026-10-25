@@ -1,14 +1,13 @@
 # Package Distribution (Homebrew + Scoop)
 
-> **Status (2026-10-21):** the tap and bucket serve **v3.2.0**, published by
-> the Release workflow on 2026-10-09 (the 3.x tags before it failed in the
-> workflow's `test` job, so v0.1.10 was the previous package). Changes merged
-> since v3.2.0 reach `brew` and `scoop` users with the next release (v3.3.0):
-> among them the Homebrew wrapper that no longer writes the build-time `PATH`
-> into `bin/makewand` (#80) and the sandbox hardening listed under
+> **Status (2026-10-25):** **v3.3.0** ships all security and sandbox protections
+> merged since v3.2.0: among them the Homebrew wrapper that no longer writes the
+> build-time `PATH` into `bin/makewand` (#80), fetch-only dependency networking
+> with workspace isolation (#91), candidate verification attribution for
+> incomplete checks (E2), and the sandbox hardening listed under
 > [Release status in SECURITY.md](../SECURITY.md#release-status--发布状态).
-> Until then, install from source to get them
-> (`curl -fsSL https://makewand.org/install.sh | bash`, needs the go.mod Go toolchain).
+> Source installs remain available via
+> `curl -fsSL https://makewand.org/install.sh | bash` (needs the go.mod Go toolchain).
 
 The release workflow now auto-generates package manifests on every `v*` tag:
 

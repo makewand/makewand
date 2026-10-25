@@ -80,7 +80,7 @@ func wrapPreviewProjectCommand(projectPath, command string, args []string, auth 
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 
-	layout := buildSandboxHomeLayout(previewHome(), projectPath, pathEnv, previewGetenv)
+	layout := buildSandboxHomeLayout(previewHome(), projectPath, pathEnv, previewGetenv, false)
 
 	socketMasks, err := sandboxWorkspaceSocketMasks(projectPath)
 	if err != nil {

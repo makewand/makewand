@@ -595,7 +595,7 @@ func verificationRank(v CandidateVerification) int {
 	switch {
 	case v.Passed:
 		return 2
-	case v.IntegrityError != "":
+	case v.IntegrityError != "" || v.ExecutionIncomplete:
 		return 0
 	case v.EnvironmentError || v.IsolationError != "":
 		return 1
@@ -608,11 +608,14 @@ func verificationRank(v CandidateVerification) int {
 
 // attemptOutranks reports whether a beats b as the fallback candidate: prefer
 // weak verification passes over unverified output and unverified output over
-// failed checks, then higher strength, then the earlier provider in routing
-// order.
+// failed checks, then completed checks over incomplete ones, then higher
+// strength, then the earlier provider in routing order.
 func attemptOutranks(a, b CandidateAttempt) bool {
 	if ra, rb := verificationRank(a.Verification), verificationRank(b.Verification); ra != rb {
 		return ra > rb
+	}
+	if a.Verification.ExecutionIncomplete != b.Verification.ExecutionIncomplete {
+		return !a.Verification.ExecutionIncomplete
 	}
 	if a.Verification.Strength != b.Verification.Strength {
 		return a.Verification.Strength > b.Verification.Strength
@@ -645,7 +648,7 @@ func CandidateAttemptStage(ctx context.Context, attempt CandidateAttempt) Candid
 // nothing about the candidate's quality: there was nothing to verify against
 // (no baseline test plan) or the environment could not run the checks.
 func verificationUnattributable(v CandidateVerification) bool {
-	if v.Passed {
+	if v.Passed || v.ExecutionIncomplete {
 		return false
 	}
 	return (v.NoTestPlan && v.AcceptanceError == "") || v.IsolationError != "" || v.EnvironmentError

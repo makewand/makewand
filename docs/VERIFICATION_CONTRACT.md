@@ -5,7 +5,8 @@
 Candidate verification reports local diagnostic results. It does not treat output
 from candidate-controlled code as an independent acceptance certificate.
 
-- **Strength 0:** a check failed, isolation was unavailable, an expected baseline
+- **Strength 0:** a check failed, timed out or exceeded the output limit after
+  starting (`ExecutionIncomplete`), isolation was unavailable, an expected baseline
   Go test was missing, or verification changed the input files or permissions.
 - **Strength 1:** the local checks completed successfully. Human approval is
   required before applying the candidate, including when baseline tests ran.
@@ -80,11 +81,69 @@ checkpoint restoration restores the prior content and supported permissions.
 On Linux, every verification step uses Bubblewrap with its own network
 namespace. Bubblewrap enables loopback inside it for local test servers; host
 loopback, host abstract sockets and the host default route remain inaccessible.
-Dependency installs, and the `cargo fetch` that runs as a dependency step before
-the checks of a Cargo manifest that declares dependencies, also get outbound-only
-`slirp4netns` networking restricted to public destinations, or run loopback-only
-without it ([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)).
-A failed install is reported as `ErrDependencyNetworkUnavailable`, an environment
+A dependency step is split so only downloading uses the network and no
+project-controlled code runs while a step has it (owner decision, 2026-10-21).
+The fetch — `pip download --only-binary=:all:` of strict PEP 508 **named**
+requirements (never a requirement/constraint file itself, nor a buildable
+`file:`/path/sdist/VCS/URL or `name @ …` target, wherever it is declared), with
+the install's http(s) index options and those of the pip configuration it would
+read (the project's `pip.conf`/`pip.ini`, the sandbox HOME's, site-wide and the
+trusted pip's site file; a configured index is never replaced by PyPI, and an
+unsupported source or unreadable configuration stops the fetch) and a constraints file of named pins
+(nested `-c`/`-r` followed); `npm ci --ignore-scripts` of a registry-only
+lockfile resolved and inspected first, only for `npm ci`/`npm install` without
+package arguments; `cargo fetch` pinned to a named rustup toolchain; `go mod
+download`/`tidy` — runs in a fresh, private fetch directory outside the
+workspace and its sandbox HOME (`$XDG_CACHE_HOME/makewand/dep-fetch`), with the
+workspace path covered by an empty tmpfs. Pip normalizes parenthesized named
+version requirements from every source. Go workspace directives are parsed
+offline with the trusted toolchain; an unparsed workspace runs only in the
+loopback step so it can report its own error without a networked fetch.
+The host copies in, through `os.Root`
+handles and refusing symlinks and non-regular files, only what the fetch reads:
+`package.json` and the lockfile; every `Cargo.toml`/`Cargo.lock` with empty
+stubs at the target paths cargo needs, including inferred example/test/bench
+targets; `go.mod`/`go.sum`/`go.work` (and those of local replacement modules inside
+the workspace, including workspace replacements and their precedence) with,
+for `go mod tidy`,
+import-only stubs of the Go files (build constraints, package clause, import
+paths, no code); the wheels of a local `find-links` directory. The fetch runs
+the package manager resolved on the host outside the workspace (no symlink hop
+or `#!` interpreter inside it), with a `PATH` of directories outside the
+workspace only, gets outbound-only `slirp4netns` networking restricted to public
+destinations, a fresh, empty HOME (`/tmp/makewand-fetch-home`) whose tool
+config-file locations are neutralised (`GIT_CONFIG_GLOBAL=/dev/null`,
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, npm user/global config at two
+distinct, non-existent paths, `PIP_CONFIG_FILE=/dev/null`, `GOENV=off`) and no
+host module cache, and writes only the fetch directory and the shared,
+host-owned caches (`GOMODCACHE` with `cache/vcs`, cargo's `CARGO_HOME`, npm's
+cache), which every later loopback step binds read-only (the go module cache as
+the first local `GOPROXY` entry, `CARGO_HOME` for cargo). The build/install that
+may run project code (`setup.py`, a PEP 517 backend, `build.rs`) then runs
+loopback-only in the workspace from what was fetched (`pip install --no-index
+--find-links <wheelhouse>`, including `-e .`; `cargo build --offline`), and the
+host puts the files the fetch produced that belong in the workspace there through
+the workspace's `os.Root` handle (`go.mod`/`go.sum` after `tidy`, `Cargo.lock`,
+the resolved `package-lock.json`, `node_modules` copied with its links
+recreated, never followed). Every host-side write into a sandbox path (the
+sandbox HOME, its go-telemetry `mode` file, the setuptools `egg_base`
+configuration, the fetch directory) goes through the `os.Root` handle the path
+was checked through, never a path reopened afterwards. Without the network
+tools, or when the network cannot be attached, the plan runs unsplit and
+loopback-only, as installs did before #80
+([policy, overrides and limits](../SECURITY.md#dependency-installs--依赖安装)).
+A failed pip fetch is reported as `ErrDependencyNetworkUnavailable`, an
+environment limitation of fetch-only networking, only when the index the fetch
+used shows releases matching the specifier and none of them offers a wheel the
+interpreter can install (makewand reads the index's PEP 691/503 page from a
+probe with the same user-mode network, running no code, and applies PEP 440); a
+project or version the index lacks, a matching release with a usable wheel, or
+an index without a usable answer is the candidate's failure. So is a failure of
+the loopback build, unless a declared VCS or URL dependency whose environment
+marker holds (evaluated before the build, for the fetch's interpreter) was never
+fetched; a dependency that only surfaces once project code runs, or output the
+build forges, is attributed to the candidate.
+A failed fetch is reported as `ErrDependencyNetworkUnavailable`, an environment
 problem rather than a candidate failure, only when makewand confirms the outage:
 with network, its own connectivity check of the ecosystem's default registry
 (for go, the sandbox's `GOPROXY` and checksum database, walked as the go command
@@ -98,7 +157,8 @@ the failure stays the candidate's and `ExecResult.Note` says why; verification
 appends it to `DepsError` or `QuickCheckError`. After a confirmed outage the TUI
 skips the tests instead of penalising the candidate or starting auto-fix.
 Installs keep the input-integrity check meaningful: npm without a lockfile runs
-with `--no-package-lock`; pip installs of a project with `pyproject.toml` or
+with `--no-package-lock` (the lockfile its networked fetch resolves stays in
+the fetch directory and never reaches the workspace); pip installs of a project with `pyproject.toml` or
 `setup.py` use `--use-pep517` and write `*.egg-info` outside the tree; a Cargo
 project with `Cargo.lock` runs every cargo step with `--locked`, reporting a
 stale lockfile as a candidate failure, and a `Cargo.lock` that cargo generates
@@ -110,6 +170,18 @@ The Go build wizard requires an explicit review approval. Review errors and
 unresolved defects stop acceptance. One available provider performs a separate
 review call rather than bypassing review, and review-generated fixes are reviewed
 again. Passing checks or a review does not assert freedom from all defects.
+
+Once a dependency, build, test, quick-check or trusted-acceptance process has
+started inside its isolated sandbox (and after any `slirp4netns` attachment completes),
+a command timeout (`context.DeadlineExceeded`/`context.Canceled`), `WaitDelay`
+expiry (`exec.ErrWaitDelay`), output-cap overflow (`ErrOutputLimitExceeded`) or
+non-`ExitError` `Wait()` failure is recorded as `ExecutionIncomplete` (Strength 0,
+candidate failure) rather than `EnvironmentError`. Pre-start host or sandbox setup
+failures (missing runtime binary, bubblewrap namespace setup error, pre-exec
+`slirp4netns` attachment failure) remain `EnvironmentError`. Unrecognized caller-supplied
+dependency commands are refused before network access rather than executed unsplit with
+outbound network, and explicitly declared Cargo workspace members or path dependencies
+under dot-prefixed directories are included within the manifest cap.
 
 ## Go candidate resources and workspace copies
 

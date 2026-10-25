@@ -439,6 +439,10 @@ type fakeUserNetEnv struct {
 func installFakeUserNet(t *testing.T, opts fakeUserNetOptions) fakeUserNetEnv {
 	t.Helper()
 	fakeWorkingBwrap(t)
+	// The fake sandbox runs no npm: a networked npm fetch takes npm 12's path,
+	// whose first networked step (the lock resolution) fails or succeeds as
+	// the install did, whatever npm this host has.
+	stubNpmVersion(t, npmNetworkedLockMajor)
 	swapSeccompVars(t, "linux", opts.seccomp, nil)
 	dir := t.TempDir()
 	env := fakeUserNetEnv{
@@ -846,8 +850,38 @@ if host_service:
 print("ok")
 `
 	port := strconv.Itoa(loopback.Addr().(*net.TCPAddr).Port)
-	result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "python3", Args: []string{"-c", script, port, abstractName, hostService}})
+	result, err := runFetchNetworkProbeForTest(t, project, "python3", []string{"-c", script, port, abstractName, hostService})
 	if err != nil || result == nil || result.ExitCode != 0 {
 		t.Fatalf("dependency sandbox network: err=%v result=%+v", err, result)
 	}
+}
+
+func runFetchNetworkProbeForTest(t *testing.T, project *Project, command string, args []string) (*ExecResult, error) {
+	t.Helper()
+	env, err := resolveVerifyExecEnvironment(project.unsafeHostAuth)
+	if err != nil {
+		return nil, err
+	}
+	projectDir, err := project.execWorkingDir()
+	if err != nil {
+		return nil, err
+	}
+	area, err := openDepFetchArea(projectDir)
+	if err != nil {
+		return nil, err
+	}
+	defer area.close()
+	dir, err := area.newFetchDir()
+	if err != nil {
+		return nil, err
+	}
+	defer dir.remove()
+	spec := fetchSpec{
+		workspace: projectDir,
+		dir:       dir.path,
+		cache:     area.cache,
+		pathEnv:   fetchPathEnv(projectDir),
+	}
+	result, _, _, err := project.execFetchCommand(context.Background(), env, spec, fetchToolPath(command, projectDir), args, true)
+	return result, err
 }

@@ -148,15 +148,54 @@ func RestrictedExecIsolationError(auth UnsafeHostExecAuthorization) error {
 // already ignore.
 const sandboxHomeRelPath = ".makewand/sandbox-home"
 
-// wrapVerificationCommand wraps a verification command in bubblewrap. The
-// workspace is the only writable host path; everything else is read-only with
-// tmpfs /tmp, a cleared environment, and the host HOME hidden (only toolchain
-// directories are re-bound read-only, see sandbox_home.go). readOnly lists
-// workspace paths (protected paths such as .git, CI definitions and
-// verification scripts) that are re-bound read-only on top of the writable
-// workspace. When allowNetwork is false the sandbox additionally unshares the
-// network namespace, as it does for every verification step
-// (verificationPlanAllowsNetwork).
+// fetchSandboxHome is the HOME a networked dependency fetch runs with: a fresh,
+// empty directory created on the sandbox tmpfs /tmp. The fetch sees no part
+// of the workspace, the persistent sandbox HOME included (wrapFetchCommand).
+const fetchSandboxHome = "/tmp/makewand-fetch-home"
+
+// networkedFetchHomeArgs returns the bwrap --setenv arguments that keep a
+// networked dependency fetch from reading any tool configuration: HOME is
+// already the fresh fetchSandboxHome; these also pin the XDG base directories
+// inside it and neutralise the config-file locations git, npm, pip and go
+// consult outside HOME:
+//   - GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1: git reads no global
+//     (~/.gitconfig, XDG) or system config, so no credential helper runs;
+//     GIT_TERMINAL_PROMPT=0 keeps it from blocking on a prompt;
+//   - NPM_CONFIG_USERCONFIG and NPM_CONFIG_GLOBALCONFIG at distinct, absent
+//     paths inside the fresh HOME: npm reads no user or global .npmrc. They must
+//     be distinct and must not be /dev/null, which npm rejects as a double-load
+//     ("double-loading config ... as global, previously loaded as user") and as
+//     not a regular file;
+//   - PIP_CONFIG_FILE=/dev/null: pip reads no configuration file (the package
+//     sources pip configuration names are forwarded as options instead,
+//     pipFetchSourceArgs);
+//   - GOENV=off: the go command reads no env file.
+func networkedFetchHomeArgs() []string {
+	return []string{
+		"--setenv", "XDG_CONFIG_HOME", fetchSandboxHome + "/.config",
+		"--setenv", "XDG_CACHE_HOME", fetchSandboxHome + "/.cache",
+		"--setenv", "XDG_DATA_HOME", fetchSandboxHome + "/.local/share",
+		"--setenv", "GIT_CONFIG_GLOBAL", os.DevNull,
+		"--setenv", "GIT_CONFIG_NOSYSTEM", "1",
+		"--setenv", "GIT_TERMINAL_PROMPT", "0",
+		"--setenv", "NPM_CONFIG_USERCONFIG", fetchSandboxHome + "/.npmrc",
+		"--setenv", "NPM_CONFIG_GLOBALCONFIG", fetchSandboxHome + "/.npmrc-global",
+		"--setenv", "PIP_CONFIG_FILE", os.DevNull,
+		"--setenv", "GOENV", "off",
+	}
+}
+
+// wrapVerificationCommand wraps a loopback verification command in
+// bubblewrap. The workspace is the only writable host path; everything else is
+// read-only with tmpfs /tmp, a cleared environment, and the host HOME hidden
+// (only toolchain directories are re-bound read-only, see sandbox_home.go).
+// readOnly lists paths re-bound read-only on top of the writable workspace:
+// protected workspace paths (such as .git, CI definitions and verification
+// scripts) and the shared dependency caches outside it. When allowNetwork is
+// false the sandbox additionally unshares the network namespace, as it does
+// for every verification step (verificationPlanAllowsNetwork). A networked
+// dependency fetch is wrapped by wrapFetchCommand instead and sees no part of
+// the workspace.
 //
 // The returned argv starts with `--seccomp 3` when the syscall filter applies
 // (see sandboxSeccompArgs); the launcher must supply it via
@@ -168,7 +207,7 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	}
 	sandboxHome := filepath.Join(workspacePath, filepath.FromSlash(sandboxHomeRelPath))
-	layout := verifyHomeLayout(workspacePath, pathEnv)
+	layout := verifyHomeLayout(workspacePath, pathEnv, false)
 
 	socketMasks, err := sandboxWorkspaceSocketMasks(workspacePath)
 	if err != nil {
@@ -230,11 +269,12 @@ func wrapVerificationCommand(bwrapPath, workspacePath, command string, args []st
 }
 
 // verifyHomeLayout resolves the sandbox HOME layout for a workspace from the
-// verification environment hooks.
-func verifyHomeLayout(workspacePath, pathEnv string) sandboxHomeLayout {
+// verification environment hooks. noHostModuleCache is threaded to
+// buildSandboxHomeLayout for a networked fetch (it is true exactly then).
+func verifyHomeLayout(workspacePath, pathEnv string, noHostModuleCache bool) sandboxHomeLayout {
 	home, err := verifyUserHome()
 	if err != nil {
 		return sandboxHomeLayout{}
 	}
-	return buildSandboxHomeLayout(home, workspacePath, pathEnv, verifyGetenv)
+	return buildSandboxHomeLayout(home, workspacePath, pathEnv, verifyGetenv, noHostModuleCache)
 }

@@ -23,7 +23,7 @@ home=
 while [ $# -gt 0 ]; do
   case "$1" in
     --setenv) [ "$2" = HOME ] && home=$3; shift 3 ;;
-    --chdir|--tmpfs|--proc|--dev|--seccomp) shift 2 ;;
+    --chdir|--tmpfs|--proc|--dev|--seccomp|--dir) shift 2 ;;
     --bind|--ro-bind) shift 3 ;;
     --*) shift ;;
     *) break ;;
@@ -83,6 +83,8 @@ func TestSetupPyOnlyInstallRedirectsEggInfo_R3(t *testing.T) {
 			if report.DepsError != "" || report.IntegrityError != "" {
 				t.Fatalf("DepsError=%q IntegrityError=%q", report.DepsError, report.IntegrityError)
 			}
+			// Without the user-mode network helper nothing can download, so the
+			// install runs as one loopback step (no fetch is split off).
 			if got := strings.TrimSpace(readLog(t, log)); got != tc.want {
 				t.Fatalf("pip step: %q, want %q", got, tc.want)
 			}
@@ -168,9 +170,12 @@ func TestSetupPyOnlySetuptoolsWritesNoEggInfoIntoWorkspace_R3(t *testing.T) {
 		{Path: "test_f.py", Content: "from fvlegacy import f\n\ndef test_f():\n    assert f() == 1\n"},
 		{Path: "pytest.ini", Content: "[pytest]\n"},
 	}
-	// pip runs this hook before the editable build; the fake pip refuses the
-	// legacy path, which would need the egg-info in the source tree.
-	const pip = "case \" $* \" in *\" --use-pep517 \"*) ;; *) echo 'legacy setup.py develop' >&2; exit 1 ;; esac\n" +
+	// The install is split into a wheel download (fetch-only) and an offline
+	// install; the download runs no build, and the install must go through PEP
+	// 517, so the fake pip passes `download` and refuses the legacy path (no
+	// --use-pep517), which would need the egg-info in the source tree.
+	const pip = "case \"$1\" in download) exit 0 ;; esac\n" +
+		"case \" $* \" in *\" --use-pep517 \"*) ;; *) echo 'legacy setup.py develop' >&2; exit 1 ;; esac\n" +
 		"exec /usr/bin/python3 -c 'import setuptools.build_meta as b; b.__legacy__.get_requires_for_build_editable()'\n"
 	for _, mode := range []string{"sandbox", "host"} {
 		t.Run(mode, func(t *testing.T) {

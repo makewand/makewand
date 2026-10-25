@@ -146,7 +146,9 @@ func fakePreviewSandbox(t *testing.T) string {
 		}
 		return ""
 	}
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return hostGoEnv{}, errors.New("go env disabled in unit tests") }
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) {
+		return hostGoEnv{}, errors.New("go env disabled in unit tests")
+	}
 	return home
 }
 

@@ -100,7 +100,7 @@ func fakeGoParsingOnPath(t *testing.T, env hostGoEnv) {
 	writeExecScript(t, filepath.Join(dir, "go"), fmt.Sprintf("exec %q \"$@\"\n", realGo))
 	t.Setenv("PATH", dir)
 	old := sandboxGoEnvProbe
-	sandboxGoEnvProbe = func(string) (hostGoEnv, error) { return env, nil }
+	sandboxGoEnvProbe = func(string, string) (hostGoEnv, error) { return env, nil }
 	t.Cleanup(func() { sandboxGoEnvProbe = old })
 }
 
@@ -223,7 +223,12 @@ func goSandboxForTest(t *testing.T) {
 	if err != nil {
 		t.Skip("no go toolchain on PATH")
 	}
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// The host-side go probes (go env, go mod edit) run with this HOME; turn
+	// telemetry off there too so a late counter write cannot race t.TempDir
+	// cleanup (the product disables it in the sandbox HOME).
+	disableGoTelemetryAt(t, home)
 	t.Setenv("PATH", filepath.Dir(realGo)+":/usr/bin:/bin")
 	t.Setenv("GOMODCACHE", filepath.Join(t.TempDir(), "modcache"))
 	t.Setenv("GOPATH", filepath.Join(t.TempDir(), "gopath"))

@@ -93,7 +93,7 @@ func TestGoRegistryChainsFollowGOPROXYSeparators_Final(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fakeGoOnPath(t, hostGoEnv{GOPROXY: tc.goproxy, GOSUMDB: sumdb})
 			var got []string
-			for _, endpoint := range defaultRegistryEndpoints("go") {
+			for _, endpoint := range defaultRegistryEndpoints("go", "") {
 				got = append(got, goProxyChainDescription(endpoint))
 			}
 			if !slices.Equal(got, tc.want) {

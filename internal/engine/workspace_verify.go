@@ -59,33 +59,34 @@ func (c *FileCheckpoint) BackupPaths() []string {
 
 // CandidateVerification reports whether a candidate patch passed local checks.
 type CandidateVerification struct {
-	Passed            bool
-	Strength          int
-	HasTests          bool
-	Isolated          bool     // external commands ran inside the bubblewrap sandbox
-	IsolationError    string   // why verification could not execute commands (fail closed)
-	EnvironmentError  bool     // a check could not run for environment reasons (sandbox setup, host toolchain), not because the candidate failed it
-	NoTestsRan        bool     // the test command succeeded but executed no actual tests
-	NoTestPlan        bool     // the baseline defines no test command: only quick checks ran, nothing was verified
-	BaselineTests     bool     // the baseline workspace defined its own test plan
-	RestoredTests     []string // baseline test files restored before verification
-	QuickCheckPlans   []ExecPlan
-	QuickCheckResults []ExecResult
-	QuickCheckError   string
-	DepsPlan          *ExecPlan
-	DepsSkipped       bool
-	DepsResult        *ExecResult
-	DepsError         string
-	TestsPlan         *ExecPlan
-	TestsResult       *ExecResult
-	TestsError        string
-	IntegrityError    string                   // input tree changed during verification
-	EvidenceLimit     string                   // successful candidate-controlled output is not an independent attestation
-	AcceptanceError   string                   // independent acceptance failed or could not execute
-	Acceptance        *TrustedAcceptanceRecord // trusted parent verdict, bound to the sealed inputs
-	VerifiedFiles     []ExtractedFile          // exact files verified in the tree
-	VerifiedContent   string                   // rendered payload of verified files
-	VerifiedDigest    string                   // sha256 hex digest of verified files
+	Passed              bool
+	Strength            int
+	HasTests            bool
+	Isolated            bool     // external commands ran inside the bubblewrap sandbox
+	IsolationError      string   // why verification could not execute commands (fail closed)
+	EnvironmentError    bool     // a check could not run for environment reasons (sandbox setup, host toolchain), not because the candidate failed it
+	ExecutionIncomplete bool     // a started candidate check timed out, flooded output, or left pipes open without completing
+	NoTestsRan          bool     // the test command succeeded but executed no actual tests
+	NoTestPlan          bool     // the baseline defines no test command: only quick checks ran, nothing was verified
+	BaselineTests       bool     // the baseline workspace defined its own test plan
+	RestoredTests       []string // baseline test files restored before verification
+	QuickCheckPlans     []ExecPlan
+	QuickCheckResults   []ExecResult
+	QuickCheckError     string
+	DepsPlan            *ExecPlan
+	DepsSkipped         bool
+	DepsResult          *ExecResult
+	DepsError           string
+	TestsPlan           *ExecPlan
+	TestsResult         *ExecResult
+	TestsError          string
+	IntegrityError      string                   // input tree changed during verification
+	EvidenceLimit       string                   // successful candidate-controlled output is not an independent attestation
+	AcceptanceError     string                   // independent acceptance failed or could not execute
+	Acceptance          *TrustedAcceptanceRecord // trusted parent verdict, bound to the sealed inputs
+	VerifiedFiles       []ExtractedFile          // exact files verified in the tree
+	VerifiedContent     string                   // rendered payload of verified files
+	VerifiedDigest      string                   // sha256 hex digest of verified files
 }
 
 // WriteFiles writes a batch of extracted files into the project.
@@ -1235,6 +1236,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		}
 		if err != nil {
 			report.DepsError = err.Error()
+			report.ExecutionIncomplete = report.ExecutionIncomplete || isStartedCommandUnknownOutcome(err)
 			report.EnvironmentError = isEnvironmentExecError(err)
 			return report
 		}
@@ -1264,6 +1266,7 @@ func (p *Project) verifyRestrictedWorkspace(ctx context.Context, files []Extract
 		}
 		if err != nil {
 			report.TestsError = err.Error()
+			report.ExecutionIncomplete = report.ExecutionIncomplete || isStartedCommandUnknownOutcome(err)
 			report.EnvironmentError = isEnvironmentExecError(err)
 			return report
 		}
@@ -1406,6 +1409,7 @@ func (p *Project) runExternalQuickChecks(ctx context.Context, files []ExtractedF
 		}
 		if err != nil {
 			report.QuickCheckError = err.Error()
+			report.ExecutionIncomplete = report.ExecutionIncomplete || isStartedCommandUnknownOutcome(err)
 			report.EnvironmentError = isEnvironmentExecError(err)
 			return false
 		}
@@ -1537,24 +1541,33 @@ func (p *Project) redirectSetuptoolsEggInfo(plan ExecPlan, isolated bool) (ExecP
 	if err != nil {
 		return plan, nil, err
 	}
-	home := filepath.Join(projectDir, filepath.FromSlash(sandboxHomeRelPath))
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return plan, nil, fmt.Errorf("create sandbox home: %w", err)
+	// Written through the sandbox HOME's own os.Root handle (openSandboxHome),
+	// which the cleanup uses too: a symlink a loopback step planted is never
+	// followed, and the HOME is never reopened by path.
+	home, err := openSandboxHome(projectDir)
+	if err != nil {
+		return plan, nil, err
 	}
-	config := filepath.Join(home, ".pydistutils.cfg")
-	f, err := os.OpenFile(config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	const config = ".pydistutils.cfg"
+	f, err := home.OpenFile(config, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, fs.ErrExist) {
+		_ = home.Close()
 		return plan, keep, nil // leave a configuration that is already there alone
 	}
 	if err != nil {
+		_ = home.Close()
 		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
 	}
 	_, writeErr := f.WriteString("[egg_info]\negg_base = /tmp\n")
 	if err := errors.Join(writeErr, f.Close()); err != nil {
-		_ = os.Remove(config)
+		_ = home.Remove(config)
+		_ = home.Close()
 		return plan, nil, fmt.Errorf("configure setuptools for the sandbox: %w", err)
 	}
-	return plan, func() { _ = os.Remove(config) }, nil
+	return plan, func() {
+		_ = home.Remove(config)
+		_ = home.Close()
+	}, nil
 }
 
 // cargoLockfile reports whether the Cargo workspace under verification has a
@@ -1644,6 +1657,9 @@ func (p *Project) prefetchDependencies(ctx context.Context, files []ExtractedFil
 	if err != nil {
 		report.QuickCheckError = err.Error()
 		report.EnvironmentError = isEnvironmentExecError(err)
+		if isStartedCommandUnknownOutcome(err) {
+			report.ExecutionIncomplete = true
+		}
 		return false
 	}
 	if result != nil && result.ExitCode != 0 {
@@ -1748,9 +1764,11 @@ func commandAvailable(command string) bool {
 
 // isEnvironmentExecError reports whether a RunVerificationPlan error means
 // the check could not run (sandbox setup, host toolchain, ...) rather than the
-// candidate misbehaving. Touching protected paths is the candidate's doing.
+// candidate misbehaving. Touching protected paths or failing to complete a
+// started command (timeout, output flood, hanging child pipe) is the
+// candidate's doing.
 func isEnvironmentExecError(err error) bool {
-	return err != nil && !errors.Is(err, ErrProtectedPathsModified)
+	return err != nil && !errors.Is(err, ErrProtectedPathsModified) && !isStartedCommandUnknownOutcome(err)
 }
 
 func execFailureDetail(result *ExecResult) string {

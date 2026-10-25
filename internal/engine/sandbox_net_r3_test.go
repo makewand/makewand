@@ -206,7 +206,7 @@ mcast_if = burst(lambda s: s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_I
 bound = burst(bind_tap, ("239.255.77.77", 9))
 print("gateway=%d mcast_if=%d bound=%d" % (gateway, mcast_if, bound))
 `
-	result, err := project.RunVerificationPlan(context.Background(), ExecPlan{Kind: "deps", Command: "python3", Args: []string{"-c", script, strconv.Itoa(sends)}})
+	result, err := runFetchNetworkProbeForTest(t, project, "python3", []string{"-c", script, strconv.Itoa(sends)})
 	if err != nil || result == nil || result.ExitCode != 0 {
 		t.Fatalf("err=%v result=%+v", err, result)
 	}

@@ -1,4 +1,4 @@
-# Makewand (魔杖) v3.2.0
+# Makewand (魔杖) v3.3.0
 
 > **多模型编程订阅联合调度与红队自愈体系** (Unified Multi-Model Subscription Orchestrator)  
 > 官方网站：[https://makewand.org](https://makewand.org) · 备用镜像：[https://makewand.com](https://makewand.com)  
@@ -75,7 +75,7 @@ cd path/to/makewand
 
 预编译 Release、Homebrew 和 Scoop 安装包含 Go CLI 与同版本 Python 引擎；运行时需要 Python 3.9+。手动解包时须将整个目录一起安装，保留二进制旁的 `lib/`。Homebrew/Scoop 会声明 Python 依赖。供应商 CLI 与项目测试工具需要单独安装；Makewand Python 引擎本身仅使用标准库。
 
-> **版本与安全加固**：v3.2.0 之后加入的保护（#75、#80–#85，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、Homebrew 包装脚本不再写死 `PATH`）已在 `master` 源码中，随 v3.3.0 发布；目前的 v3.2.x 预编译包、Homebrew 与 Scoop 没有这些保护。v3.3.0 发布前需要它们时，请用上面的源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
+> **版本与安全加固**：v3.3.0 包含了 v3.2.0 之后加入的全部保护（#75、#80–#85、#91、#100，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、依赖安装仅下载阶段出网且隔离工作区、候选测试超时或输出泛滥计为候选失败而非环境错误、Homebrew 包装脚本不再写死 `PATH`）；旧版 v3.2.x 没有这些保护，请升级到 v3.3.0 或使用源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
 
 供应商启停策略对 Go/Python 入口共同生效，禁用也阻止该工具的探测和额度读取。Claude、Gemini 和 OpenAI 的 API 参数按环境变量、`api_keys.json`、`config.json`、默认值的顺序读取；付费调用仍需显式启用 `allow_paid`。详见[共享配置契约](docs/EXECUTION_CONTRACT.md#shared-provider-configuration)。
 
@@ -174,7 +174,7 @@ makewand sandbox --no-net go test ./...
 ```
 > **跨平台隔离说明**：Bubblewrap 物理沙箱依赖 Linux 内核命名空间。没有沙箱时（如 macOS），所有 provider 调用（包括只读审查）都遵循 fail-closed 拦截，并给出指引：在装有 bwrap 的 Linux 容器/虚拟机中运行，或显式 `MAKEWAND_UNSAFE_HOST_EXEC=1` 确认授权（附审计记录）。bwrap 只从 root 拥有的系统目录解析，装在其他位置时用 `MAKEWAND_BWRAP_PATH` 指定。
 
-> **依赖安装网络**：Go 候选验证的依赖安装（含 Rust 检查前的 `cargo fetch`）不共享宿主网络命名空间。找到可信的 `slirp4netns`、`nsenter`、`ip` 时只能访问公网（私网、回环、链路本地与云元数据、组播及本机地址在命令运行前即被路由屏蔽，可选的 `tc`/`nft` 再过滤组播与 IPv6），否则只有回环网络；这些工具不在 root 拥有的系统目录时，用 `MAKEWAND_SLIRP4NETNS_PATH`、`MAKEWAND_NSENTER_PATH`、`MAKEWAND_IP_PATH`、`MAKEWAND_TC_PATH`、`MAKEWAND_NFT_PATH` 指定。私网或本机回环上的镜像与代理按设计不可达。安装失败只有在 makewand 自己的连通性检查（离线时为项目文件）确认注册表不可达时才算环境问题，此时 TUI 跳过测试、不扣分。详见 [SECURITY.md](SECURITY.md#dependency-installs--依赖安装)。
+> **依赖安装网络**：Go 候选验证中只有“下载”走网络（站主 2026-10-21 定）。依赖步骤拆成两段：不执行项目代码的取回（`pip download --only-binary=:all:`；按 makewand 先解析并检查过、只含注册表包的锁文件进行的 `npm ci --ignore-scripts`，命令行带包参数时不联网；固定到具名 rustup 工具链的 `cargo fetch`；`go mod download`/`tidy`）在工作区之外、每次新建且只含清单与锁文件副本的私有取回目录中联网运行，看不到工作区的任何文件，只运行工作区之外的可信工具，下载到宿主自有的共享缓存（之后的回环步骤只读）；随后的构建/安装（`pip install --no-index --find-links`、含 `-e .`；`cargo build --offline`）只在回环网络下进行——`setup.py`/`build.rs`/生命周期脚本永不在可联网时运行，`node_modules` 与锁文件由宿主在取回后放入工作区。取回找到可信的 `slirp4netns`、`nsenter`、`ip` 时只能访问公网（私网、回环、链路本地与云元数据、组播及本机地址在命令运行前即被路由屏蔽，可选的 `tc`/`nft` 再过滤组播与 IPv6），否则只有回环网络；这些工具不在 root 拥有的系统目录时，用 `MAKEWAND_SLIRP4NETNS_PATH`、`MAKEWAND_NSENTER_PATH`、`MAKEWAND_IP_PATH`、`MAKEWAND_TC_PATH`、`MAKEWAND_NFT_PATH` 指定。取回不绑定宿主模块缓存；pip 配置与需求文件指定的私有索引照样使用，绝不被 PyPI 悄悄替换。无法在不运行代码的前提下取回的依赖（索引显示匹配版本只有源码分发、需构建的 git 依赖、npm 的 git/本地/workspace 依赖、以路径指定的 Rust 工具链等）按环境问题（依赖不可用）报告、不扣分；不存在的项目或版本仍算候选失败。私网或本机回环上的镜像与代理按设计不可达。安装失败只有在 makewand 自己的连通性检查（离线时为项目文件）确认注册表不可达时才算环境问题，此时 TUI 跳过测试、不扣分。详见 [SECURITY.md](SECURITY.md#dependency-installs--依赖安装)。
 
 ### 8. 单模型直接透传调用
 ```bash

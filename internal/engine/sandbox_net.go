@@ -191,6 +191,13 @@ type sandboxNetwork struct {
 	// attach, when set (kind None), is why the installed helper could not be
 	// attached; it replaces detail and remedy.
 	attach *userNetFailure
+	// prefetched marks the loopback build/install stage of a split dependency
+	// plan: its dependencies declared by name were already downloaded by the
+	// networked fetch, so a failure here is the candidate's own (its project
+	// code ran) and is never reclassified as an environment outage from its
+	// output, whatever that output claims (dependencyRegistryError). A declared
+	// VCS or URL dependency is reported before this (execDependencyPlan).
+	prefetched bool
 }
 
 // environmentNote ends every guidance message.
@@ -344,8 +351,13 @@ const registryCheckAttempts = 2
 // probe, it probes and exits before anything else initializes. The check
 // needs no interpreter or other program on the host or in the sandbox.
 func init() {
-	if len(os.Args) > 1 && os.Args[1] == registryProbeArg {
-		os.Exit(runRegistryProbe(os.Stdout, os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case registryProbeArg:
+			os.Exit(runRegistryProbe(os.Stdout, os.Args[2:]))
+		case pipIndexProbeArg:
+			os.Exit(runPipIndexProbe(os.Stdout, os.Args[2:]))
+		}
 	}
 }
 
@@ -614,8 +626,8 @@ type registryProbeRun struct {
 // candidate code nor project configuration can influence the result, and no
 // interpreter has to be installed. A check that cannot run (its sandbox could
 // not get the user-mode network, for example) is tried once more.
-func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, command string) registryCheck {
-	endpoints := registryCheckEndpoints(command)
+func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, command, workspace string) registryCheck {
+	endpoints := registryCheckEndpoints(command, workspace)
 	if len(endpoints) == 0 {
 		return registryCheck{failure: "it does not know the registry of " + command}
 	}
@@ -623,7 +635,7 @@ func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, comm
 	attempts := 0
 	for attempts < registryCheckAttempts && ctx.Err() == nil {
 		attempts++
-		if check = runRegistryCheck(ctx, env, endpoints); check.done {
+		if check = runRegistryCheck(ctx, env, endpoints, workspace); check.done {
 			return check
 		}
 	}
@@ -634,7 +646,7 @@ func checkRegistryReachable(ctx context.Context, env verifyExecEnvironment, comm
 }
 
 // runRegistryCheck runs the probe once for endpoints.
-func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints []registryEndpoint) registryCheck {
+func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints []registryEndpoint, workspace string) registryCheck {
 	probe, err := registryProbeExecutable()
 	if err != nil {
 		return registryCheck{failure: err.Error()}
@@ -654,7 +666,7 @@ func runRegistryCheck(ctx context.Context, env verifyExecEnvironment, endpoints 
 	if env.mode == verifyExecUnsafeHost {
 		run = runRegistryProbeOnHost(checkCtx, dir, probe, args)
 	} else {
-		run = runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, args)
+		run = runRegistryProbeInSandbox(checkCtx, env.bwrapPath, dir, probe, workspace, args)
 	}
 	if run.failure != "" || ctx.Err() != nil {
 		return registryCheck{failure: run.failure}
@@ -681,15 +693,25 @@ func registryProbeSelf() (string, error) {
 }
 
 // runRegistryProbeInSandbox runs the probe in a fresh verification sandbox
-// whose workspace is the empty directory dir, with the user-mode network a
-// dependency install gets. The executable is bound into the sandbox, which
+// from the empty directory dir, retaining the original workspace exclusion,
+// with the user-mode network a dependency install gets. The executable is bound, which
 // hides HOME, /tmp and /mnt, where it may lie.
-func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe string, args []string) registryProbeRun {
-	wrappedCmd, wrappedArgs, err := wrapVerificationCommand(bwrapPath, dir, probe, args, false, nil)
+func runRegistryProbeInSandbox(ctx context.Context, bwrapPath, dir, probe, workspace string, args []string) registryProbeRun {
+	if workspace == "" {
+		return registryProbeRun{failure: "the original workspace boundary is unavailable"}
+	}
+	workspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return registryProbeRun{failure: "the original workspace boundary cannot be resolved: " + err.Error()}
+	}
+	// The probe is a networked step running makewand's own code in an empty
+	// directory: it is wrapped as a networked fetch (a fresh HOME, no host
+	// module cache, no workspace) so it never binds the host caches or reads
+	// any project configuration.
+	wrappedCmd, wrappedArgs, err := wrapFetchCommand(bwrapPath, fetchSpec{workspace: workspace, dir: dir, readOnly: []string{probe}, pathEnv: fetchPathEnv(workspace)}, probe, args)
 	if err != nil {
 		return registryProbeRun{failure: "its sandbox could not be prepared: " + err.Error()}
 	}
-	wrappedArgs = insertBeforeCommand(wrappedArgs, len(args), "--ro-bind", probe, probe)
 	userNet, network := prepareUserNetwork(wrappedArgs)
 	if userNet == nil {
 		return registryProbeRun{failure: network.checkFailure()}
@@ -809,14 +831,14 @@ func parseRegistryCheck(run registryProbeRun, endpoints []registryEndpoint, time
 // defaultRegistryEndpoints returns the endpoints of the default registry that
 // a dependency install of command's ecosystem needs (index and downloads), or
 // nil for a command whose outages makewand does not recognize.
-func defaultRegistryEndpoints(command string) []registryEndpoint {
+func defaultRegistryEndpoints(command, workspace string) []registryEndpoint {
 	switch command {
 	case "npm":
 		return registryEndpoints("https://registry.npmjs.org/")
 	case "pip", "pip3":
 		return registryEndpoints("https://pypi.org/simple/", "https://files.pythonhosted.org/")
 	case "go":
-		return goRegistryEndpoints()
+		return goRegistryEndpoints(workspace)
 	case "cargo":
 		return registryEndpoints("https://index.crates.io/config.json", "https://static.crates.io/")
 	}
@@ -828,10 +850,11 @@ func defaultRegistryEndpoints(command string) []registryEndpoint {
 // go command reaches it (goSumDBEndpoint). Both follow the host's GOPROXY,
 // GOSUMDB, GONOSUMDB and GOPRIVATE, which makewand passes into the sandbox (a
 // project cannot set them); by default proxy.golang.org and sum.golang.org.
-func goRegistryEndpoints() []registryEndpoint {
+func goRegistryEndpoints(workspace string) []registryEndpoint {
 	var hostEnv hostGoEnv
-	if goBin := lookPathIn("go", sandboxPathEnv()); goBin != "" {
-		if probed, err := sandboxGoEnvProbe(goBin); err == nil {
+	pathEnv := fetchPathEnv(workspace)
+	if goBin := trustedToolPath("go", workspace, pathEnv); filepath.IsAbs(goBin) {
+		if probed, err := sandboxGoEnvProbe(goBin, pathEnv); err == nil {
 			hostEnv = probed
 		}
 	}

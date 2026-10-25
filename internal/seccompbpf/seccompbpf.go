@@ -31,6 +31,17 @@ func GenerateFilter() []byte {
 }
 
 func generate(goarch string) []byte {
+	return generatePolicy(goarch, false)
+}
+
+// GenerateExecGuardFilter adds execve/execveat denial. A trusted interpreter
+// installs it after startup, before importing pip, so dependency metadata
+// cannot launch a build backend while the download has network access.
+func GenerateExecGuardFilter() []byte {
+	return generatePolicy(runtime.GOARCH, true)
+}
+
+func generatePolicy(goarch string, denyExec bool) []byte {
 	const (
 		bpfLd           = 0x00
 		bpfW            = 0x00
@@ -76,6 +87,14 @@ func generate(goarch string) []byte {
 		}
 	default:
 		return nil
+	}
+	if denyExec {
+		switch goarch {
+		case "amd64":
+			blockedSyscalls = append(blockedSyscalls, 59, 322) // execve, execveat
+		case "arm64":
+			blockedSyscalls = append(blockedSyscalls, 221, 281)
+		}
 	}
 
 	buf := new(bytes.Buffer)
