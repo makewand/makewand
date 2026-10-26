@@ -165,6 +165,268 @@ class TestBoundedWorkspaceScan(unittest.TestCase):
             idx = [i for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null" and cmd[i + 2] == str(sock_path)]
             self.assertTrue(idx)
 
+    def test_bfs_prioritizes_shallow_sockets_before_deep_cache_truncation(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            sock_path = root / "sub" / "agent.sock"
+            sock_path.parent.mkdir()
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(str(sock_path))
+            deep_dir = root / "zz_reports" / "run1" / "autonomous" / "bulk_shards" / "shard"
+            deep_dir.mkdir(parents=True)
+            deep_sock = deep_dir / "hidden.sock"
+            s_deep = socket.socket(socket.AF_UNIX)
+            s_deep.bind(str(deep_sock))
+            for i in range(200):
+                (deep_dir.parent / f"img_{i:03d}.jpg").write_text("x")
+            err = io.StringIO()
+            try:
+                with patch.object(sandbox, "READONLY_SCAN_ENTRY_LIMIT", 50), patch("sys.stderr", err):
+                    cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
+            finally:
+                s.close()
+                s_deep.close()
+            masked = {cmd[i + 2] for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null"}
+            tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+            remount_ro = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--remount-ro"}
+            self.assertIn(str(sock_path), masked)
+            self.assertIn(str(deep_dir.parent), tmpfs_masked)
+            self.assertIn(str(deep_dir.parent), remount_ro)
+            self.assertIn("工作区扫描未能完成", err.getvalue())
+
+    def test_roi_image_cache_is_masked_with_tmpfs_without_truncating(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            (root / ".git").mkdir()
+            cache_dir = root / "reports" / "autonomous" / "roi-image-cache"
+            (cache_dir / "shard0").mkdir(parents=True)
+            for i in range(100):
+                (cache_dir / "shard0" / f"crop_{i}.jpg").write_text("x")
+            seen = []
+            real_scandir = os.scandir
+
+            def spy(path):
+                seen.append(str(path))
+                return real_scandir(path)
+
+            with patch("makewand.sandbox.os.scandir", side_effect=spy):
+                ro_cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
+                rw_cmd = wrap_bwrap(["true"], workspace=ws, readonly=False)
+            self.assertNotIn(str(cache_dir), seen)
+            self.assertNotIn(str(cache_dir / "shard0"), seen)
+            for cmd in (ro_cmd, rw_cmd):
+                tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+                remount_ro = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--remount-ro"}
+                self.assertIn(str(cache_dir), tmpfs_masked)
+                self.assertIn(str(cache_dir), remount_ro)
+
+    def test_late_socket_in_large_directory_still_masked_on_truncation(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            for i in range(150):
+                (root / f"a_{i:03d}.txt").write_text("x")
+            late_sock = root / "zzzz_late.sock"
+            (root / "zz_sub").mkdir()
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(str(late_sock))
+            err = io.StringIO()
+            try:
+                with patch.object(sandbox, "READONLY_SCAN_ENTRY_LIMIT", 30), patch("sys.stderr", err):
+                    cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
+            finally:
+                s.close()
+            masked = {cmd[i + 2] for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null"}
+            tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+            self.assertIn(str(late_sock), masked)
+            self.assertIn(str(root / "zz_sub"), tmpfs_masked)
+
+    def test_oserror_during_scandir_fails_closed(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            sub = root / "sub"
+            sub.mkdir()
+            real_scandir = os.scandir
+
+            def fail_sub(path):
+                if os.fspath(path) == str(sub):
+                    raise OSError(5, "Input/output error")
+                return real_scandir(path)
+
+            def fail_root(path):
+                if os.fspath(path) == str(root):
+                    raise OSError(24, "Too many open files")
+                return real_scandir(path)
+
+            err = io.StringIO()
+            with patch("makewand.sandbox.os.scandir", side_effect=fail_sub), patch("sys.stderr", err):
+                with self.assertRaises(sandbox.SandboxConfigError):
+                    wrap_bwrap(["true"], workspace=ws, readonly=False)
+                ro_cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
+                tmpfs_masked = {ro_cmd[i + 1] for i, x in enumerate(ro_cmd[:-1]) if x == "--tmpfs"}
+                self.assertIn(str(sub), tmpfs_masked)
+
+            with patch("makewand.sandbox.os.scandir", side_effect=fail_root):
+                with self.assertRaises(sandbox.SandboxConfigError):
+                    wrap_bwrap(["true"], workspace=ws, readonly=True)
+
+    def test_scan_timeout_truncates_readonly_and_fails_closed_writable(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            (root / "sub").mkdir()
+            for i in range(20):
+                (root / "sub" / f"f{i}").write_text("x")
+            err = io.StringIO()
+            clock = [100.0]
+
+            def fake_monotonic():
+                clock[0] += 2.0
+                return clock[0]
+
+            with patch("makewand.sandbox.time.monotonic", side_effect=fake_monotonic), \
+                    patch.dict(os.environ, {"MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS": "1.0"}), \
+                    patch("sys.stderr", err):
+                cmd = wrap_bwrap(["true"], workspace=ws, readonly=True)
+                self.assertIn(ws, ro_bound(cmd))
+                tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+                self.assertIn(str(root / "sub"), tmpfs_masked)
+                self.assertIn("工作区扫描未能完成", err.getvalue())
+                with self.assertRaises(sandbox.SandboxConfigError):
+                    wrap_bwrap(["true"], workspace=ws, readonly=False)
+
+    def test_deep_workspace_under_broad_mount_root_scans_spine_and_masks_omitted_siblings(self):
+        base = Path(tempfile.mkdtemp(prefix="g4-deep-", dir="/tmp"))
+        socks = []
+        try:
+            ws_dir = base / "a" / "b" / "c" / "d" / "ws"
+            ws_inner = ws_dir / "inner"
+            ws_inner.mkdir(parents=True)
+            ws_sock = ws_inner / "agent.sock"
+            sibling_deep = base / "other1" / "other2" / "other3"
+            sibling_deep.mkdir(parents=True)
+            sibling_sock = sibling_deep / "sib.sock"
+            for sp in (ws_sock, sibling_sock):
+                sk = socket.socket(socket.AF_UNIX)
+                sk.bind(str(sp))
+                socks.append(sk)
+            real_scandir = os.scandir
+
+            class FixtureRootEntries:
+                def __init__(self, entries):
+                    self.entries = entries
+
+                def __enter__(self):
+                    self.entries.__enter__()
+                    return self
+
+                def __exit__(self, *error):
+                    return self.entries.__exit__(*error)
+
+                def __iter__(self):
+                    return (entry for entry in self.entries if entry.name == base.name)
+
+            def fixture_scandir(path):
+                entries = real_scandir(path)
+                return FixtureRootEntries(entries) if os.fspath(path) == "/tmp" else entries
+
+            with home_outside_tmp(), patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
+                cmd = wrap_bwrap(["true"], workspace=str(ws_dir), worktree_root="/tmp", readonly=True)
+            masked = {cmd[i + 2] for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null"}
+            tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+            remount_ro = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--remount-ro"}
+            self.assertIn(str(ws_sock), masked)
+            self.assertIn(str(base / "other1" / "other2"), tmpfs_masked)
+            self.assertIn(str(base / "other1" / "other2"), remount_ro)
+            self.assertNotIn(str(ws_dir), tmpfs_masked)
+            self.assertNotIn(str(ws_inner), tmpfs_masked)
+        finally:
+            for sk in socks:
+                sk.close()
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_readonly_root_workspace_scans_root(self):
+        seen_roots = []
+        seen_skip_paths = []
+        real_scan = sandbox._scan_tree
+
+        def spy_scan(roots, **kwargs):
+            seen_roots.append(list(roots))
+            seen_skip_paths.append(set(kwargs.get("skip_paths") or ()))
+            return real_scan(roots, **kwargs)
+
+        with patch("makewand.sandbox._scan_tree", side_effect=spy_scan):
+            cmd = wrap_bwrap(["true"], workspace="/", readonly=True)
+        self.assertIn(["/"], seen_roots)
+        root_idx = seen_roots.index(["/"])
+        self.assertNotIn("/var", seen_skip_paths[root_idx])
+        self.assertIn("--ro-bind", cmd)
+
+    def test_isdir_failure_on_root_does_not_silently_skip_scan_root(self):
+        with tempfile.TemporaryDirectory() as ws:
+            sock_path = Path(ws) / "root.sock"
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(str(sock_path))
+            try:
+                with patch("makewand.sandbox.os.path.isdir", return_value=False):
+                    _, socks, truncated = sandbox._scan_tree(
+                        [ws], max_depth=None, entry_limit=100, collect_git=False
+                    )
+                self.assertIn(str(sock_path), socks)
+                self.assertFalse(truncated)
+            finally:
+                s.close()
+
+    def test_separate_non_broad_repo_root_not_truncated_by_broad_mount_root(self):
+        base = Path(tempfile.mkdtemp(prefix="g4-repo-", dir="/tmp"))
+        repo_base = Path(tempfile.mkdtemp(prefix="g4-mainrepo-", dir="/var/tmp"))
+        socks = []
+        try:
+            ws_dir = base / "wt"
+            ws_dir.mkdir(parents=True)
+            deep_repo_dir = repo_base / "d1" / "d2" / "d3" / "d4"
+            deep_repo_dir.mkdir(parents=True)
+            repo_sock = deep_repo_dir / "repo.sock"
+            sk = socket.socket(socket.AF_UNIX)
+            sk.bind(str(repo_sock))
+            socks.append(sk)
+            real_scandir = os.scandir
+
+            class FixtureRootEntries:
+                def __init__(self, entries):
+                    self.entries = entries
+
+                def __enter__(self):
+                    self.entries.__enter__()
+                    return self
+
+                def __exit__(self, *error):
+                    return self.entries.__exit__(*error)
+
+                def __iter__(self):
+                    return (entry for entry in self.entries if entry.name == base.name)
+
+            def fixture_scandir(path):
+                entries = real_scandir(path)
+                return FixtureRootEntries(entries) if os.fspath(path) == "/tmp" else entries
+
+            with home_outside_tmp(), patch("makewand.sandbox.os.scandir", side_effect=fixture_scandir):
+                cmd = wrap_bwrap(
+                    ["true"],
+                    workspace=str(ws_dir),
+                    worktree_root="/tmp",
+                    repo_root=str(repo_base),
+                    readonly=True,
+                )
+            masked = {cmd[i + 2] for i, x in enumerate(cmd[:-2]) if x == "--ro-bind" and cmd[i + 1] == "/dev/null"}
+            tmpfs_masked = {cmd[i + 1] for i, x in enumerate(cmd[:-1]) if x == "--tmpfs"}
+            self.assertIn(str(repo_sock), masked)
+            for anc in (repo_base, repo_base / "d1", repo_base / "d1" / "d2", repo_base / "d1" / "d2" / "d3", deep_repo_dir):
+                self.assertNotIn(str(anc), tmpfs_masked)
+        finally:
+            for sk in socks:
+                sk.close()
+            shutil.rmtree(base, ignore_errors=True)
+            shutil.rmtree(repo_base, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

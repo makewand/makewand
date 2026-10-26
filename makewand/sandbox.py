@@ -38,6 +38,7 @@ import shutil
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -352,8 +353,16 @@ PROVIDER_HOME_BIN_DIRS = {
 
 # Bounds for build-time tree scans (eng-delivery#7). The workspace socket scan
 # walks everything (node_modules, .git internals included, H5); a truncated scan
-# fails closed for writable sessions.
+# fails closed for writable sessions and masks unscanned subtrees with a
+# read-only tmpfs in read-only sessions.
 SCAN_ENTRY_LIMIT = 1_000_000  # MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT overrides
+READONLY_SCAN_ENTRY_LIMIT = SCAN_ENTRY_LIMIT  # MAKEWAND_SANDBOX_READONLY_SCAN_ENTRY_LIMIT overrides
+READONLY_SCAN_TIMEOUT_SECONDS = 15.0  # MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS overrides
+SANDBOX_MASKED_CACHE_DIRS: frozenset = frozenset({"roi-image-cache"})
+SCAN_DEFERRED_BULK_DIRS: frozenset = frozenset({
+    "node_modules", ".venv", "venv", ".cache", ".worktrees",
+})
+MAX_UNSCANNED_DIR_MASKS = 512
 BROAD_SCAN_DEPTH = 3
 PROVIDER_SCAN_DEPTH = 3
 PROVIDER_SCAN_ENTRY_LIMIT = 20_000
@@ -690,11 +699,118 @@ def _untraversable_foreign_dir(path: str) -> bool:
     return not os.access(path, os.X_OK)
 
 
-def _workspace_scan_limit() -> int:
+def _workspace_scan_limit(readonly: bool = False) -> int:
     raw = os.environ.get("MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT", "").strip()
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
+    if readonly:
+        ro_raw = os.environ.get("MAKEWAND_SANDBOX_READONLY_SCAN_ENTRY_LIMIT", "").strip()
+        if ro_raw.isdigit() and int(ro_raw) > 0:
+            return min(SCAN_ENTRY_LIMIT, int(ro_raw))
+        if READONLY_SCAN_ENTRY_LIMIT != 1_000_000:
+            return min(SCAN_ENTRY_LIMIT, READONLY_SCAN_ENTRY_LIMIT)
     return SCAN_ENTRY_LIMIT
+
+
+def _workspace_scan_timeout(readonly: bool = False) -> Optional[float]:
+    raw = os.environ.get("MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+            return val if val > 0 else None
+        except ValueError:
+            pass
+    if readonly:
+        return READONLY_SCAN_TIMEOUT_SECONDS
+    return None
+
+
+def _workspace_masked_cache_dirs() -> frozenset:
+    raw = os.environ.get("MAKEWAND_SANDBOX_MASKED_DIRS", "").strip()
+    if not raw:
+        return SANDBOX_MASKED_CACHE_DIRS
+    extra = {part.strip() for part in raw.split(",") if part.strip() and os.sep not in part}
+    return SANDBOX_MASKED_CACHE_DIRS | frozenset(extra)
+
+
+def _norm_is_within(path: str, root: str) -> bool:
+    """Fast _is_within when both path and root are already _norm()-ed."""
+    if root == "/":
+        return True
+    return path == root or path.startswith(root + os.sep)
+
+
+def _covered_by_norm_set(path: str, roots: Set[str]) -> bool:
+    if not roots:
+        return False
+    cur = path
+    while cur and cur != "/":
+        if cur in roots:
+            return True
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return "/" in roots
+
+
+def _dedup_norm_ancestors(paths: Set[str]) -> Set[str]:
+    kept: Set[str] = set()
+    for d in paths:
+        cur = os.path.dirname(d)
+        has_anc = False
+        while cur and cur != "/" and cur != d:
+            if cur in paths:
+                has_anc = True
+                break
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                break
+            cur = nxt
+        if not has_anc:
+            kept.add(d)
+    return kept
+
+
+def _collapse_unscanned_dirs(
+    unscanned_dirs: Set[str],
+    protected_paths: Sequence[str],
+    max_masks: int = MAX_UNSCANNED_DIR_MASKS,
+) -> Optional[List[str]]:
+    """
+    Normalizes and bounds a set of unscanned directory paths so each can be
+    masked with a read-only tmpfs. Returns None if any unscanned directory
+    contains a protected path (e.g. the workspace root itself) or cannot be
+    collapsed within max_masks.
+    """
+    if not unscanned_dirs:
+        return []
+    prot = [_norm(p) for p in protected_paths if p and p != "/"]
+    normed = {_norm(d) for d in unscanned_dirs if d}
+    if any(d == "/" or any(_norm_is_within(p, d) for p in prot) for d in normed):
+        return None
+    kept = _dedup_norm_ancestors(normed)
+    while len(kept) > max_masks:
+        by_parent: Dict[str, List[str]] = {}
+        for d in kept:
+            parent = os.path.dirname(d)
+            if parent in (d, "/", "") or any(_norm_is_within(p, parent) for p in prot):
+                continue
+            by_parent.setdefault(parent, []).append(d)
+        if not by_parent:
+            return None
+        for parent, children in sorted(
+            by_parent.items(),
+            key=lambda kv: (kv[0].count(os.sep), len(kv[1]), kv[0]),
+            reverse=True,
+        ):
+            for c in children:
+                kept.discard(c)
+            kept.add(parent)
+            if len(kept) <= max_masks:
+                break
+        kept = _dedup_norm_ancestors(kept)
+    return sorted(kept)
 
 
 def _scan_tree(
@@ -706,24 +822,51 @@ def _scan_tree(
     skip_dirs: frozenset = SCAN_SKIP_DIRS,
     skip_paths: Iterable[str] = (),
     descend_git: bool = False,
+    timeout_seconds: Optional[float] = None,
+    mask_dirs: frozenset = frozenset(),
+    defer_dirs: frozenset = SCAN_DEFERRED_BULK_DIRS,
+    priority_paths: Iterable[str] = (),
+    unbounded_paths: Iterable[str] = (),
+    unscanned_dirs: Optional[Set[str]] = None,
+    masked_cache_dirs: Optional[Set[str]] = None,
 ) -> Tuple[Set[str], Set[str], bool]:
     """
-    Iteratively scans roots without following symlinks.
+    Iteratively scans roots in breadth-first order without following symlinks.
     Returns (git_entries, socket_paths, truncated). `.git` entries are recorded;
     a `.git` directory is descended into (for sockets only, e.g. the fsmonitor
     daemon socket) when descend_git is set; directories named in skip_dirs are
-    skipped; the total number of entries visited is capped by entry_limit.
+    skipped; directories named in mask_dirs are recorded in masked_cache_dirs
+    for read-only tmpfs masking; directories in defer_dirs are queued behind
+    primary workspace directories; any subdirectories not entered due to
+    max_depth, entry_limit, timeout_seconds, or OSError are recorded in
+    unscanned_dirs.
     """
     git_paths: Set[str] = set()
     sockets: Set[str] = set()
     skip_abs = {_norm(p) for p in skip_paths}
+    priority_abs = [_norm(p) for p in priority_paths if p]
+    unbounded_abs = [_norm(p) for p in unbounded_paths if p]
     seen = 0
-    truncated = False   # entry budget exhausted: stop walking
-    incomplete = False  # an unreadable directory we own was skipped: keep walking
-    # (path, depth, inside_git): .git entries below a .git directory are not recorded
-    stack: List[Tuple[str, int, bool]] = [(_norm(r), 0, False) for r in roots if r and os.path.isdir(r)]
-    while stack:
-        cur, depth, in_git = stack.pop()
+    truncated = False   # entry or time budget exhausted: stop walking non-spine subtrees
+    incomplete = False  # an unreadable/errored directory was encountered
+    deadline: Optional[float] = (
+        time.monotonic() + timeout_seconds
+        if timeout_seconds is not None and timeout_seconds > 0
+        else None
+    )
+    dir_hard_limit = max(entry_limit * 10, 1_000_000)
+    # (path, depth, inside_git, in_bulk): .git entries below a .git directory are not recorded
+    queue = deque((_norm(r), 0, False, False) for r in roots if r)
+    bulk_queue: deque = deque()
+    while queue or bulk_queue:
+        if seen > 0 and deadline is not None and time.monotonic() >= deadline:
+            truncated = True
+        cur, depth, in_git, in_bulk = queue.popleft() if queue else bulk_queue.popleft()
+        cur_on_spine = any(_norm_is_within(p, cur) for p in priority_abs)
+        if truncated and not cur_on_spine:
+            if unscanned_dirs is not None:
+                unscanned_dirs.add(cur)
+            continue
         try:
             it = os.scandir(cur)
         except PermissionError:
@@ -731,38 +874,122 @@ def _scan_tree(
             # reach too; one we own could be chmod-ed back from inside.
             if not _untraversable_foreign_dir(cur):
                 incomplete = True
+                if unscanned_dirs is not None:
+                    unscanned_dirs.add(cur)
             continue
         except OSError:
+            incomplete = True
+            if unscanned_dirs is not None:
+                unscanned_dirs.add(cur)
             continue
-        with it:
-            for entry in it:
-                seen += 1
-                if seen > entry_limit:
-                    truncated = True
-                    break
-                name = entry.name
-                path = entry.path
-                is_git = name == ".git" and not in_git
-                if is_git and collect_git:
-                    git_paths.add(path)
-                if is_git and not descend_git:
-                    continue
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if name in skip_dirs or path in skip_abs:
+        cur_dirs: List[Tuple[str, int, bool, bool]] = []
+        cur_failed = False
+        cur_aborted = False
+        dir_seen = 0
+        try:
+            with it:
+                for entry in it:
+                    seen += 1
+                    dir_seen += 1
+                    if not truncated and (
+                        seen > entry_limit
+                        or (deadline is not None and (seen & 0x3F) == 0 and time.monotonic() >= deadline)
+                    ):
+                        truncated = True
+                        if not cur_on_spine:
+                            cur_aborted = True
+                            break
+                    if dir_seen > dir_hard_limit:
+                        incomplete = True
+                        cur_failed = True
+                        break
+                    name = entry.name
+                    path = entry.path
+                    is_git = name == ".git" and not in_git
+                    if is_git and collect_git:
+                        git_paths.add(path)
+                    if is_git and not descend_git:
+                        continue
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if name in skip_dirs or path in skip_abs:
+                                continue
+                            on_path_spine = any(_norm_is_within(p, path) for p in priority_abs)
+                            in_unbounded = any(_norm_is_within(path, u) for u in unbounded_abs)
+                            if (
+                                not in_git
+                                and not is_git
+                                and name in mask_dirs
+                                and masked_cache_dirs is not None
+                                and not on_path_spine
+                            ):
+                                masked_cache_dirs.add(path)
+                                continue
+                            if (
+                                max_depth is None
+                                or depth + 1 < max_depth
+                                or on_path_spine
+                                or in_unbounded
+                            ):
+                                in_priority_ws = not priority_abs or on_path_spine or any(
+                                    _norm_is_within(path, p) for p in priority_abs
+                                )
+                                is_bulk = in_bulk or (not in_priority_ws) or (
+                                    name in defer_dirs and not on_path_spine
+                                )
+                                cur_dirs.append((path, depth + 1, in_git or is_git, is_bulk))
+                            elif unscanned_dirs is not None:
+                                unscanned_dirs.add(path)
                             continue
-                        if max_depth is None or depth + 1 < max_depth:
-                            stack.append((path, depth + 1, in_git or is_git))
+                        if entry.is_file(follow_symlinks=False) or entry.is_symlink():
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        if stat.S_ISSOCK(st.st_mode):
+                            sockets.add(path)
+                    except OSError:
+                        incomplete = True
+                        cur_failed = True
                         continue
-                    if entry.is_file(follow_symlinks=False) or entry.is_symlink():
-                        continue
-                    st = entry.stat(follow_symlinks=False)
-                    if stat.S_ISSOCK(st.st_mode):
-                        sockets.add(path)
-                except OSError:
-                    continue
+        except OSError:
+            incomplete = True
+            cur_failed = True
+        if cur_failed or cur_aborted:
+            if unscanned_dirs is not None:
+                unscanned_dirs.add(cur)
+            if truncated:
+                kept_spine = deque()
+                for q in (queue, bulk_queue):
+                    while q:
+                        q_path, q_depth, q_git, q_bulk = q.popleft()
+                        if any(_norm_is_within(p, q_path) for p in priority_abs):
+                            kept_spine.append((q_path, q_depth, q_git, q_bulk))
+                        elif unscanned_dirs is not None:
+                            unscanned_dirs.add(q_path)
+                queue = kept_spine
+                bulk_queue.clear()
+            continue
+        for d_path, d_depth, d_git, d_bulk in cur_dirs:
+            on_spine = any(_norm_is_within(p, d_path) for p in priority_abs)
+            if truncated and not on_spine:
+                if unscanned_dirs is not None:
+                    unscanned_dirs.add(d_path)
+            elif on_spine:
+                queue.appendleft((d_path, d_depth, d_git, False))
+            elif d_bulk:
+                bulk_queue.append((d_path, d_depth, d_git, True))
+            else:
+                queue.append((d_path, d_depth, d_git, False))
         if truncated:
-            break
+            kept_spine: deque = deque()
+            for q in (queue, bulk_queue):
+                while q:
+                    q_path, q_depth, q_git, q_bulk = q.popleft()
+                    if any(_norm_is_within(p, q_path) for p in priority_abs):
+                        kept_spine.append((q_path, q_depth, q_git, q_bulk))
+                    elif unscanned_dirs is not None:
+                        unscanned_dirs.add(q_path)
+            queue = kept_spine
+            bulk_queue.clear()
     return git_paths, sockets, truncated or incomplete
 
 
@@ -2411,39 +2638,107 @@ def wrap_bwrap(
         bwrap_cmd.extend(["--ro-bind" if readonly else "--bind", mount_root, mount_root])
 
     # Bounded scan of the mounted workspace: .git entries (writable sessions) and pathname sockets
+    scan_candidates = {mount_root, ws}
+    if repo_needed and repo_abs:
+        scan_candidates.add(repo_abs)
     scan_roots = []
-    for r in sorted({mount_root, ws}, key=len):
-        if r == "/":
-            continue
+    for r in sorted((c for c in scan_candidates if c), key=len):
         if not any(_is_within(r, s) for s in scan_roots):
             scan_roots.append(r)
     broad = any(_broad_workspace(r, user_home) for r in scan_roots)
-    scan_limit = _workspace_scan_limit()
+    scan_skip_paths: Set[str] = set()
+    if "/" in scan_roots:
+        exposed_nonroot = [p for p in (mount_root, ws, repo_abs) if p and p != "/"]
+        scan_skip_paths.update(["/proc", "/sys", "/dev"])
+        for m in ("/tmp", *SOCKET_RUNTIME_DIRS, *masked_roots, user_home):
+            if m and not any(_is_within(p, m) or _is_within(m, p) for p in exposed_nonroot):
+                scan_skip_paths.add(m)
+    if any(_home_exposed(p, user_home) for p in (mount_root, ws, repo_abs) if p and p != "/"):
+        for rel in SENSITIVE_HOME_DIRS:
+            scan_skip_paths.add(os.path.join(user_home, rel))
+        try:
+            for entry in os.listdir(user_home):
+                if any(entry.startswith(pfx) for pfx in (".codex", ".claude", ".gemini", ".anthropic", ".openai")):
+                    scan_skip_paths.add(os.path.join(user_home, entry))
+        except OSError:
+            pass
+    priority_ws = tuple(
+        dict.fromkeys(
+            p
+            for p in (
+                ws,
+                repo_abs if repo_needed else None,
+                mount_root if not _broad_workspace(mount_root, user_home) else None,
+            )
+            if p
+        )
+    )
+    unbounded_ws = tuple(
+        p for p in dict.fromkeys((*priority_ws, mount_root))
+        if p and not _broad_workspace(p, user_home)
+    )
+    protected_ws = tuple(
+        dict.fromkeys(
+            p for p in (ws, mount_root, repo_abs if repo_needed else None, user_home) if p
+        )
+    )
+    scan_limit = _workspace_scan_limit(readonly=readonly)
+    scan_timeout = _workspace_scan_timeout(readonly=readonly)
+    unscanned_dirs: Set[str] = set()
+    masked_cache_dirs: Set[str] = set()
     git_paths, ws_sockets, truncated = _scan_tree(
         scan_roots,
         max_depth=BROAD_SCAN_DEPTH if broad else None,
         entry_limit=scan_limit,
         collect_git=not readonly,
         skip_dirs=frozenset(),
+        skip_paths=scan_skip_paths,
         descend_git=True,
+        timeout_seconds=scan_timeout,
+        mask_dirs=_workspace_masked_cache_dirs(),
+        priority_paths=priority_ws,
+        unbounded_paths=unbounded_ws,
+        unscanned_dirs=unscanned_dirs,
+        masked_cache_dirs=masked_cache_dirs,
     )
-    if truncated:
-        if not readonly:
+    if not readonly and (truncated or unscanned_dirs):
+        raise SandboxConfigError(
+            f"工作区扫描未能完成（条目超过 {scan_limit}，或含有当前用户自己的不可读目录），"
+            ".git 保护与套接字遮蔽无法确认，拒绝可写沙箱 (fail closed)。"
+            "可用 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT 调高上限，或恢复相关目录的读取权限。"
+        )
+    if readonly:
+        workspace_tmpfs_masks = _collapse_unscanned_dirs(
+            masked_cache_dirs | unscanned_dirs, protected_ws
+        )
+        if workspace_tmpfs_masks is None:
             raise SandboxConfigError(
-                f"工作区扫描未能完成（条目超过 {scan_limit}，或含有当前用户自己的不可读目录），"
-                ".git 保护与套接字遮蔽无法确认，拒绝可写沙箱 (fail closed)。"
-                "可用 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT 调高上限，或恢复相关目录的读取权限。"
+                f"工作区扫描未能完成（条目超过 {scan_limit}，或工作区根目录不可读/无法遮蔽未扫描子树），"
+                "拒绝只读沙箱 (fail closed)。"
             )
-        _warn(f"工作区扫描未能完成（条目超过 {scan_limit} 或有不可读目录），套接字遮蔽不完整（只读会话）")
+        if truncated:
+            _warn(f"工作区扫描未能完成（条目超过 {scan_limit} 或有不可读目录），未扫描子目录已由 tmpfs 遮蔽（只读会话）")
+    else:
+        collapsed_cache = _collapse_unscanned_dirs(masked_cache_dirs, protected_ws)
+        if collapsed_cache is None:
+            raise SandboxConfigError("工作区缓存目录遮蔽无法完成，拒绝构建沙箱 (fail closed)。")
+        workspace_tmpfs_masks = collapsed_cache
+
+    workspace_tmpfs_set = set(workspace_tmpfs_masks)
 
     # In writable sessions, protect all root .git directories AND submodule .git gitfiles from tampering
     if not readonly:
         for gp_str in sorted(git_paths):
-            bwrap_cmd.extend(["--ro-bind", gp_str, gp_str])
+            if not _covered_by_norm_set(gp_str, workspace_tmpfs_set):
+                bwrap_cmd.extend(["--ro-bind", gp_str, gp_str])
 
     # If repo_root is provided and distinct from mount_root, ensure host repo_root is strictly read-only
     if repo_needed and not repo_first:
         bwrap_cmd.extend(["--ro-bind", repo_abs, repo_abs])
+
+    for mdir in workspace_tmpfs_masks:
+        bwrap_cmd.extend(["--tmpfs", mdir])
+        readonly_masks.append(mdir)
 
     # SENSITIVE_HOME_DIRS: a workspace / repo_root mount that contains HOME made
     # it visible again, so re-mask every credential path after those mounts.
@@ -2540,7 +2835,10 @@ def wrap_bwrap(
                 readonly_masks.append(path)
 
     # Mask pre-existing pathname AF_UNIX sockets in workspace / provider state to prevent host breakout
-    sockets = set(ws_sockets)
+    sockets = {
+        s for s in ws_sockets
+        if not _covered_by_norm_set(s, workspace_tmpfs_set)
+    }
     if provider_scan_roots:
         _, p_socks, _ = _scan_tree(
             provider_scan_roots,
