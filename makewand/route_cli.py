@@ -528,7 +528,7 @@ def cmd_outcome(args) -> None:
             if value is not None:
                 details[name] = value
         ledger = OutcomeLedger()
-        ledger.record(
+        recorded = ledger.record(
             provider, tier, task_type, passed,
             seconds=seconds, calls=calls, model=model, effort=effort,
             infer_request_id=(
@@ -546,6 +546,11 @@ def cmd_outcome(args) -> None:
         _fail(f"错误：{error}")
     except OSError as error:
         _fail(f"错误：写入成绩失败：{error}")
+    if not recorded.get("request_id"):
+        # Recorded anyway: an unlinked row still counts, it just cannot be matched to its call.
+        print("makewand: warning: outcome not linked to a dispatched call: no --request-id or "
+              "MAKEWAND_TASK_ID, and no single recent unrecorded call of this provider/model "
+              "to link automatically. Pass the request id the dispatch used.", file=sys.stderr)
     detail = ""
     if model or effort:
         detail = f"（model={model or '-'} effort={effort or '-'}）"
