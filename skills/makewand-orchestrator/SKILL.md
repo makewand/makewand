@@ -46,6 +46,8 @@ makewand route review hard --risk high --self <你> --not <实现方> --request-
 makewand outcome codex 3 review pass --candidate-verdict fail --candidate-hash <SHA256> --model <模型> --effort <深度> --seconds <实际秒数> --calls 1 --caller <你> --request-id <ID> --max-model-calls <N>
 ```
 
+review 记录不带 `--candidate-verdict` 时照常记账但会警告：没有实测耗时和实际调用数就照实不填，不要为消除警告编数字。用 `--call-budget-file` 指定非默认账本时，任务上限照常生效，但整机/项目日计数另算，`makewand observe` 会列出这些账本。
+
 实现/测试任务的 pass/fail 仍是其结果是否通过验收。操作失败另带 `--failure-kind startup|auth|quota|timeout|unknown|invalid_output|verification`；只有 startup/auth/quota 在本请求冷却 5 分钟，unknown/timeout 要用户批准重试。候选测试失败或有效审查拒绝不触发提供方冷却。429/额度耗尽还应 `makewand mark <工具> <剩余时长>`，不要猜测失败原因。
 
 退出码 12/16/17 分别为取消/超时/未知：告知用户，未经授权不自动重试，UNKNOWN 可能已产生花费。13 是预算耗尽，14 是应用冲突，15 是沙箱不可用。模型恢复、冷却时间经过或预选推荐项都不构成重试授权；用户已批准后才使用 route 的 `--retry-approved`。`status --probe` 可能产生真实模型调用，不能当廉价健康检查。

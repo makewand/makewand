@@ -782,6 +782,8 @@ def observe_all_dialogs(save_report=True, clean_hung=False, confirm_pids: Option
             cleaned_pids = terminate_dispatched_processes(hung_candidates, confirm_pids)
 
     optimizations = analyze_makewand_optimizations(session_reports, metrics, external_sessions=external_sessions)
+    from makewand import ledger_registry
+    other_ledgers = ledger_registry.recent_activity()
 
     report = {
         "timestamp": datetime.now().isoformat(),
@@ -793,7 +795,8 @@ def observe_all_dialogs(save_report=True, clean_hung=False, confirm_pids: Option
         "external_count": len(external_sessions),
         "makewand_optimizations": optimizations,
         "hung_candidates": hung_candidates,
-        "cleaned_pids": cleaned_pids
+        "cleaned_pids": cleaned_pids,
+        "other_ledgers": other_ledgers,
     }
 
     if save_report:
@@ -859,6 +862,16 @@ def format_observation_markdown(report):
         for cand in report["hung_candidates"]:
             alive = "是" if cand.get("dispatcher_alive") else "否"
             lines.append(f"| `{cand['pid']}` | {cand['comm']} | {cand['etimes'] // 60} 分钟 | `{cand.get('dispatcher_pid')}` | {alive} | `{cand.get('args', '')}` |")
+
+    if report.get("other_ledgers"):
+        lines.append("")
+        lines.append("### 📒 非默认调用账本近 24 小时调用（默认账本看不到这些；任务上限照常生效，整机/项目日计数另算）")
+        lines.append("")
+        lines.append("| 账本 | 调用次数 | 异常 | 引擎 | 任务 |")
+        lines.append("|---|---:|---:|---|---|")
+        for ledger in report["other_ledgers"]:
+            lines.append(f"| `{ledger['path']}` | {ledger['calls']} | {ledger['abnormal']} | "
+                         f"{', '.join(ledger['engines'])} | {', '.join(ledger['tasks']) or '-'} |")
 
     lines.append("")
     lines.append("#### 🛠️ Makewand 针对性优化研判与建议：")

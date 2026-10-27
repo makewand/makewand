@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from contextlib import contextmanager
-from makewand import accounting_files, filelock, layered_budget, account_leases, ledger_compaction
+from makewand import accounting_files, filelock, layered_budget, account_leases, ledger_compaction, ledger_registry
 
 
 class BudgetError(RuntimeError):
@@ -313,7 +313,9 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
                                      "result_status": None, "outcome_known": None,
                                      "tokens": None, "monetary_cost": None})
             _save(path, data)
-            return attempt
+            ledger_path = path.path
+        ledger_registry.note(ledger_path)  # outside the ledger lock: visibility only
+        return attempt
     except BudgetError:
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
