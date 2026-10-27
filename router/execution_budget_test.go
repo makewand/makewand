@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/makewand/makewand/execution"
 )
@@ -45,7 +46,13 @@ func budgetTestContext(t *testing.T, maximum int) (context.Context, string) {
 }
 func budgetTestAttempts(t *testing.T, path string) []map[string]any {
 	t.Helper()
+	// Like production readers (execution.retryAccountingIO), retry while a
+	// settlement still holds the ledger: Windows reports a sharing violation.
 	data, err := os.ReadFile(path)
+	for deadline := time.Now().Add(2 * time.Second); err != nil && isSharingViolation(err) && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		data, err = os.ReadFile(path)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
