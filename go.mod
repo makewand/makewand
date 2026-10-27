@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/mattn/go-runewidth v0.0.31
 	github.com/spf13/cobra v1.10.2
-	github.com/spf13/pflag v1.0.9
+	github.com/spf13/pflag v1.0.10
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.0

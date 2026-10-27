@@ -2,6 +2,23 @@
 
 Thanks for your interest in improving makewand.
 
+## Maintenance mode and frozen components
+
+Since 2026-10-24 makewand is in maintenance mode: no new features; correctness,
+security, recovery and compatibility fixes only. The day-to-day core is dispatch
+(`makewand <provider>` / `review`), `route`, the call budget and outcome ledgers,
+`mark` and the sandbox.
+
+These components are **frozen** (2026-10-27): they keep their code and tests,
+but only defects that lose data or break security are fixed; ordinary bugs,
+features and refactors are not taken.
+
+- Multi-tenant server suite: `server*` packages, the `serve` command and `cmd/server-drill`
+- Terminal UI: `internal/tui`
+- Race / ensemble / merge / DAG: `race`, `ensemble`, `merge`, `makewand/ensemble.py`, `makewand/merger.py`, `makewand/task_dag.py`
+- Website `site/` and the Homebrew/Scoop channels (`scripts/publish_homebrew_tap.sh`, `scripts/publish_scoop_bucket.sh`)
+- `benchmarks/`
+
 ## Development setup
 
 1. Clone the repository and enter it.

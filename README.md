@@ -9,6 +9,8 @@
 curl -fsSL https://makewand.org/install.sh | bash
 ```
 
+> **维护模式（2026-10-24 起）**：不再增加功能，只做正确性、安全、恢复与兼容修复。多租户 server 套件、TUI、race/ensemble、官网及 Homebrew/Scoop 渠道已冻结，只修数据丢失或安全缺陷。详见 [CONTRIBUTING.md](CONTRIBUTING.md#maintenance-mode-and-frozen-components)。
+
 ---
 
 ## 🌟 核心特性 (Key Features)

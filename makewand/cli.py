@@ -1889,7 +1889,8 @@ def _main():
             if args.caller not in CALLERS:
                 raise ValueError("invalid MAKEWAND_CALLER")
             os.environ["MAKEWAND_CALLER"] = args.caller
-        if explicit_request and args.max_model_calls is None and inherited_maximum is None:
+        dispatch_subcommands = PROMPT_COMMANDS | {"review", "ensemble", "chat", None}
+        if (explicit_request or (request_id is not None and args.subcommand in dispatch_subcommands)) and args.max_model_calls is None and inherited_maximum is None:
             args.max_model_calls = 3
         inherited_limit = int(inherited_maximum) if inherited_maximum is not None else None
         if inherited_limit is not None and inherited_limit <= 0:

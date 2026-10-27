@@ -329,6 +329,7 @@ class OutcomeLedger:
         ts: Any = None,
         model: Any = None,
         effort: Any = None,
+        infer_request_id: Any = None,
         **details,
     ) -> Dict[str, Any]:
         """追加一条成绩记录。ts 可注入（epoch 秒或 datetime），默认真实时钟。
@@ -373,6 +374,12 @@ class OutcomeLedger:
                     pass
             filelock.flock(fd, filelock.LOCK_EX)
             try:
+                if "request_id" not in details and callable(infer_request_id):
+                    inferred = infer_request_id(self._read_rows(strict=False, locked=True))
+                    if inferred is not None:
+                        details = dict(details, request_id=inferred)
+                        row.update(_outcome_details(dict(row, **details)))
+                        payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
                 # A truncated tail line without a trailing newline (crash
                 # mid-append, hand-truncated file) must not swallow this
                 # record: terminate that line first, under the write lock.
@@ -406,7 +413,7 @@ class OutcomeLedger:
             os.close(fd)
         return dict(row)
 
-    def _read_rows(self, *, strict=False) -> List[Dict[str, Any]]:
+    def _read_rows(self, *, strict=False, locked=False) -> List[Dict[str, Any]]:
         try:
             stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
         except FileNotFoundError:
@@ -418,12 +425,13 @@ class OutcomeLedger:
             return []
         rows: List[Dict[str, Any]] = []
         with stream:
-            try:
-                filelock.flock(stream.fileno(), filelock.LOCK_SH)
-            except OSError:
-                if strict:
-                    raise
-                pass
+            if not locked:
+                try:
+                    filelock.flock(stream.fileno(), filelock.LOCK_SH)
+                except OSError:
+                    if strict:
+                        raise
+                    pass
             try:
                 for line in stream:
                     text = line.strip()
@@ -441,10 +449,11 @@ class OutcomeLedger:
                     elif strict:
                         raise ValueError("cannot verify request cooldowns from invalid outcome metadata")
             finally:
-                try:
-                    filelock.flock(stream.fileno(), filelock.LOCK_UN)
-                except OSError:
-                    pass
+                if not locked:
+                    try:
+                        filelock.flock(stream.fileno(), filelock.LOCK_UN)
+                    except OSError:
+                        pass
         return rows
 
     def records(self) -> Iterator[Dict[str, Any]]:

@@ -67,3 +67,42 @@ class DispatchRequestTests(unittest.TestCase):
             ledger = json.loads((base / "calls.json").read_text())
             self.assertEqual(ledger["scopes"]["tasks"]["user-request"]["used"], 5)
             self.assertEqual(ledger["scopes"]["tasks"]["independent-request"]["used"], 1)
+
+    def test_inherited_makewand_task_id_on_dispatch_command_enforces_default_budget_of_3(self):
+        provider_child = r'''
+import json,sys
+from unittest.mock import patch
+sys.path.insert(0, sys.argv.pop(1))
+from makewand import cli
+def synthetic(args, is_auto_routed_run=False):
+    result = cli._execute_direct_task("synthetic", lambda prompt, **kw: (True, "fixture", None),
+                                      "fixture", timeout=1, readonly=True)
+    print(json.dumps({"status": result.status, "task_id": result.task_id}))
+    raise SystemExit(result.exit_code)
+with patch("makewand.cli._dispatch_parsed_command", synthetic):
+    cli._main()
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            env = dict(os.environ)
+            for key in tuple(env):
+                if key.startswith("MAKEWAND_"):
+                    env.pop(key)
+            env.update(HOME=tmp, XDG_STATE_HOME=str(base / "state"), XDG_CACHE_HOME=str(base / "cache"),
+                       XDG_CONFIG_HOME=str(base / "config"), MAKEWAND_CONFIG_DIR=str(base / "config"),
+                       MAKEWAND_NO_DAEMON="1", MAKEWAND_TASK_ID="env-task-id-99")
+
+            def invoke_codex():
+                return subprocess.run(
+                    [sys.executable, "-I", "-c", provider_child, str(ROOT), "codex", "hello", "--readonly"],
+                    cwd=tmp, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20,
+                )
+
+            for _ in range(3):
+                res = invoke_codex()
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(json.loads(res.stdout)["task_id"], "env-task-id-99")
+            self.assertEqual(invoke_codex().returncode, 13)
+            ledger = json.loads((base / "config" / "call-budget.json").read_text())
+            self.assertEqual(ledger["scopes"]["tasks"]["env-task-id-99"]["used"], 3)
+            self.assertEqual(ledger["scopes"]["tasks"]["env-task-id-99"]["maximum"], 3)

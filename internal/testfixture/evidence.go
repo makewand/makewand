@@ -39,12 +39,19 @@ func IsolateExecutionEvidence() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := os.Mkdir(filepath.Join(dir, "config"), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
 	for _, key := range accountingEnv {
 		if err := os.Unsetenv(key); err != nil {
 			return nil, err
 		}
 	}
-	for key, value := range map[string]string{"MAKEWAND_EXECUTION_EVIDENCE_DIR": filepath.Join(dir, "evidence"), isolatedEnv: dir} {
+	// MAKEWAND_CONFIG_DIR keeps the ledger registry and default ledger of a
+	// test that names its own ledger out of the user's configuration.
+	for key, value := range map[string]string{"MAKEWAND_EXECUTION_EVIDENCE_DIR": filepath.Join(dir, "evidence"),
+		"MAKEWAND_CONFIG_DIR": filepath.Join(dir, "config"), isolatedEnv: dir} {
 		if err := os.Setenv(key, value); err != nil {
 			return nil, err
 		}
