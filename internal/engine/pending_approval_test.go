@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -212,7 +213,13 @@ func TestPendingApprovalAuthorizedBeforeWriteRequiresReview(t *testing.T) {
 func TestPendingApprovalValidationAndLockAreIndependent(t *testing.T) {
 	p := pendingApprovalFixture(t)
 	record := sealPendingApproval(t, p)
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// A deadlock guard, not a latency bound: slow Windows runners need longer
+	// for the SQLite transaction and fsyncs.
+	guard := 3 * time.Second
+	if runtime.GOOS == "windows" {
+		guard = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), guard)
 	defer cancel()
 	err := p.ApplyFilesTransactional(ctx, record.Files, func() error {
 		if err := p.TransitionPendingApproval(ctx, record, "authorized", "under independent apply lock"); err != nil {

@@ -95,7 +95,7 @@ func TestRawCLIChildStub(t *testing.T) {
 		if err := os.WriteFile(path+".armed-ready", []byte("armed"), 0o600); err != nil {
 			os.Exit(4)
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(rawEscapeWindow())
 		// #nosec G703 -- marker is in the parent-created temporary fixture directory.
 		if err := os.WriteFile(path+".escaped", []byte("escaped"), 0o600); err != nil {
 			os.Exit(4)
@@ -131,6 +131,17 @@ func TestRawCLIChildStub(t *testing.T) {
 		fmt.Println("--- FILE: fixture.txt ---\n```\nsynthetic fixture\n```")
 	}
 	os.Exit(0)
+}
+
+// rawEscapeWindow is how long the marker descendant outlives the armed leader
+// before it marks an escape. Cleanup must finish well inside it; slow Windows
+// runners get a longer window so process teardown and settlement fit, while a
+// cleanup that waited for the descendant would still overrun it.
+func rawEscapeWindow() time.Duration {
+	if runtime.GOOS == "windows" {
+		return 10 * time.Second
+	}
+	return 2 * time.Second
 }
 
 func waitRawStubMarker(path, suffix string) bool {
@@ -206,11 +217,11 @@ func TestRawCLILeaderExitClearsDescendantsAndPipes(t *testing.T) {
 	select {
 	case completed = <-done:
 		finished = true
-	case <-time.After(1800 * time.Millisecond):
-		t.Fatal("leader, descendant, or inherited pipes did not finish within 1800ms of arming")
+	case <-time.After(rawEscapeWindow() * 9 / 10):
+		t.Fatalf("leader, descendant, or inherited pipes did not finish within %v of arming", rawEscapeWindow()*9/10)
 	}
 	r := completed.result
-	if ctx.Err() != nil || completed.at.Sub(started) > 1800*time.Millisecond || (r.err != nil && !errors.Is(r.err, execution.ErrUnknownOutcome)) || (r.err == nil && r.output != "leader\n") {
+	if ctx.Err() != nil || completed.at.Sub(started) > rawEscapeWindow()*9/10 || (r.err != nil && !errors.Is(r.err, execution.ErrUnknownOutcome)) || (r.err == nil && r.output != "leader\n") {
 		t.Fatalf("leader/stdio was not bounded after readiness: err=%v ctx=%v elapsed=%v output=%q", r.err, ctx.Err(), completed.at.Sub(started), r.output)
 	}
 	for _, suffix := range []string{".armed-ready", ".leader-exit"} {
@@ -218,7 +229,7 @@ func TestRawCLILeaderExitClearsDescendantsAndPipes(t *testing.T) {
 			t.Fatalf("leader or descendant did not reach the real exit phase %s: %v", suffix, err)
 		}
 	}
-	if remaining := time.Until(completed.at.Add(2300 * time.Millisecond)); remaining > 0 {
+	if remaining := time.Until(completed.at.Add(rawEscapeWindow() + 300*time.Millisecond)); remaining > 0 {
 		time.Sleep(remaining)
 	}
 	if _, err := os.Stat(state + ".escaped"); !os.IsNotExist(err) {

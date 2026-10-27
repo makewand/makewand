@@ -22,14 +22,18 @@ func TestR4DefaultBusyWaitLeavesDeadlineForFallback(t *testing.T) {
 			t.Fatal(err)
 		}
 	}()
-	waitCtx, cancel := context.WithTimeout(ctx, capacityTestDuration(240*time.Millisecond))
+	// The whole window stays inside the holder's 5 s lease heartbeat: a
+	// heartbeat transaction landing on the last busy attempt (Windows scales
+	// the window 25x) stalled it past the bound.
+	window := min(capacityTestDuration(240*time.Millisecond), 4*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 	started := time.Now()
 	_, err = Reserve(waitCtx, Metadata{Engine: "codex"})
 	if !errors.Is(err, ErrConcurrencyBusy) || errors.Is(err, ErrBudgetExhausted) || waitCtx.Err() != nil {
 		t.Fatalf("busy wait consumed deadline or became terminal: %v, ctx=%v", err, waitCtx.Err())
 	}
-	if elapsed := time.Since(started); elapsed < capacityTestDuration(30*time.Millisecond) || elapsed > capacityTestDuration(220*time.Millisecond) {
+	if elapsed := time.Since(started); elapsed < window/8 || elapsed > window*11/12 {
 		t.Fatalf("unexpected bounded wait: %v", elapsed)
 	}
 	fallback, err := Reserve(waitCtx, Metadata{Engine: "grok"})

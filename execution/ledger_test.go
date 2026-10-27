@@ -87,7 +87,10 @@ func TestLedgerConcurrentHardLimitAndUnknownMeasurements(t *testing.T) {
 				return
 			}
 			admitted.Add(1)
-			if err := attempt.Complete(Outcome{Status: Unknown, Known: false}); err != nil {
+			// Complete waits at most accountingWriteTimeout for the ledger and
+			// then settles in the background; 60 contenders on a slow runner
+			// can reach that bound, which is not an accounting failure.
+			if err := attempt.Complete(Outcome{Status: Unknown, Known: false}); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 				t.Errorf("complete: %v", err)
 			}
 		})
@@ -97,6 +100,17 @@ func TestLedgerConcurrentHardLimitAndUnknownMeasurements(t *testing.T) {
 		t.Fatalf("admitted=%d, want 7", admitted.Load())
 	}
 	ledger := readTestLedger(t, path)
+	for settled := time.Now().Add(time.Minute); ; {
+		pending := false
+		for _, raw := range ledger["attempts"].([]any) {
+			pending = pending || raw.(map[string]any)["status"] != "completed"
+		}
+		if !pending || time.Now().After(settled) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+		ledger = readTestLedger(t, path)
+	}
 	for _, raw := range ledger["attempts"].([]any) {
 		entry := raw.(map[string]any)
 		if entry["status"] != "completed" || entry["result_status"] != "UNKNOWN" || entry["outcome_known"] != false || entry["tokens"] != nil || entry["monetary_cost"] != nil {
