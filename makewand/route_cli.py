@@ -306,11 +306,137 @@ def cmd_route(args) -> None:
         if request_arguments:
             escalate_cmd += " " + " ".join(request_arguments)
         lines.append(f"验收不过就升一档：{escalate_cmd}")
+    outcome_hint = _OUTCOME_HINT
+    outcome_req_args = _request_arguments(
+        {"request_id": execution_options.get("request_id"), "caller": execution_options.get("caller")},
+        include_maximum=False,
+    )
+    if outcome_req_args:
+        outcome_hint += " " + " ".join(outcome_req_args)
     lines.append(
         "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
-        + _OUTCOME_HINT
+        + outcome_hint
     )
     print("\n".join(lines))
+
+
+def _infer_recent_request_id(
+    ledger: OutcomeLedger,
+    provider: str,
+    model: str | None,
+    budget_file: str | None = None,
+    max_age_seconds: float = 3600.0,
+    existing_rows: list[dict] | None = None,
+) -> str | None:
+    """When `makewand outcome` is called in a fresh shell without `--request-id`
+    or `MAKEWAND_TASK_ID`, match the most recent completed call in `call-budget.json`
+    for the same provider (and model, if specified) that still lacks an outcome row.
+    """
+    try:
+        from makewand.execution_contract import identifier
+        from makewand.layered_budget import default_path, project_ref
+
+        path_str = budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or default_path()
+        if not path_str:
+            return None
+        current_project = project_ref()
+        data = json.loads(Path(path_str).expanduser().read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    attempts = data.get("attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+
+    def _matches_project(entry: dict) -> bool:
+        scopes = entry.get("scopes")
+        if not isinstance(scopes, list):
+            return False
+        for item in scopes:
+            if isinstance(item, list) and len(item) == 2 and item[0] == "projects" and isinstance(item[1], str):
+                proj_hash = item[1].rpartition(":")[0] or item[1]
+                return proj_hash == current_project
+        return False
+
+    recorded_counts: dict[tuple[str, str], int] = {}
+    recorded_model_counts: dict[tuple[str, str, str | None], int] = {}
+    rows_to_scan = existing_rows if existing_rows is not None else ledger._read_rows(strict=False)
+    for row in rows_to_scan:
+        if not isinstance(row, dict):
+            continue
+        req_id = row.get("request_id")
+        prov = row.get("provider")
+        if isinstance(req_id, str) and req_id and isinstance(prov, str) and prov:
+            recorded_counts[(req_id, prov)] = recorded_counts.get((req_id, prov), 0) + 1
+            rm = row.get("model")
+            norm_rm = rm.strip() if isinstance(rm, str) and rm.strip() else None
+            recorded_model_counts[(req_id, prov, norm_rm)] = (
+                recorded_model_counts.get((req_id, prov, norm_rm), 0) + 1
+            )
+
+    attempt_counts: dict[tuple[str, str], int] = {}
+    attempt_model_counts: dict[tuple[str, str, str | None], int] = {}
+    cross_project_tasks: set[str] = set()
+    for entry in attempts:
+        if not isinstance(entry, dict):
+            continue
+        tid = entry.get("task_id")
+        if isinstance(tid, str) and tid.strip():
+            tid = tid.strip()
+            if not _matches_project(entry):
+                cross_project_tasks.add(tid)
+                continue
+        else:
+            continue
+        if entry.get("status") != "completed":
+            continue
+        eng = entry.get("engine")
+        if isinstance(eng, str) and eng:
+            attempt_counts[(tid, eng)] = attempt_counts.get((tid, eng), 0) + 1
+            em = entry.get("requested_model")
+            norm_em = em.strip() if isinstance(em, str) and em.strip() else None
+            attempt_model_counts[(tid, eng, norm_em)] = (
+                attempt_model_counts.get((tid, eng, norm_em), 0) + 1
+            )
+
+    now = time.time()
+    norm_model = model.strip() if isinstance(model, str) and model.strip() else None
+    candidate_tasks: list[str] = []
+    for entry in reversed(attempts):
+        if not isinstance(entry, dict) or entry.get("status") != "completed":
+            continue
+        if entry.get("engine") != provider:
+            continue
+        if not _matches_project(entry):
+            continue
+        task_id = entry.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            continue
+        task_id = task_id.strip()
+        if task_id in cross_project_tasks:
+            continue
+        try:
+            identifier(task_id, "request_id")
+        except ValueError:
+            continue
+        ts = entry.get("finished_at") if entry.get("finished_at") is not None else entry.get("started_at")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
+            continue
+        if not (-300.0 <= now - float(ts) <= max_age_seconds):
+            continue
+        req_model = entry.get("requested_model")
+        norm_req_model = req_model.strip() if isinstance(req_model, str) and req_model.strip() else None
+        if norm_req_model != norm_model:
+            continue
+        if (
+            attempt_counts.get((task_id, provider), 0) > recorded_counts.get((task_id, provider), 0)
+            and attempt_model_counts.get((task_id, provider, norm_model), 0)
+            > recorded_model_counts.get((task_id, provider, norm_model), 0)
+        ):
+            if task_id not in candidate_tasks:
+                candidate_tasks.append(task_id)
+    return candidate_tasks[0] if len(candidate_tasks) == 1 else None
 
 
 def cmd_mark(args) -> None:
@@ -359,9 +485,19 @@ def cmd_outcome(args) -> None:
             value = getattr(args, name, None)
             if value is not None:
                 details[name] = value
-        OutcomeLedger().record(
+        ledger = OutcomeLedger()
+        ledger.record(
             provider, tier, task_type, passed,
             seconds=seconds, calls=calls, model=model, effort=effort,
+            infer_request_id=(
+                lambda rows: _infer_recent_request_id(
+                    ledger,
+                    provider,
+                    model,
+                    budget_file=getattr(args, "call_budget_file", None),
+                    existing_rows=rows,
+                )
+            ),
             **details,
         )
     except ValueError as error:
