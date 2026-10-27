@@ -23,7 +23,8 @@ LAUNCHER = REPO_ROOT / "bin" / "makewand"
 WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
 FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
-          " --model <模型> --effort <推理深度>")
+          " --model <模型> --effort <推理深度>"
+          "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls）")
 CANDIDATE_LINE = re.compile(
     r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1 --timeout \d+ --total-timeout \d+(?: --readonly)?   # (.+)$"
 )
@@ -70,6 +71,17 @@ class RoutingCliTests(unittest.TestCase):
         self.assertTrue(row["review_validated"])
         self.assertFalse(row["candidate_approved"])
         self.assertEqual((row["seconds"], row["calls"], row["caller"], row["request_id"]), (12.5, 1, "agy", "review-42"))
+
+    def test_review_without_candidate_verdict_is_recorded_with_a_warning(self):
+        result = self.run_cli("outcome", "codex", "3", "review", "pass", "--request-id", "review-43")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("without --candidate-verdict", result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["request_id"], "review-43")
+        self.assertNotIn("candidate_approved", rows[-1])
+        implement = self.run_cli("outcome", "codex", "3", "implement", "pass", "--request-id", "impl-43")
+        self.assertEqual(implement.returncode, 0, implement.stderr)
+        self.assertNotIn("candidate-verdict", implement.stderr)
 
     def test_recorded_request_failure_cools_route_without_affecting_other_requests(self):
         recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",

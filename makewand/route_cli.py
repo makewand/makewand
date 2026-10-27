@@ -44,6 +44,7 @@ _TEXT_CANDIDATE_LIMIT = 5
 _OUTCOME_HINT = (
     "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
     " --model <模型> --effort <推理深度>"
+    "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls）"
 )
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
@@ -512,6 +513,12 @@ def cmd_outcome(args) -> None:
         passed = args.result == "pass"
         details = {}
         verdict = getattr(args, "candidate_verdict", None)
+        if verdict is None and task_type == "review":
+            # Recorded anyway: a missing verdict must not cost the row or invite made-up timings.
+            print("makewand: warning: review outcome without --candidate-verdict; the code verdict "
+                  "(pass|fail|unverified) is what shows whether cross-model review is worth it. "
+                  "It needs measured --seconds and actual --calls; if you have none, record as is.",
+                  file=sys.stderr)
         if verdict is not None:
             if seconds is None or calls is None:
                 raise ValueError("--candidate-verdict requires measured --seconds and actual --calls")

@@ -575,6 +575,7 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cannot reserve model task: %w", err)
 		}
+		noteLedger(cfg.LedgerPath)
 	}
 	attempt.leaseStop = make(chan struct{})
 	// Legacy ledgers have no account lease to renew. In particular, don't
