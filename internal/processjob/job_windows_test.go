@@ -259,7 +259,10 @@ func TestWindowsProcessJobMemoryLimitConfigured(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	cmd := windowsJobCommand(ctx, "hold", "")
-	const memory = uintptr(512 << 20)
+	memory := uintptr(512 << 20)
+	if raceEnabled {
+		memory = 4 << 30
+	}
 	cleanup, err := StartWithOptions(cmd, Options{MaxProcesses: 3, MemoryBytes: memory})
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +276,11 @@ func TestWindowsProcessJobMemoryLimitConfigured(t *testing.T) {
 	}
 	lease := value.(*jobLease)
 	lease.mu.Lock()
+	if lease.handle == 0 {
+		// A NULL handle would query the test process's own job instead.
+		lease.mu.Unlock()
+		t.Fatal("child exited and its job closed before the limits were read")
+	}
 	var limits windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	err = windows.QueryInformationJobObject(lease.handle, windows.JobObjectExtendedLimitInformation, uintptr(unsafe.Pointer(&limits)), uint32(unsafe.Sizeof(limits)), nil)
 	lease.mu.Unlock()
