@@ -23,7 +23,8 @@ LAUNCHER = REPO_ROOT / "bin" / "makewand"
 WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
 FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
-          " --model <模型> --effort <推理深度>")
+          " --model <模型> --effort <推理深度>"
+          "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls）")
 CANDIDATE_LINE = re.compile(
     r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1 --timeout \d+ --total-timeout \d+(?: --readonly)?   # (.+)$"
 )
@@ -70,6 +71,17 @@ class RoutingCliTests(unittest.TestCase):
         self.assertTrue(row["review_validated"])
         self.assertFalse(row["candidate_approved"])
         self.assertEqual((row["seconds"], row["calls"], row["caller"], row["request_id"]), (12.5, 1, "agy", "review-42"))
+
+    def test_review_without_candidate_verdict_is_recorded_with_a_warning(self):
+        result = self.run_cli("outcome", "codex", "3", "review", "pass", "--request-id", "review-43")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("without --candidate-verdict", result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["request_id"], "review-43")
+        self.assertNotIn("candidate_approved", rows[-1])
+        implement = self.run_cli("outcome", "codex", "3", "implement", "pass", "--request-id", "impl-43")
+        self.assertEqual(implement.returncode, 0, implement.stderr)
+        self.assertNotIn("candidate-verdict", implement.stderr)
 
     def test_recorded_request_failure_cools_route_without_affecting_other_requests(self):
         recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",
@@ -142,6 +154,144 @@ class RoutingCliTests(unittest.TestCase):
                               "--seconds", "1", "--calls", "1")
         self.assertEqual(result.returncode, 2)
         self.assertIn("cannot validate", result.stderr)
+
+    def test_outcome_hint_includes_request_id_and_outcome_auto_links_recent_budget_attempt(self):
+        import hashlib as _hashlib
+        import time as _time
+        proj_hash = _hashlib.sha256(str(self.work.resolve()).encode()).hexdigest()[:32]
+        same_proj_scopes = lambda tid: [["tasks", tid], ["projects", f"{proj_hash}:2026-10-27"], ["machine", "2026-10-27"]]
+        route_res = self.run_cli("route", "review", "normal", "--simple",
+                                 "--request-id", "auto-link-42", "--caller", "claude", quota={})
+        self.assertEqual(route_res.returncode, 0, route_res.stderr)
+        footer_line = route_res.stdout.splitlines()[-1]
+        self.assertIn("--request-id auto-link-42", footer_line)
+        self.assertIn("--caller claude", footer_line)
+
+        cfg_dir = self.base / "config"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        now = _time.time()
+        budget_file = cfg_dir / "call-budget.json"
+        budget_file.write_text(json.dumps({
+            "schema": 2,
+            "maximum": 1000,
+            "scopes": {"tasks": {"auto-link-42": {"maximum": 3, "used": 1, "last_used": now}}, "projects": {}, "machine": {}, "day": "2026-10-27", "clock": now},
+            "attempts": [
+                {
+                    "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+                    "engine": "muse",
+                    "tier": "standard",
+                    "requested_model": "muse-wonder-full-1.0",
+                    "readonly": True,
+                    "started_at": now - 30.0,
+                    "finished_at": now - 5.0,
+                    "status": "completed",
+                    "task_id": "auto-link-42",
+                    "scopes": same_proj_scopes("auto-link-42"),
+                    "result_status": "PASSED",
+                    "success": True,
+                    "seconds": 25.0,
+                },
+                {
+                    "id": "b1b2c3d4e5f60718293a4b5c6d7e8f91",
+                    "engine": "muse",
+                    "tier": "standard",
+                    "requested_model": None,
+                    "readonly": True,
+                    "started_at": now - 10.0,
+                    "finished_at": now - 1.0,
+                    "status": "completed",
+                    "task_id": "unrelated-no-model",
+                    "scopes": same_proj_scopes("unrelated-no-model"),
+                    "result_status": "PASSED",
+                    "success": True,
+                    "seconds": 9.0,
+                },
+            ],
+        }), encoding="utf-8")
+
+        # Subshell call without --request-id or MAKEWAND_TASK_ID auto-links to auto-link-42
+        out1 = self.run_cli("outcome", "muse", "3", "review", "pass",
+                            "--model", "muse-wonder-full-1.0", "--effort", "xhigh")
+        self.assertEqual(out1.returncode, 0, out1.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1].get("request_id"), "auto-link-42")
+
+        # Second outcome without a second recent budget attempt does not duplicate request_id,
+        # even if the same project has an expired (>1h) unrecorded attempt or another project has an attempt
+        budget_file.write_text(json.dumps({
+            "schema": 2,
+            "maximum": 1000,
+            "scopes": {"tasks": {}, "projects": {}, "machine": {}, "day": "2026-10-27", "clock": now},
+            "attempts": [
+                {
+                    "id": "01b2c3d4e5f60718293a4b5c6d7e8f00",
+                    "engine": "muse",
+                    "tier": "standard",
+                    "requested_model": "muse-wonder-full-1.0",
+                    "readonly": True,
+                    "started_at": now - 7230.0,
+                    "finished_at": now - 7200.0,
+                    "status": "completed",
+                    "task_id": "auto-link-42",
+                    "scopes": same_proj_scopes("auto-link-42"),
+                },
+                {
+                    "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+                    "engine": "muse",
+                    "tier": "standard",
+                    "requested_model": "muse-wonder-full-1.0",
+                    "readonly": True,
+                    "started_at": now - 30.0,
+                    "finished_at": now - 5.0,
+                    "status": "completed",
+                    "task_id": "auto-link-42",
+                    "scopes": same_proj_scopes("auto-link-42"),
+                },
+            ],
+        }), encoding="utf-8")
+        out2 = self.run_cli("outcome", "muse", "3", "review", "pass",
+                            "--model", "muse-wonder-full-1.0", "--effort", "xhigh")
+        self.assertEqual(out2.returncode, 0, out2.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertIsNone(rows[-1].get("request_id"))
+
+        # Ambiguous multiple unmatched requests for the same provider+model in the same project return None
+        budget_file.write_text(json.dumps({
+            "schema": 2,
+            "maximum": 1000,
+            "scopes": {"tasks": {}, "projects": {}, "machine": {}, "day": "2026-10-27", "clock": now},
+            "attempts": [
+                {
+                    "id": "c1",
+                    "engine": "codex",
+                    "tier": "standard",
+                    "requested_model": "gpt-6-sol",
+                    "readonly": True,
+                    "started_at": now - 20.0,
+                    "finished_at": now - 5.0,
+                    "status": "completed",
+                    "task_id": "req-first",
+                    "scopes": same_proj_scopes("req-first"),
+                },
+                {
+                    "id": "c2",
+                    "engine": "codex",
+                    "tier": "standard",
+                    "requested_model": "gpt-6-sol",
+                    "readonly": True,
+                    "started_at": now - 10.0,
+                    "finished_at": now - 1.0,
+                    "status": "completed",
+                    "task_id": "req-second",
+                    "scopes": same_proj_scopes("req-second"),
+                },
+            ],
+        }), encoding="utf-8")
+        out3 = self.run_cli("outcome", "codex", "2", "review", "pass",
+                            "--model", "gpt-6-sol", "--effort", "medium")
+        self.assertEqual(out3.returncode, 0, out3.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertIsNone(rows[-1].get("request_id"))
 
     def run_cli(self, *args, quota=None, policy=None, worker=False, extra_env=None):
         env = dict(os.environ)

@@ -3,11 +3,16 @@
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# Admission registers these tests' own ledgers; keep that out of the user's configuration.
+_CONFIG = tempfile.TemporaryDirectory(prefix="makewand-benchmark-config-")
+os.environ["MAKEWAND_CONFIG_DIR"] = _CONFIG.name
 
 
 ROOT = Path(__file__).resolve().parent
