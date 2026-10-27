@@ -14,6 +14,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Admission registers these tests' own ledgers; keep that out of the user's configuration.
+_CONFIG = tempfile.TemporaryDirectory(prefix="makewand-benchmark-config-")
+os.environ["MAKEWAND_CONFIG_DIR"] = _CONFIG.name
+
 ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("benchmark_runner", ROOT / "runner.py")
 runner = importlib.util.module_from_spec(SPEC)
@@ -412,7 +416,8 @@ class ExecutionEventTests(unittest.TestCase):
                         raise RuntimeError("private prompt credential token")
                     return True, "local stub completed", None
                 with mock.patch.dict(os.environ, {"MAKEWAND_EXECUTION_EVENTS_FILE": str(path),
-                                     "MAKEWAND_TASK_ID": "task", "MAKEWAND_BENCHMARK_RUN_ID": "trial"}, clear=True), \
+                                     "MAKEWAND_TASK_ID": "task", "MAKEWAND_BENCHMARK_RUN_ID": "trial",
+                                     "MAKEWAND_CONFIG_DIR": _CONFIG.name}, clear=True), \
                      execution_context(task_id="task"):
                     with stage("workflow") as workflow:
                         result = execute(ExecutionRequest(task_id="task", stage="generation", engine="offline-stub",

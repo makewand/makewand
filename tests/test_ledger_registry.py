@@ -25,9 +25,10 @@ class LedgerRegistryTest(unittest.TestCase):
         env = patch.dict(os.environ, {"MAKEWAND_CONFIG_DIR": str(self.config)})
         env.start()
         self.addCleanup(env.stop)
-        noted = patch.object(ledger_registry, "_noted", set())
-        noted.start()
-        self.addCleanup(noted.stop)
+        for name in ("_noted", "_announced"):
+            noted = patch.object(ledger_registry, name, set())
+            noted.start()
+            self.addCleanup(noted.stop)
 
     def reserve(self, ledger):
         stderr = io.StringIO()
@@ -64,15 +65,44 @@ class LedgerRegistryTest(unittest.TestCase):
             self.reserve(own)
         self.assertEqual(self.rows(), [])
 
-    def test_known_ledgers_skips_bad_lines_and_missing_files(self):
+    def test_known_ledgers_skips_bad_lines_and_keeps_newest(self):
         alive = Path(self.tmp.name) / "alive.json"
-        alive.write_text("{}")
+        gone = Path(self.tmp.name) / "gone.json"
         (self.config / ledger_registry.REGISTRY_NAME).write_text(
             "not json\n"
-            + json.dumps({"path": str(Path(self.tmp.name) / "gone.json"), "ts": 2}) + "\n"
+            + json.dumps({"path": str(gone), "ts": 2}) + "\n"
             + json.dumps({"path": str(alive), "ts": 1}) + "\n"
             + json.dumps({"path": str(alive), "ts": 3}) + "\n")
-        self.assertEqual(ledger_registry.known_ledgers(), [str(alive)])
+        self.assertEqual(ledger_registry.known_ledgers(), [str(alive), str(gone)])
+
+    def test_failed_registration_is_retried_and_creates_the_config_directory(self):
+        own = Path(self.tmp.name) / "call-budget.json"
+        with patch.object(ledger_registry, "registry_path", return_value=self.config):  # a directory
+            self.reserve(own)
+        self.assertEqual(self.rows(), [])
+        missing = self.config / "nested"
+        with patch.dict(os.environ, {"MAKEWAND_CONFIG_DIR": str(missing)}):
+            self.assertEqual(self.reserve(own), "")  # the notice was already given
+            self.assertTrue((missing / ledger_registry.REGISTRY_NAME).is_file())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs FIFOs")
+    def test_fifo_registry_and_ledger_never_block(self):
+        os.mkfifo(self.config / ledger_registry.REGISTRY_NAME)
+        own = Path(self.tmp.name) / "call-budget.json"
+        self.reserve(own)  # returns: the FIFO is opened non-blocking and refused
+        self.assertEqual(ledger_registry.known_ledgers(), [])
+        os.unlink(self.config / ledger_registry.REGISTRY_NAME)
+        fifo = Path(self.tmp.name) / "fifo.json"
+        os.mkfifo(fifo)
+        (self.config / ledger_registry.REGISTRY_NAME).write_text(json.dumps({"path": str(fifo), "ts": 1}) + "\n")
+        self.assertEqual(ledger_registry.recent_activity(), [])
+
+    def test_oversized_ledger_is_skipped(self):
+        big = Path(self.tmp.name) / "big.json"
+        with open(big, "wb") as handle:
+            handle.truncate(ledger_registry._MAX_READ + 1)
+        (self.config / ledger_registry.REGISTRY_NAME).write_text(json.dumps({"path": str(big), "ts": 1}) + "\n")
+        self.assertEqual(ledger_registry.recent_activity(), [])
 
     def test_recent_activity_summarizes_registered_ledgers(self):
         own = Path(self.tmp.name) / "call-budget.json"

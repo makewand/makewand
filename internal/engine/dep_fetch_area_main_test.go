@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/makewand/makewand/internal/testfixture"
 )
 
 // TestMain keeps the host-owned dependency fetch area (depFetchBaseDir) of
 // every test in a temporary directory of its own, never the user's cache, and
 // the host's pip configuration out of the tests.
 func TestMain(m *testing.M) {
+	isolationCleanup, err := testfixture.IsolateExecutionEvidence()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "execution evidence isolation:", err)
+		os.Exit(1)
+	}
 	dir, err := os.MkdirTemp("", "makewand-dep-fetch-test-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -19,6 +26,7 @@ func TestMain(m *testing.M) {
 	pipHostConfigFiles = nil // the host's pip configuration is not the tests'
 	code := m.Run()
 	_ = os.RemoveAll(dir)
+	isolationCleanup()
 	os.Exit(code)
 }
 

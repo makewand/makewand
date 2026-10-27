@@ -39,6 +39,10 @@ func IsolateExecutionEvidence() (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := os.Mkdir(filepath.Join(dir, "config"), 0o700); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
 	for _, key := range accountingEnv {
 		if err := os.Unsetenv(key); err != nil {
 			return nil, err
