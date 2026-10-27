@@ -204,13 +204,25 @@ class RoutingCliTests(unittest.TestCase):
         rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
         self.assertEqual(rows[-1].get("request_id"), "auto-link-42")
 
-        # Second outcome without a second budget attempt does not duplicate request_id,
-        # even if another project has an unmatched attempt with the same task_id
+        # Second outcome without a second recent budget attempt does not duplicate request_id,
+        # even if the same project has an expired (>1h) unrecorded attempt or another project has an attempt
         budget_file.write_text(json.dumps({
             "schema": 2,
             "maximum": 1000,
             "scopes": {"tasks": {}, "projects": {}, "machine": {}, "day": "2026-10-27", "clock": now},
             "attempts": [
+                {
+                    "id": "01b2c3d4e5f60718293a4b5c6d7e8f00",
+                    "engine": "muse",
+                    "tier": "standard",
+                    "requested_model": "muse-wonder-full-1.0",
+                    "readonly": True,
+                    "started_at": now - 7230.0,
+                    "finished_at": now - 7200.0,
+                    "status": "completed",
+                    "task_id": "auto-link-42",
+                    "scopes": same_proj_scopes("auto-link-42"),
+                },
                 {
                     "id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
                     "engine": "muse",
@@ -222,18 +234,6 @@ class RoutingCliTests(unittest.TestCase):
                     "status": "completed",
                     "task_id": "auto-link-42",
                     "scopes": same_proj_scopes("auto-link-42"),
-                },
-                {
-                    "id": "x1b2c3d4e5f60718293a4b5c6d7e8f99",
-                    "engine": "muse",
-                    "tier": "standard",
-                    "requested_model": "muse-wonder-full-1.0",
-                    "readonly": True,
-                    "started_at": now - 15.0,
-                    "finished_at": now - 2.0,
-                    "status": "completed",
-                    "task_id": "auto-link-42",
-                    "scopes": [["tasks", "auto-link-42"], ["projects", "other_project_hash:2026-10-27"], ["machine", "2026-10-27"]],
                 },
             ],
         }), encoding="utf-8")

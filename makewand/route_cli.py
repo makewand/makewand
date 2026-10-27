@@ -359,8 +359,11 @@ def _infer_recent_request_id(
                 return proj_hash == current_project
         return False
 
+    now = time.time()
     recorded_counts: dict[tuple[str, str], int] = {}
     recorded_model_counts: dict[tuple[str, str, str | None], int] = {}
+    recorded_ts: dict[tuple[str, str], list[float]] = {}
+    recorded_model_ts: dict[tuple[str, str, str | None], list[float]] = {}
     rows_to_scan = existing_rows if existing_rows is not None else ledger._read_rows(strict=False)
     for row in rows_to_scan:
         if not isinstance(row, dict):
@@ -374,9 +377,15 @@ def _infer_recent_request_id(
             recorded_model_counts[(req_id, prov, norm_rm)] = (
                 recorded_model_counts.get((req_id, prov, norm_rm), 0) + 1
             )
+            r_ts = row.get("ts")
+            if not isinstance(r_ts, bool) and isinstance(r_ts, (int, float)) and math.isfinite(r_ts):
+                recorded_ts.setdefault((req_id, prov), []).append(float(r_ts))
+                recorded_model_ts.setdefault((req_id, prov, norm_rm), []).append(float(r_ts))
 
     attempt_counts: dict[tuple[str, str], int] = {}
     attempt_model_counts: dict[tuple[str, str, str | None], int] = {}
+    recent_attempt_ts: dict[tuple[str, str], list[float]] = {}
+    recent_attempt_model_ts: dict[tuple[str, str, str | None], list[float]] = {}
     cross_project_tasks: set[str] = set()
     for entry in attempts:
         if not isinstance(entry, dict):
@@ -399,8 +408,16 @@ def _infer_recent_request_id(
             attempt_model_counts[(tid, eng, norm_em)] = (
                 attempt_model_counts.get((tid, eng, norm_em), 0) + 1
             )
+            a_ts = entry.get("finished_at") if entry.get("finished_at") is not None else entry.get("started_at")
+            if (
+                not isinstance(a_ts, bool)
+                and isinstance(a_ts, (int, float))
+                and math.isfinite(a_ts)
+                and -300.0 <= now - float(a_ts) <= max_age_seconds
+            ):
+                recent_attempt_ts.setdefault((tid, eng), []).append(float(a_ts))
+                recent_attempt_model_ts.setdefault((tid, eng, norm_em), []).append(float(a_ts))
 
-    now = time.time()
     norm_model = model.strip() if isinstance(model, str) and model.strip() else None
     candidate_tasks: list[str] = []
     for entry in reversed(attempts):
@@ -423,16 +440,34 @@ def _infer_recent_request_id(
         ts = entry.get("finished_at") if entry.get("finished_at") is not None else entry.get("started_at")
         if isinstance(ts, bool) or not isinstance(ts, (int, float)) or not math.isfinite(ts):
             continue
-        if not (-300.0 <= now - float(ts) <= max_age_seconds):
+        ts_val = float(ts)
+        if not (-300.0 <= now - ts_val <= max_age_seconds):
             continue
         req_model = entry.get("requested_model")
         norm_req_model = req_model.strip() if isinstance(req_model, str) and req_model.strip() else None
         if norm_req_model != norm_model:
             continue
+        prov_recent_attempts = recent_attempt_ts.get((task_id, provider), [])
+        model_recent_attempts = recent_attempt_model_ts.get((task_id, provider, norm_model), [])
+        prov_recent_outcomes = [
+            t for t in recorded_ts.get((task_id, provider), []) if -300.0 <= now - t <= max_age_seconds
+        ]
+        model_recent_outcomes = [
+            t
+            for t in recorded_model_ts.get((task_id, provider, norm_model), [])
+            if -300.0 <= now - t <= max_age_seconds
+        ]
+        floor_ts = math.floor(ts_val)
         if (
             attempt_counts.get((task_id, provider), 0) > recorded_counts.get((task_id, provider), 0)
             and attempt_model_counts.get((task_id, provider, norm_model), 0)
             > recorded_model_counts.get((task_id, provider, norm_model), 0)
+            and len(prov_recent_attempts) > len(prov_recent_outcomes)
+            and len(model_recent_attempts) > len(model_recent_outcomes)
+            and sum(1 for t in prov_recent_attempts if t >= ts_val)
+            > sum(1 for t in prov_recent_outcomes if t >= floor_ts)
+            and sum(1 for t in model_recent_attempts if t >= ts_val)
+            > sum(1 for t in model_recent_outcomes if t >= floor_ts)
         ):
             if task_id not in candidate_tasks:
                 candidate_tasks.append(task_id)
