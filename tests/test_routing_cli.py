@@ -83,6 +83,16 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(implement.returncode, 0, implement.stderr)
         self.assertNotIn("candidate-verdict", implement.stderr)
 
+    def test_unlinked_outcome_is_recorded_with_a_warning(self):
+        result = self.run_cli("outcome", "codex", "3", "implement", "pass")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not linked to a dispatched call", result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertNotIn("request_id", rows[-1])
+        linked = self.run_cli("outcome", "codex", "3", "implement", "pass", "--request-id", "impl-44")
+        self.assertEqual(linked.returncode, 0, linked.stderr)
+        self.assertNotIn("not linked", linked.stderr)
+
     def test_recorded_request_failure_cools_route_without_affecting_other_requests(self):
         recorded = self.run_cli("outcome", "codex", "3", "review", "fail", "--failure-kind", "unknown",
                                 "--request-id", "blocked-42", "--seconds", "1", "--calls", "1")
