@@ -9,6 +9,7 @@ import ntpath
 import os
 import re
 import stat
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -51,16 +52,40 @@ def _windows_api_path(path):
     return "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
 
 
+# ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION: a scanner or another
+# process briefly holding the object. Like Go's retryAccountingIO, retry these
+# for a bounded time and then report the original error (fail closed).
+_TRANSIENT_WINERRORS = frozenset({5, 32})
+_TRANSIENT_RETRY_SECONDS = 1.0
+
+
+def _retry_transient_windows(operation, *, sleep=time.sleep, clock=time.monotonic):
+    deadline = clock() + _TRANSIENT_RETRY_SECONDS
+    delay = 0.005
+    while True:
+        try:
+            return operation()
+        except OSError as error:
+            if getattr(error, "winerror", None) not in _TRANSIENT_WINERRORS or clock() + delay > deadline:
+                raise
+        sleep(delay)
+        delay = min(delay * 2, 0.25)
+
+
 def _windows_open(path, *, directory=False, create=False, writable=False, delete=False):
     from makewand import native_windows as native
     kernel = native._api()
     access = (0x20 | 0x80) if directory else (0x80000000 | (0x40000000 if writable else 0))
-    # A temporary permits a later DELETE reopen of this same object; locks
-    # and ordinary reads deny delete-sharing throughout their lifetimes.
-    handle = kernel.CreateFileW(_windows_api_path(path), access, 7 if delete else 3, None,
-                               1 if create else 3, 0x00200000 | (0x02000000 if directory else 0), None)
-    if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+
+    def create_file():
+        # A temporary permits a later DELETE reopen of this same object; locks
+        # and ordinary reads deny delete-sharing throughout their lifetimes.
+        handle = kernel.CreateFileW(_windows_api_path(path), access, 7 if delete else 3, None,
+                                   1 if create else 3, 0x00200000 | (0x02000000 if directory else 0), None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+    handle = _retry_transient_windows(create_file)
     try:
         info = native._info(handle)
         if bool(info.attributes & 0x10) != directory or (not directory and info.links != 1):
@@ -189,7 +214,7 @@ class AccountingFiles:
             kernel = native._api()
             source = _windows_delete_handle(fd)
             try:
-                native._set_nt_file_information(source, 65, buffer, len(buffer))
+                _retry_transient_windows(lambda: native._set_nt_file_information(source, 65, buffer, len(buffer)))
             finally:
                 kernel.CloseHandle(source)
         else:
