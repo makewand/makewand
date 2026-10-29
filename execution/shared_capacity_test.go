@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -546,5 +547,54 @@ b.request_budget('idle',maximum=3,budget_file=os.environ['FIXTURE_LEDGER'])`)
 	}
 	if len(data["attempts"].([]any)) != 0 {
 		t.Fatal("unreferenced old receipt never compacted")
+	}
+}
+
+func TestSharedCapacityRegistrationFailureReleasesUninvokedReservation(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		t.Run(fmt.Sprint(pending), func(t *testing.T) {
+			root := sharedCapacityFixture(t, 3)
+			original := accountingSyncDirectory
+			injected := errors.New("injected shared registration sync failure")
+			var fail atomic.Bool
+			fail.Store(true)
+			accountingSyncDirectory = func(path *accountingPath) error {
+				if err := original(path); err != nil {
+					return err
+				}
+				if path.name == "shared-capacity.json" && fail.CompareAndSwap(true, false) {
+					return injected
+				}
+				return nil
+			}
+			t.Cleanup(func() { accountingSyncDirectory = original })
+			path := filepath.Join(root, "failed.json")
+			ctx := ContextWithConfig(t.Context(), Config{LedgerPath: path, TaskID: "failed", MaxCalls: 3})
+			if a, err := Reserve(ctx, Metadata{Engine: "codex", Pending: pending}); a != nil || !errors.Is(err, injected) {
+				t.Fatalf("registration returned a usable reservation: %v %v", a, err)
+			}
+			var data map[string]any
+			if err := readCapacityFile(path, &data); err != nil {
+				t.Fatal(err)
+			}
+			if len(data["leases"].(map[string]any)) != 0 {
+				t.Fatal("live caller retained an uninvoked lease")
+			}
+			if data["attempts"].([]any)[0].(map[string]any)["status"] != "released" {
+				t.Fatal("failed registration never settled")
+			}
+			counter := data["scopes"].(map[string]any)["tasks"].(map[string]any)["failed"].(map[string]any)
+			if used, _ := jsonInteger(counter["used"]); used != 0 {
+				t.Fatal("never-dispatched registration consumed a call")
+			}
+			other := ContextWithConfig(t.Context(), Config{LedgerPath: filepath.Join(root, "next.json"), TaskID: "next", MaxCalls: 3})
+			b, err := Reserve(other, Metadata{Engine: "codex"})
+			if err != nil {
+				t.Fatal("failed registration permanently occupied provider", err)
+			}
+			if err := b.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

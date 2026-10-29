@@ -24,6 +24,10 @@ Neither waiting nor a busy refusal spends a call. A private ledger's daily
 counters remain separate; this policy does not fabricate a vendor balance or
 combine past spend. Unknown results and timeouts retain their existing retry
 authorisation requirements.
+If shared registration fails before admission returns, the runtime rejects the
+known uninvoked reservation and releases its account lease. This does not
+refund an invoked transport. Settlement retries after transient accounting
+failures without launching another provider or renewing the abandoned lease.
 
 `shared-capacity.json` contains only active lease references, short-lived queue
 tickets and project scheduling turns. Admissions hold its lock before the

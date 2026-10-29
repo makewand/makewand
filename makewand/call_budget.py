@@ -9,6 +9,7 @@ import math
 import errno
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -296,6 +297,7 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
             stage="provider", account_ref=None, api_policy="subscription_only",
             budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False,
             capacity_gate=None, capacity_policy=None):
+    attempt, ledger_path, write_attempted = None, None, False
     try:
         deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
         # Admission without an execution deadline waits for the ledger like Go's
@@ -348,16 +350,54 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
             if capacity_gate is not None:
                 data["attempts"][-1].update(capacity_project=capacity_gate.ticket["project"],
                                             capacity_label=capacity_gate.ticket["label"])
-            _save(path, data)
             ledger_path = path.path
+            write_attempted = True
+            _save(path, data)
         if capacity_gate is not None:
             capacity_gate.commit(ledger_path, attempt)
         ledger_registry.note(ledger_path)  # outside the ledger lock: visibility only
         return attempt
-    except BudgetError:
+    except BaseException as error:
+        if capacity_gate is not None and write_attempted:
+            # The caller has not received a reservation, so no transport can
+            # have started. Settle even an uncertain post-rename write failure.
+            _abandon_capacity_reservation(attempt, ledger_path, max_model_calls)
+        if isinstance(error, BudgetError):
+            raise
+        if isinstance(error, (OSError, ValueError, KeyError, TypeError, RuntimeError)):
+            raise BudgetError(f"cannot reserve model task budget: {error}") from error
         raise
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-        raise BudgetError(f"cannot reserve model task budget: {error}") from error
+
+
+def _abandon_capacity_reservation(attempt, ledger_path, maximum):
+    """Undo only a reservation whose admission never returned to its caller.
+
+    Retry accounting after storage recovers, without invoking a provider or
+    renewing the abandoned lease. The original reservation ID remains fixed.
+    """
+    def settle():
+        try:
+            reject_unlaunched(attempt, budget_file=ledger_path, max_model_calls=maximum)
+        except BudgetError as error:
+            # A missing record needs no settlement; an invocation fence must
+            # never be refunded, even if a caller violated the gate contract.
+            return str(error) in ("model task reservation disappeared", "cannot refund an invoked transport")
+        except (OSError, ValueError, RuntimeError):
+            return False
+        return True
+
+    if settle():
+        return
+
+    def retry():
+        waiter, delay = threading.Event(), .1
+        while True:
+            waiter.wait(delay)
+            if settle():
+                return
+            delay = min(delay * 2, 30)
+
+    threading.Thread(target=retry, name="makewand-capacity-settlement", daemon=True).start()
 
 
 def complete(attempt, success, seconds, *, result_status=None, outcome_known=True,

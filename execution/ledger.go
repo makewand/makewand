@@ -568,6 +568,18 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 				})
 			})
 			cancelAdmission()
+			if err != nil && capacityPolicy != nil && hasLease {
+				// Reserve has not returned, so no caller can invoke a transport.
+				// Shared registration (or an uncertain budget write) failed after
+				// allocation: use the trusted pre-dispatch settlement, including
+				// its existing storage-recovery retry loop. Never retry this ID
+				// as a new reservation after it may have been durably released.
+				cleanupErr := attempt.release(true)
+				if !errors.Is(cleanupErr, errReservationDisappeared) {
+					err = errors.Join(err, cleanupErr)
+				}
+				break
+			}
 			if capacityPolicy != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
 				err = fmt.Errorf("%w: shared capacity transaction busy; no call admitted", ErrConcurrencyBusy)
 			}

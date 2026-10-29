@@ -511,6 +511,71 @@ class SharedCapacityTests(unittest.TestCase):
                     self.fail("invalid policy ran a local command")
                 self.assertEqual(sandbox()[3], "LocalCapacityUnavailable")
 
+    def test_registration_failure_releases_uninvoked_reservation(self):
+        import errno
+        for failure in ("read", "published-save"):
+            with self.subTest(failure=failure):
+                source = self.root / (failure + ".json")
+                original_read, original_save = capacity._source_rows, capacity.save
+
+                def read(value):
+                    if failure == "read" and Path(value) == source and source.exists():
+                        raise RuntimeError("accounting file identity changed")
+                    return original_read(value)
+
+                def save(path, state):
+                    original_save(path, state)
+                    if failure == "published-save" and any(row["attempt"] for row in state["active"].values()):
+                        raise OSError(errno.ENOSPC, "injected shared registration failure")
+
+                with patch.object(capacity, "_source_rows", side_effect=read), patch.object(capacity, "save", side_effect=save):
+                    with self.assertRaises(budget.BudgetError):
+                        self.reserve(failure, "codex")
+                data = json.loads(source.read_text())
+                self.assertEqual(data["leases"], {}, "live caller retained an uninvoked lease")
+                self.assertEqual(data["attempts"][0]["status"], "released")
+                self.assertEqual(data["scopes"]["tasks"][failure]["used"], 0)
+                b = self.reserve(failure + "-next", "codex")
+                self.finish(failure + "-next", b)
+
+    def test_registration_failure_cleanup_recovers_after_io_restored(self):
+        import errno
+        import threading
+        allow_cleanup, cleanup_done = threading.Event(), threading.Event()
+        original_save, original_reject = budget._save, budget.reject_unlaunched
+        original_state_save = capacity.save
+
+        def persist(path, data):
+            if any(row["status"] == "released" for row in data["attempts"]) and not allow_cleanup.is_set():
+                raise OSError(errno.ENOSPC, "injected settlement unavailable")
+            return original_save(path, data)
+
+        def observe(*args, **kwargs):
+            result = original_reject(*args, **kwargs)
+            cleanup_done.set()
+            return result
+
+        def state_save(path, state):
+            original_state_save(path, state)
+            if state["active"]:
+                raise OSError(errno.ENOSPC, "injected registration unavailable")
+
+        with patch.object(budget, "_save", side_effect=persist), \
+                patch.object(budget, "reject_unlaunched", side_effect=observe), \
+                patch.object(capacity, "save", side_effect=state_save):
+            try:
+                with self.assertRaises(budget.BudgetError):
+                    self.reserve("recover", "codex")
+                allow_cleanup.set()
+                self.assertTrue(cleanup_done.wait(4), "no deferred settlement after storage recovered")
+            finally:
+                allow_cleanup.set()
+        data = json.loads((self.root / "recover.json").read_text())
+        self.assertEqual(data["leases"], {})
+        self.assertEqual(data["scopes"]["tasks"]["recover"]["used"], 0)
+        b = self.reserve("recovered-next", "codex")
+        self.finish("recovered-next", b)
+
 
 if __name__ == "__main__":
     unittest.main()
