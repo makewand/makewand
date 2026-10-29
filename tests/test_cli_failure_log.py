@@ -175,6 +175,20 @@ class CliFailureLogTest(unittest.TestCase):
         self.assertFalse(result.outcome_known)
         self.assertFalse(self.log.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX symlink-race fixture")
+    def test_symlink_swap_after_precheck_never_changes_the_target(self):
+        self.log.parent.mkdir(parents=True)
+        outside = Path(self.tmp.name) / "outside"
+        outside.write_bytes(b"outside sentinel\n")
+        outside.chmod(0o644)
+        before_mode = outside.stat().st_mode
+        self.log.symlink_to(outside)
+        # Model a link appearing after the cheap precheck, before the open.
+        with patch.object(Path, "is_symlink", return_value=False):
+            cli_failure_log.record("grok", 1, "Error: something")
+        self.assertEqual(outside.read_bytes(), b"outside sentinel\n")
+        self.assertEqual(outside.stat().st_mode, before_mode)
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_existing_wider_log_is_tightened(self):
         self.log.parent.mkdir(parents=True)

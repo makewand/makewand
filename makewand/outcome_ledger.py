@@ -384,7 +384,7 @@ class OutcomeLedger:
             filelock.flock(fd, filelock.LOCK_EX)
             try:
                 if "request_id" not in details and callable(infer_request_id):
-                    inferred = infer_request_id(self._read_rows(strict=False, locked=True))
+                    inferred = infer_request_id(self._read_rows(strict=False, locked=True, descriptor=fd))
                     if inferred is not None:
                         details = dict(details, request_id=inferred)
                         row.update(_outcome_details(dict(row, **details)))
@@ -425,13 +425,22 @@ class OutcomeLedger:
             os.close(fd)
         return dict(row)
 
-    def _read_rows(self, *, strict=False, locked=False) -> List[Dict[str, Any]]:
+    def _read_rows(self, *, strict=False, locked=False, descriptor=None) -> List[Dict[str, Any]]:
         try:
-            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
+            if descriptor is None:
+                stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
+            else:
+                # Windows byte locks also reject a read through another handle
+                # in this process. Reuse the writer's handle without closing it.
+                if not locked:
+                    raise ValueError("an existing outcome descriptor requires its held lock")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                stream = os.fdopen(descriptor, "r", encoding="utf-8",
+                                   errors="strict" if strict else "replace", closefd=False)
         except FileNotFoundError:
             return []
         except OSError:
-            if strict:
+            if strict or descriptor is not None:
                 raise
             # Missing or unreadable (e.g. read-only state dir): empty ledger.
             return []

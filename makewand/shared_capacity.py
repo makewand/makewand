@@ -218,7 +218,7 @@ def _source_rows(value):
 def refresh(state, selected):
     paths = {layered_budget.default_path(), selected, *ledger_registry.known_ledgers(),
              *(row["ledger"] for row in state["active"].values() if row["kind"] == "model")}
-    for value in sorted({str(Path(path).expanduser().resolve()) for path in paths}):
+    for value in sorted({str(accounting_files.canonical_path(path)) for path in paths}):
         previous = {row["attempt"]: row for row in state["active"].values() if row["kind"] == "model" and row["ledger"] == value}
         try:
             rows, attempts, now = _source_rows(value)
@@ -319,7 +319,7 @@ def admission(current_policy, engine, account, value, task_id, ticket_id, deadli
         yield None
         return
     value = value or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()
-    value = str(Path(value).expanduser().resolve())
+    value = str(accounting_files.canonical_path(value))
     project_id, label = project(working_directory)
     now = time.time()
     ticket = {"id": ticket_id, "kind": "model", "ledger": value, "attempt": "", "project": project_id,
@@ -385,7 +385,7 @@ def relocation(current_policy, engine, value, attempt):
     if current_policy is None:
         yield None
         return
-    value = str(Path(value or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()).expanduser().resolve())
+    value = str(accounting_files.canonical_path(value or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()))
     with locked(time.monotonic() + 5) as (path, state):
         refresh(state, value)
         old = next((row for row in state["active"].values() if row["kind"] == "model"
@@ -477,7 +477,7 @@ def tool_scope(current_policy, deadline):
     if deadline <= time.monotonic():
         raise BudgetDeadlineError("local tool deadline expired before admission")
     identifier = uuid.uuid4().hex
-    state_path = str(Path(layered_budget.default_path()).with_name(STATE_NAME).expanduser().resolve())
+    state_path = str(accounting_files.canonical_path(Path(layered_budget.default_path()).with_name(STATE_NAME)))
     project_id, label = project()
     now = time.time()
     ticket = {"id": identifier, "kind": "tool", "ledger": "", "attempt": "", "project": project_id,
@@ -492,7 +492,7 @@ def tool_scope(current_policy, deadline):
         while True:
             _check_admission_cancelled()
             with locked(wait_until, state_path=state_path) as (path, state):
-                refresh(state, str(Path(layered_budget.default_path()).expanduser().resolve()))
+                refresh(state, str(accounting_files.canonical_path(layered_budget.default_path())))
                 existing = next((r for r in state["queue"] if r["id"] == identifier), None)
                 if existing is None:
                     state["queue"].append(ticket)

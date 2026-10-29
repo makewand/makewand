@@ -52,6 +52,41 @@ def _windows_api_path(path):
     return "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
 
 
+def _windows_ordinary_path(value):
+    """Canonical names for ordinary drive/UNC aliases, never device objects.
+
+    Windows realpath may retain its extended prefix if a second lookup races
+    with atomic replacement. Normalize that spelling before applying the same
+    component, identity and private-file checks as an ordinary path.
+    """
+    raw = os.fspath(value).replace("/", "\\")
+    if raw[:8].upper() == "\\\\?\\UNC\\":
+        raw = "\\\\" + raw[8:]
+    elif raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+        if not re.match(r"^[A-Za-z]:\\", raw):
+            raise ValueError("Accounting requires an ordinary drive or UNC share path")
+    elif raw.startswith("\\\\.\\"):
+        raise ValueError("Accounting requires an ordinary drive or UNC share path")
+    else:
+        return raw
+    _windows_components(raw)  # keep ADS, reserved names and ambiguous components closed
+    return raw
+
+
+def canonical_path(value):
+    original = Path(value).expanduser()
+    if os.name == "nt":
+        from makewand.windows_paths import _validate_components
+        original = Path(_windows_ordinary_path(original))
+        _validate_components(ntpath.splitdrive(os.fspath(original))[1], navigation=True)
+    path = original.resolve()
+    if os.name == "nt":
+        path = Path(_windows_ordinary_path(path))
+        _windows_components(path)
+    return path
+
+
 # ERROR_ACCESS_DENIED and ERROR_SHARING_VIOLATION: a scanner or another
 # process briefly holding the object. Like Go's retryAccountingIO, retry these
 # for a bounded time and then report the original error (fail closed).
@@ -280,13 +315,14 @@ class AccountingFiles:
 
 
 @contextmanager
-def pin(value):
-    """Resolve legitimate aliases once, then pin/create canonical ancestors."""
-    original = Path(value).expanduser()
-    if os.name == "nt":
-        from makewand.windows_paths import _validate_components
-        _validate_components(ntpath.splitdrive(os.fspath(original))[1], navigation=True)
-    path = original.resolve()
+def pin(value, *, resolve_leaf=True):
+    """Pin canonical ancestors; fixed diagnostic names never resolve the leaf."""
+    if resolve_leaf:
+        path = canonical_path(value)
+    else:
+        original = Path(value).expanduser()
+        leaf = _leaf_name(original.name)
+        path = canonical_path(original.parent) / leaf
     _leaf_name(path.name)
     handles = []
     if os.name == "nt":

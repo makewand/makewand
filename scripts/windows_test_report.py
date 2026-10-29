@@ -7,6 +7,7 @@ MODULES = ["test_native_windows", "test_native_windows_pipeline", "test_native_d
            "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight",
            "test_shared_capacity", "test_cli_failure_log", "test_budget_watch", "test_diagnostics_closeout"]
 WINDOWS_SKIPS = {
+    "test_cli_failure_log.CliFailureLogTest.test_symlink_swap_after_precheck_never_changes_the_target": "POSIX symlink-race fixture",
     "test_cli_failure_log.CliFailureLogTest.test_existing_wider_log_is_tightened": "POSIX permission bits",
     "test_cli_failure_log.CliFailureLogTest.test_non_regular_log_is_skipped_without_blocking": "needs FIFOs",
     "test_shared_capacity.SharedCapacityTests.test_dead_owner_does_not_release_live_worker": "Linux process identity required",

@@ -83,7 +83,7 @@ def record(engine, code, stderr):
         # Reuse the accounting opener's identity, owner, hardlink and Windows
         # DACL checks before writing diagnostics, including in an inherited
         # broadly-readable Windows cache directory.
-        with accounting_files.pin(path) as files:
+        with accounting_files.pin(path, resolve_leaf=False) as files:
             descriptor = files.open(files.name, create=True, writable=True)
             try:
                 try:
