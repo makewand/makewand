@@ -384,7 +384,10 @@ def tool_update(action, pid=None, identifier=None):
             lease["workers"].append(ref)
             lease["launch_pending"] = ref.get("token") is None
         elif action in ("stopped", "launch_failed"):
-            if not account_leases.workers_alive(lease):
+            # Native Windows runners close the kill-on-close Job and wait
+            # before reporting stopped. PID liveness alone cannot prove Job
+            # descendants died, so use that trusted cleanup evidence here.
+            if (action == "stopped" and not Path("/proc").is_dir()) or not account_leases.workers_alive(lease):
                 lease["workers"], lease["launch_pending"] = [], False
         elif action == "settle":
             row["settled"] = True

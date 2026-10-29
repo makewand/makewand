@@ -255,6 +255,19 @@ class SharedCapacityTests(unittest.TestCase):
             filelock.flock(holder.fileno(), filelock.LOCK_UN)
         self.assertFalse((self.root / "waiting.json").exists())
 
+    def test_native_runner_stopped_proof_clears_job_worker_fence(self):
+        real_is_dir = Path.is_dir
+        with patch.object(capacity, "tool_memory_available", return_value=True):
+            with capacity.tool_scope(capacity.policy(), time.monotonic() + 2):
+                capacity.tool_update("launch")
+                capacity.tool_update("job_worker", os.getpid())
+                with patch.object(Path, "is_dir", lambda path: False if str(path) == "/proc" else real_is_dir(path)):
+                    capacity.tool_update("stopped")
+                state = json.loads((self.root / capacity.STATE_NAME).read_text())
+                tool = next(row for row in state["active"].values() if row["kind"] == "tool")
+                self.assertEqual(tool["lease"]["workers"], [])
+                self.assertFalse(tool["lease"]["launch_pending"])
+
 
 if __name__ == "__main__":
     unittest.main()
