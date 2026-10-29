@@ -41,6 +41,8 @@ lease is gone. For older reapers without that marker, recovery requires the
 original attempt to remain present and the cached owner and all known workers
 to be provably dead after expiry. Source checks use the same bounded effective
 clock as ledger admission. Recovery never refunds or rewrites the call result.
+Both implementations validate source budget ledgers before trusting settlement
+evidence, without compacting away the completed attempts needed by the cache.
 
 Model queues prefer projects that have waited since a less recent admission, keeping
 FIFO order within equally served projects. A blocked provider does not block

@@ -242,24 +242,13 @@ func capacitySource(value string) (map[string]*capacityEntry, map[string]map[str
 	if err := readCapacityFile(value, &data); err != nil {
 		return nil, nil, 0, err
 	}
-	if err := validateLeases(data); err != nil {
+	if err := validateLedger(data); err != nil {
 		return nil, nil, 0, err
 	}
-	entries, ok := data["attempts"].([]any)
-	if !ok {
-		return nil, nil, 0, fmt.Errorf("invalid capacity source attempts")
-	}
 	attempts := map[string]map[string]any{}
-	for _, raw := range entries {
-		entry, ok := raw.(map[string]any)
-		if !ok {
-			return nil, nil, 0, fmt.Errorf("invalid capacity source attempt")
-		}
-		id, ok := entry["id"].(string)
-		if !ok || id == "" || attempts[id] != nil {
-			return nil, nil, 0, fmt.Errorf("invalid capacity source identity")
-		}
-		attempts[id] = entry
+	for _, raw := range data["attempts"].([]any) {
+		entry := raw.(map[string]any)
+		attempts[entry["id"].(string)] = entry
 	}
 	rows := map[string]*capacityEntry{}
 	now := leaseClock(data)

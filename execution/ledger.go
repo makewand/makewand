@@ -217,43 +217,49 @@ func readLedger(path *accountingPath, maximum int) (map[string]any, error) {
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("invalid trailing budget ledger data")
 	}
+	if err := validateLedger(ledger); err != nil {
+		return nil, err
+	}
+	compactLedger(ledger)
+	return ledger, nil
+}
+
+// Shared-capacity readers need the same validation without compaction: an old
+// completed attempt can still be positive settlement evidence for a cache.
+func validateLedger(ledger map[string]any) error {
 	schema, ok := jsonInteger(ledger["schema"])
 	if _, attemptsOK := ledger["attempts"].([]any); schema != Schema || !ok || !attemptsOK {
-		return nil, fmt.Errorf("invalid model call ledger schema or attempts")
+		return fmt.Errorf("invalid model call ledger schema or attempts")
 	}
 	if limit, valid := jsonInteger(ledger["maximum"]); !valid || limit <= 0 {
-		return nil, fmt.Errorf("invalid model call ledger maximum")
+		return fmt.Errorf("invalid model call ledger maximum")
 	}
 	identifiers := make(map[string]struct{})
 	for _, raw := range ledger["attempts"].([]any) {
 		entry, ok := raw.(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("invalid model call ledger attempt")
+			return fmt.Errorf("invalid model call ledger attempt")
 		}
 		id, ok := entry["id"].(string)
 		if _, duplicate := identifiers[id]; !ok || id == "" || duplicate {
-			return nil, fmt.Errorf("invalid or duplicate model call ledger attempt identity")
+			return fmt.Errorf("invalid or duplicate model call ledger attempt identity")
 		}
 		identifiers[id] = struct{}{}
 	}
 	if err := validateLeases(ledger); err != nil {
-		return nil, err
+		return err
 	}
 	if ledger["scopes"] != nil {
 		if err := validateScopes(ledger); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	if raw, exists := ledger["archived_used"]; exists {
 		if n, valid := jsonInteger(raw); !valid || n < 0 {
-			return nil, fmt.Errorf("invalid archived call count")
+			return fmt.Errorf("invalid archived call count")
 		}
 	}
-	if err := validateRetention(ledger); err != nil {
-		return nil, err
-	}
-	compactLedger(ledger)
-	return ledger, nil
+	return validateRetention(ledger)
 }
 
 // Close the image before decoding or replacing it. Callers hold the sidecar

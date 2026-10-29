@@ -404,7 +404,7 @@ func TestSharedCapacityRecoveryAfterLegacyReaper(t *testing.T) {
 	t.Run("source clock", func(t *testing.T) {
 		data["leases"] = map[string]any{"crashed": row.Lease}
 		row.Lease["expires_at"] = now + 5
-		data["scopes"] = map[string]any{"clock": now + 10}
+		data["scopes"] = map[string]any{"clock": now + 10, "day": "", "tasks": map[string]any{}, "projects": map[string]any{}, "machine": map[string]any{}}
 		write()
 		rows, _, _, err := capacitySource(path)
 		if err != nil || len(rows) != 0 {
@@ -433,4 +433,58 @@ func TestSharedCapacityRecoveryAfterLegacyReaper(t *testing.T) {
 			t.Fatal("source reaping evidence did not settle cached slot")
 		}
 	})
+}
+
+func TestSharedCapacityInvalidSourceCannotReleaseCachedLiveSlot(t *testing.T) {
+	root := sharedCapacityFixture(t, 3)
+	for _, field := range []string{"schema", "maximum", "scopes"} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(root, field+".json")
+			data := map[string]any{"schema": 1, "maximum": 3,
+				"attempts": []any{map[string]any{"id": "live", "status": "started"}},
+				"leases": map[string]any{"live": map[string]any{"keys": []any{"codex:provider", "codex:unknown", "codex:unknown:subscription"},
+					"owner": leaseProcessRef(os.Getpid()), "workers": []any{}, "launch_pending": false, "expires_at": float64(time.Now().UnixNano())/1e9 + 30}}}
+			write := func() {
+				raw, err := json.Marshal(data)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write()
+			rows, _, _, err := capacitySource(path)
+			if err != nil || rows["live"] == nil {
+				t.Fatal("invalid live fixture", err)
+			}
+			row := rows["live"]
+			state := &sharedCapacityState{Schema: 1, Active: map[string]*capacityEntry{row.ID: row}}
+			data["leases"] = map[string]any{}
+			data["attempts"].([]any)[0].(map[string]any)["status"] = "completed"
+			original, existed := data[field]
+			data[field] = map[string]any{"schema": 2, "maximum": 0, "scopes": map[string]any{"clock": "broken"}}[field]
+			write()
+			if _, _, _, err := capacitySource(path); err == nil {
+				t.Error("invalid source accepted as settlement evidence")
+			}
+			refreshCapacity(state, path)
+			if state.Active[row.ID] == nil {
+				t.Error("invalid source released a live cached slot")
+			}
+			if existed {
+				data[field] = original
+			} else {
+				delete(data, field)
+			}
+			// Valid historical evidence must survive the source reader even
+			// when normal budget loading would compact this old completion.
+			data["attempts"].([]any)[0].(map[string]any)["finished_at"] = float64(time.Now().Add(-72*time.Hour).UnixNano()) / 1e9
+			write()
+			refreshCapacity(state, path)
+			if state.Active[row.ID] != nil {
+				t.Error("valid historical settlement evidence was lost")
+			}
+		})
+	}
 }
