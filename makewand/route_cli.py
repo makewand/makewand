@@ -44,7 +44,8 @@ _TEXT_CANDIDATE_LIMIT = 5
 _OUTCOME_HINT = (
     "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
     " --model <模型> --effort <推理深度>"
-    "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls）"
+    " --request-id <请求ID> --caller <发起工具>"
+    "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls，批准须带 --candidate-hash <SHA256>）"
 )
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}

@@ -112,6 +112,10 @@ def model_process_failure(engine, code, output, stderr=None, exception=None, rea
     # remote completion. Timeout/spawn evidence takes precedence over stderr.
     error = (exception or stderr) if status in ("TIMEOUT", "FAILED") else (stderr or exception)
     error = error or f"{engine} returned exit code {code}"
+    if status == "UNKNOWN":
+        # Keep what the CLI printed, so an uncatalogued refusal can be found later.
+        from makewand import cli_failure_log
+        cli_failure_log.record(engine, code, stderr)
     return ExecutionResult(False, output, str(error), status=status, engine=engine,
         readonly=readonly, outcome_known=status == "FAILED",
         error_kind="deadline" if status == "TIMEOUT" else "process_start" if status == "FAILED" else "process_exit")

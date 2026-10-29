@@ -155,7 +155,7 @@ _RESET_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|
 _RESET_EPOCH_RE = re.compile(r"(?:^|\|)\s*(\d{10})(?:\.\d+)?\s*$")
 _RESET_ISO_RE = re.compile(
     r"(?<![\d.])(\d{4})-(\d{1,2})-(\d{1,2})"
-    r"(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,6})\d*)?)?\s*(Z|[+-]\d{2}(?::?\d{2})?)?)?(?![\d.])",
+    r"(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,6})\d*)?)?\s*(Z|[+-]\d{2}(?::?\d{2})?)?)?(?!\d|\.\d)",
     re.IGNORECASE)
 _RESET_NAMED_DATE_RE = re.compile(
     rf"\b(?P<mon>{_RESET_MONTH})\.?\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?\b(?:\s*,?\s*(?P<year>\d{{4}})\b)?"

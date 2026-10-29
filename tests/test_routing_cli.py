@@ -24,7 +24,8 @@ WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
 FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
           " --model <模型> --effort <推理深度>"
-          "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls）")
+          " --request-id <请求ID> --caller <发起工具>"
+          "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls，批准须带 --candidate-hash <SHA256>）")
 CANDIDATE_LINE = re.compile(
     r"^  (\d+)\. makewand (\S+) (.*) -C <目录> -f <子任务文件> --max-model-calls 1 --timeout \d+ --total-timeout \d+(?: --readonly)?   # (.+)$"
 )

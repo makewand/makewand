@@ -6,7 +6,7 @@
   "want (Q: a CLI's own quota or rate refusal, N: task content) and prov label the corpus a case came from (the round-2 verifier, earlier Go and Python tests, engine edge cases); they are not expectations.",
   "expect.<provider>.<modes>.<kind> is the normalized line on which health.py finds a message of that kind, for every kind of the provider's catalog entry; <modes> joins the modes with the same findings by ','. A provider or mode that is absent finds nothing."
  ],
- "catalog_sha256": "160ebb0557c19cdfd7b238ec44aeaed8fd768c9275ae324c8b3e438a3b4d219a",
+ "catalog_sha256": "dad09c949b14bba0cab77c21027c184f2913fabda238a26c7950f724ff15c0de",
  "cases": [
   {"id":"v1-r1-C1","text":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)"}}}},
   {"id":"v1-r1-C2","text":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)"}}}},
@@ -787,6 +787,10 @@
   {"id":"r4-muse-answer-http429","stdout":"I called the endpoint and it now answers:\nHTTP 429 Too Many Requests\n","stderr":"error: turn failed\n","want":"N","prov":"muse","expect":{"claude":{"apart":{"rate":"HTTP 429 Too Many Requests"}}}},
   {"id":"r4-muse-answer-exceeded","text":"I called the endpoint and it now answers:\n429 Rate limit exceeded\n","want":"N","prov":"muse"},
   {"id":"r4-muse-feedback-receipt","text":"Not uploaded: rate limited (retry after 30s)\n","want":"N","prov":"muse"},
-  {"id":"r4-muse-real-rate","stdout":"partial\n","stderr":"rate limited (HTTP 429 \u00b7 attempt 2)\n","want":"Q","prov":"muse","expect":{"muse":{"apart":{"rate":"rate limited (HTTP 429 \u00b7 attempt 2)"}}}}
+  {"id":"r4-muse-real-rate","stdout":"partial\n","stderr":"rate limited (HTTP 429 \u00b7 attempt 2)\n","want":"Q","prov":"muse","expect":{"muse":{"apart":{"rate":"rate limited (HTTP 429 \u00b7 attempt 2)"}}}},
+  {"id":"closeout-muse-subscription-429","text":"agent loop failed: model failed: API error 429 [request_id=00000000-0000-4000-8000-000000000001]: Subscription quota exhausted. Your usage window resets at 2026-10-28T10:47:45Z. (rate_limit_error)","want":"Q","prov":"muse","expect":{"muse":{"merged,stderr,stdout":{"quota":"agent loop failed: model failed: API error 429 [request_id=00000000-0000-4000-8000-000000000001]: Subscription quota exhausted. Your usage window resets at 2026-10-28T10:47:45Z. (rate_limit_error)"}}}},
+  {"id":"closeout-muse-quoted-quota","stdout":"I investigated this diagnostic:\nagent loop failed: model failed: API error 429 [request_id=00000000-0000-4000-8000-000000000001]: Subscription quota exhausted. Your usage window resets at 2026-10-28T10:47:45Z. (rate_limit_error)\nThe fix is complete.","stderr":"error: turn failed","want":"N","prov":"muse"},
+  {"id":"closeout-muse-other-status","text":"agent loop failed: model failed: API error 503 [request_id=00000000-0000-4000-8000-000000000001]: Subscription quota exhausted. Your usage window resets at 2026-10-28T10:47:45Z. (rate_limit_error)","want":"N","prov":"muse"},
+  {"id":"closeout-muse-other-reason","text":"agent loop failed: model failed: API error 429 [request_id=00000000-0000-4000-8000-000000000001]: Unrecognized model. Your usage window resets at 2026-10-28T10:47:45Z. (rate_limit_error)","want":"N","prov":"muse"}
  ]
 }

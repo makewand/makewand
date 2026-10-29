@@ -360,6 +360,15 @@ class OutcomeLedger:
         if set(details) - {"review_validated", "candidate_approved", "caller", "request_id", "candidate_hash", "failure_kind"}:
             raise TypeError("unsupported outcome metadata")
         row.update(_outcome_details(dict(row, **details)))
+        # Only new explicit approvals have this gate. Keep legacy records
+        # readable so inspection does not erase their missing metadata.
+        if row.get("candidate_approved") is True:
+            if row.get("review_validated") is not True or not row["passed"]:
+                raise ValueError("candidate approval requires validated review work")
+            if row["seconds"] is None or row["calls"] is None:
+                raise ValueError("candidate approval requires measured seconds and actual calls")
+            if not row.get("candidate_hash"):
+                raise ValueError("candidate approval requires --candidate-hash (candidate_hash)")
         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         self._ensure_dir()
         if not _O_NOFOLLOW and os.path.islink(self.outcomes_path):
@@ -375,11 +384,14 @@ class OutcomeLedger:
             filelock.flock(fd, filelock.LOCK_EX)
             try:
                 if "request_id" not in details and callable(infer_request_id):
-                    inferred = infer_request_id(self._read_rows(strict=False, locked=True))
+                    inferred = infer_request_id(self._read_rows(strict=False, locked=True, descriptor=fd))
                     if inferred is not None:
                         details = dict(details, request_id=inferred)
                         row.update(_outcome_details(dict(row, **details)))
                         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                if row.get("candidate_approved") is True and not row.get("request_id"):
+                    raise ValueError("candidate approval requires --request-id or MAKEWAND_TASK_ID "
+                                     "(request_id); no unique dispatched call could be linked")
                 # A truncated tail line without a trailing newline (crash
                 # mid-append, hand-truncated file) must not swallow this
                 # record: terminate that line first, under the write lock.
@@ -413,13 +425,22 @@ class OutcomeLedger:
             os.close(fd)
         return dict(row)
 
-    def _read_rows(self, *, strict=False, locked=False) -> List[Dict[str, Any]]:
+    def _read_rows(self, *, strict=False, locked=False, descriptor=None) -> List[Dict[str, Any]]:
         try:
-            stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
+            if descriptor is None:
+                stream = open(self.outcomes_path, "r", encoding="utf-8", errors="strict" if strict else "replace")
+            else:
+                # Windows byte locks also reject a read through another handle
+                # in this process. Reuse the writer's handle without closing it.
+                if not locked:
+                    raise ValueError("an existing outcome descriptor requires its held lock")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                stream = os.fdopen(descriptor, "r", encoding="utf-8",
+                                   errors="strict" if strict else "replace", closefd=False)
         except FileNotFoundError:
             return []
         except OSError:
-            if strict:
+            if strict or descriptor is not None:
                 raise
             # Missing or unreadable (e.g. read-only state dir): empty ledger.
             return []

@@ -9,6 +9,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- UNKNOWN CLI 失败只保留已知提供者自身独立 stderr 的脱敏末尾，完整分类后再截取，日志超限保留最新记录；`observe` 增加请求上限和 UNKNOWN/超时后续调用的授权核对提示。
+- 识别 Muse 实际的订阅额度 429 报错，并保留句末标点前 ISO 重置时间的时区；Python 与 Go 共用一致的 CLI 消息目录和回归语料。
+- 新的候选批准记录要求有效审查、实测用量、候选 SHA256 和可关联请求；保留旧成绩记录，路由提示补齐请求 ID、发起工具及候选哈希。原生 Windows 门禁纳入日志、预算提示及审计边界回归。
+- Windows 成绩关联复用已持锁的同一文件句柄读取历史，避免强制字节锁拒绝本进程的第二句柄；普通盘符/UNC 路径的扩展命名统一规范化，保留设备路径、保留名称、数据流、身份及私有文件检查。
+
 ## [3.3.0] - 2026-10-25
 
 - 候选验证归因与依赖取回收口（E2 / PR #91）：依赖、构建、测试、快速检查及可信验收子进程在隔离沙箱内启动后（含 slirp4netns 挂载完成后），发生命令超时、等待延迟超期、输出超限截断或非 ExitError 等待错误时，统一记为 `ExecutionIncomplete`（Strength 0，算作候选失败并记录模型质量扣分），仅启动前的宿主或沙箱设置故障保留 `EnvironmentError`；未识别的调用方自定义依赖命令在联网取回前即拒绝，不再整条放入带公网出口的沙箱执行；`Cargo.toml` 显式声明在点号隐藏目录下的 workspace 成员与本地 `path` 依赖在清单上限内一并拷入取回目录。
