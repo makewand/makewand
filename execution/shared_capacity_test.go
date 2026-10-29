@@ -307,3 +307,36 @@ func TestSharedCapacityReapedLegacyFloorAllowsTwoAgySlots(t *testing.T) {
 		t.Fatal("reaped old floor poisoned new policy", err)
 	}
 }
+
+func TestSharedCapacityTildeConfigImportsLegacyDefaultLedger(t *testing.T) {
+	root := sharedCapacityFixture(t, 3)
+	policy, err := os.ReadFile(filepath.Join(root, "capacity-policy.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	config := filepath.Join(home, "config")
+	if err := os.Mkdir(config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config, "capacity-policy.json"), policy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("MAKEWAND_CONFIG_DIR", "~/config")
+	now := float64(time.Now().UnixNano()) / 1e9
+	data := map[string]any{"schema": 1, "maximum": 3, "attempts": []any{map[string]any{"id": "legacy", "status": "started", "engine": "codex", "started_at": now}},
+		"leases": map[string]any{"legacy": map[string]any{"keys": []any{"codex:provider", "codex:unknown", "codex:unknown:subscription"}, "owner": leaseProcessRef(os.Getpid()), "workers": []any{}, "launch_pending": false, "expires_at": now + 30}}}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(config, "call-budget.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Reserve(ContextWithConfig(t.Context(), Config{LedgerPath: filepath.Join(root, "private.json"), TaskID: "private", MaxCalls: 3}), Metadata{Engine: "codex"})
+	if !errors.Is(err, ErrConcurrencyBusy) {
+		t.Fatal("legacy default ledger was not imported", err)
+	}
+}

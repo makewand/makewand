@@ -339,7 +339,9 @@ func validateCapacityState(state *sharedCapacityState) error {
 func refreshCapacity(state *sharedCapacityState, selected string) {
 	paths := map[string]bool{selected: true}
 	if path, err := DefaultBudgetPath(); err == nil {
-		paths[resolvedLedgerPath(path)] = true
+		// Expand the original operator path in the canonicalization loop below;
+		// filepath.Abs on a leading ~ would turn it into a literal cwd child.
+		paths[path] = true
 	}
 	// The old registry is an import source only. New admissions are durably
 	// registered under the shared lock before any provider callback can run.
