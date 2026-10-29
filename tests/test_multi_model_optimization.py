@@ -321,7 +321,7 @@ class TestGrokProviderIntegration(unittest.TestCase):
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     @patch("makewand.providers.grok.run_subprocess")
     def test_grok_cli_argument_construction(self, mock_run, mock_bwrap):
-        with _FakeProviderHome() as fh:
+        with _FakeProviderHome() as fh, patch("makewand.sandbox._provider_socket_preflight"):
             self._grok_cli_argument_construction(mock_run, str(fh.workspace))
 
     def _grok_cli_argument_construction(self, mock_run, ws):

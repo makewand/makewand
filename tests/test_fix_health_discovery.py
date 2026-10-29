@@ -468,6 +468,7 @@ class TestGrokCliCacheLayout(_TempHome):
             return "/opt/grok/bin/grok" if name == "grok" else real_which(name, *args, **kwargs)
         with patch("shutil.which", side_effect=fixture_which), \
              patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+             patch("makewand.sandbox._provider_socket_preflight"), \
              patch.object(grok_provider, "run_subprocess", return_value=(0, "ok", "", None)) as run:
             grok_provider.execute_grok_task("analyze problem", cwd=str(workspace), tier="fast", readonly=True)
         cmd = run.call_args[0][0]
