@@ -576,19 +576,21 @@ def run_subprocess(
             scope.unregister_proc(proc)
         cleanup_group()
         from makewand.execution_runtime import provider_process_lease
-        if proc is None:
-            provider_process_lease("launch_failed")
-        elif proc.poll() is not None:
-            provider_process_lease("stopped")
-        cleanup_display()
-        if selector is not None:
-            selector.close()
-        if proc is not None:
-            for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):
-                if pipe and not getattr(pipe, "closed", True):
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
-        if display_proc is not None and not display_proc.stdin.closed:
-            display_proc.stdin.close()
+        try:
+            if proc is None:
+                provider_process_lease("launch_failed")
+            elif proc.poll() is not None:
+                provider_process_lease("stopped")
+        finally:
+            cleanup_display()
+            if selector is not None:
+                selector.close()
+            if proc is not None:
+                for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):
+                    if pipe and not getattr(pipe, "closed", True):
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+            if display_proc is not None and not display_proc.stdin.closed:
+                display_proc.stdin.close()

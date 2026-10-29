@@ -4,8 +4,10 @@ import json
 import re
 
 MODULES = ["test_native_windows", "test_native_windows_pipeline", "test_native_delivery",
-           "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight"]
+           "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight",
+           "test_shared_capacity"]
 WINDOWS_SKIPS = {
+    "test_shared_capacity.SharedCapacityTests.test_dead_owner_does_not_release_live_worker": "Linux process identity required",
     "test_provider_startup_preflight.PrivateHomeFallbackTests.test_existing_unwritable_runtime_uses_writable_private_cache": "needs POSIX permission enforcement for a normal user",
     "test_provider_startup_preflight.PrivateHomeFallbackTests.test_symlinked_runtime_base_is_not_used": "POSIX symlink fixture",
     "test_provider_startup_preflight.SocketPreflightTests.test_probe_uses_its_own_filter_and_preserves_actual_filter_bytes": "seccomp pipes on POSIX",

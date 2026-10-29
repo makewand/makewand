@@ -1158,6 +1158,20 @@ def _suite_without_evidence(name, cmd, code, stdout, stderr, err_category) -> Op
 
 
 def run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
+    from makewand import shared_capacity
+    from makewand.call_budget import BudgetError
+    try:
+        policy = shared_capacity.policy()
+        if policy is not None and shared_capacity._tool.get() is None:
+            deadline = time.monotonic() + max(0, timeout)
+            with shared_capacity.tool_scope(policy, deadline):
+                return _run_local_tests(cwd, max(0, deadline - time.monotonic()))
+    except (BudgetError, OSError, ValueError) as error:
+        return False, LocalTestsUnavailable(f"本地测试等待容量失败，未通过验收: {error}")
+    return _run_local_tests(cwd, timeout)
+
+
+def _run_local_tests(cwd: str, timeout: int = 60) -> Tuple[bool, Optional[str]]:
     """
     Deterministically detects and runs local unit test suites in cwd inside Bubblewrap sandbox.
     Supports composite / multi-stack projects (Python, Go, Node, Rust).

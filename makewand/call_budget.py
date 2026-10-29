@@ -9,11 +9,12 @@ import math
 import errno
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
 from contextlib import contextmanager
-from makewand import accounting_files, filelock, layered_budget, account_leases, ledger_compaction, ledger_registry
+from makewand import accounting_files, filelock, layered_budget, account_leases, ledger_compaction, ledger_registry, shared_capacity
 
 
 class BudgetError(RuntimeError):
@@ -43,10 +44,10 @@ class LeaseWaitConfigError(BudgetConfigError):
 _LEASE_WAIT_DECIMAL = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
-def lease_wait_seconds(deadline_monotonic=None):
+def lease_wait_seconds(deadline_monotonic=None, capacity_policy=None):
     value = os.environ.get("MAKEWAND_LEASE_WAIT_SECONDS")
     if not value:
-        return 30
+        return capacity_policy["wait_seconds"] if capacity_policy else 30
     try:
         value = value.strip(" \t\r\n\v\f")
         if not _LEASE_WAIT_DECIMAL.fullmatch(value):
@@ -54,7 +55,7 @@ def lease_wait_seconds(deadline_monotonic=None):
         seconds = float(value)
         if not math.isfinite(seconds) or seconds < 0 or seconds * 1e9 >= 2**63:
             raise ValueError()
-        return seconds
+        return min(seconds, capacity_policy["wait_seconds"]) if capacity_policy else seconds
     except ValueError as error:
         raise LeaseWaitConfigError("MAKEWAND_LEASE_WAIT_SECONDS must be a finite nonnegative decimal fitting int64 nanoseconds") from error
 
@@ -215,32 +216,62 @@ def _save(path, data):
 def reserve(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=None,
             stage="provider", account_ref=None, api_policy="subscription_only",
             budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False,
-            wait_for_capacity=True):
+            wait_for_capacity=True, working_directory=None):
     deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
-    wait_seconds = lease_wait_seconds(deadline_monotonic)
+    capacity_policy = shared_capacity.policy()
+    ticket_id = uuid.uuid4().hex
+    wait_seconds = lease_wait_seconds(deadline_monotonic, capacity_policy)
     now = time.monotonic()
     wait_until = now + wait_seconds if wait_for_capacity else now
     if deadline_monotonic is not None:
         remaining = max(0, deadline_monotonic - now)
-        # Leave one second for dispatch/cleanup, or half of a short request.
-        wait_until = min(wait_until, deadline_monotonic - min(1, remaining / 2))
+        # Host policy leaves two thirds of the remaining budget for execution.
+        latest = now + remaining / 3 if capacity_policy else deadline_monotonic - min(1, remaining / 2)
+        wait_until = min(wait_until, latest)
     from makewand.providers.base import get_current_contestant_scope
     scope = get_current_contestant_scope()
-    delay = .05
+    try:
+        return _reserve_wait(engine, tier, model, readonly, lease_id=lease_id, task_id=task_id,
+            stage=stage, account_ref=account_ref, api_policy=api_policy, budget_file=budget_file,
+            max_model_calls=max_model_calls, deadline_monotonic=deadline_monotonic, pending=pending,
+            capacity_policy=capacity_policy, ticket_id=ticket_id, wait_until=wait_until, scope=scope,
+            working_directory=working_directory)
+    finally:
+        shared_capacity.cancel(ticket_id, capacity_policy)
+
+
+def _reserve_wait(engine, tier, model, readonly, *, capacity_policy, ticket_id, wait_until, scope, working_directory, **kwargs):
+    delay, next_report = .05, 0
     busy_error = None
     while True:
         _check_admission_cancelled()
         try:
-            return _reserve_once(engine, tier, model, readonly, lease_id=lease_id, task_id=task_id,
-                stage=stage, account_ref=account_ref, api_policy=api_policy,
-                budget_file=budget_file, max_model_calls=max_model_calls,
-                deadline_monotonic=deadline_monotonic, pending=pending)
+            transaction = dict(kwargs)
+            if capacity_policy:
+                # Never hold the host gate indefinitely waiting for a private
+                # ledger. Failed short transactions retry outside both locks.
+                lock_deadline = time.monotonic() + min(5, max(1, wait_until - time.monotonic()))
+                if kwargs["deadline_monotonic"] is not None:
+                    lock_deadline = min(lock_deadline, kwargs["deadline_monotonic"])
+                transaction["deadline_monotonic"] = lock_deadline
+            try:
+                with shared_capacity.admission(capacity_policy, engine, kwargs["account_ref"], kwargs["budget_file"],
+                        kwargs["task_id"], ticket_id, transaction["deadline_monotonic"], working_directory) as gate:
+                    return _reserve_once(engine, tier, model, readonly, capacity_gate=gate,
+                                         capacity_policy=capacity_policy, **transaction)
+            except BudgetDeadlineError as error:
+                if capacity_policy and (kwargs["deadline_monotonic"] is None or time.monotonic() < kwargs["deadline_monotonic"]):
+                    raise ConcurrencyBusyError("shared capacity transaction busy; no call admitted") from error
+                raise
         except BudgetDeadlineError as error:
             if busy_error is not None:
                 raise busy_error from error
             raise
         except ConcurrencyBusyError as error:
             busy_error = error
+            if capacity_policy and time.monotonic() >= next_report:
+                shared_capacity.report_busy(error)
+                next_report = time.monotonic() + 15
             remaining = wait_until - time.monotonic()
             if remaining <= 0:
                 raise
@@ -264,7 +295,9 @@ def _check_admission_cancelled():
 
 def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=None,
             stage="provider", account_ref=None, api_policy="subscription_only",
-            budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False):
+            budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False,
+            capacity_gate=None, capacity_policy=None):
+    attempt, ledger_path, write_attempted = None, None, False
     try:
         deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
         # Admission without an execution deadline waits for the ledger like Go's
@@ -274,6 +307,8 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
         with _ledger(budget_file, max_model_calls, lock_deadline, admission=True) as (path, data):
             _check_admission_cancelled()
             if data is None:
+                if capacity_gate is not None:
+                    raise BudgetConfigError("host capacity requires a model call ledger")
                 return None
             maximum = data["maximum"] if "scopes" in data else _maximum(data, max_model_calls)
             holds = _active_holds(data)
@@ -294,8 +329,8 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
             elif _charged(data) + reserved >= maximum:
                 raise BudgetError(f"model task budget exhausted ({len(data['attempts'])}/{maximum})")
             account_lease = None
-            if "scopes" in data:
-                account_lease = account_leases.admission(data, engine, account_ref)
+            if "scopes" in data or capacity_policy:
+                account_lease = account_leases.admission(data, engine, account_ref, capacity_policy)
             if lease_id is not None:
                 hold["remaining"] -= 1
             if keys:
@@ -312,14 +347,57 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
                                      "account_ref": account_ref, "api_policy": api_policy,
                                      "result_status": None, "outcome_known": None,
                                      "tokens": None, "monetary_cost": None})
-            _save(path, data)
+            if capacity_gate is not None:
+                data["attempts"][-1].update(capacity_project=capacity_gate.ticket["project"],
+                                            capacity_label=capacity_gate.ticket["label"])
             ledger_path = path.path
+            write_attempted = True
+            _save(path, data)
+        if capacity_gate is not None:
+            capacity_gate.commit(ledger_path, attempt)
         ledger_registry.note(ledger_path)  # outside the ledger lock: visibility only
         return attempt
-    except BudgetError:
+    except BaseException as error:
+        if capacity_gate is not None and write_attempted:
+            # The caller has not received a reservation, so no transport can
+            # have started. Settle even an uncertain post-rename write failure.
+            _abandon_capacity_reservation(attempt, ledger_path, max_model_calls)
+        if isinstance(error, BudgetError):
+            raise
+        if isinstance(error, (OSError, ValueError, KeyError, TypeError, RuntimeError)):
+            raise BudgetError(f"cannot reserve model task budget: {error}") from error
         raise
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-        raise BudgetError(f"cannot reserve model task budget: {error}") from error
+
+
+def _abandon_capacity_reservation(attempt, ledger_path, maximum):
+    """Undo only a reservation whose admission never returned to its caller.
+
+    Retry accounting after storage recovers, without invoking a provider or
+    renewing the abandoned lease. The original reservation ID remains fixed.
+    """
+    def settle():
+        try:
+            reject_unlaunched(attempt, budget_file=ledger_path, max_model_calls=maximum)
+        except BudgetError as error:
+            # A missing record needs no settlement; an invocation fence must
+            # never be refunded, even if a caller violated the gate contract.
+            return str(error) in ("model task reservation disappeared", "cannot refund an invoked transport")
+        except (OSError, ValueError, RuntimeError):
+            return False
+        return True
+
+    if settle():
+        return
+
+    def retry():
+        waiter, delay = threading.Event(), .1
+        while True:
+            waiter.wait(delay)
+            if settle():
+                return
+            delay = min(delay * 2, 30)
+
+    threading.Thread(target=retry, name="makewand-capacity-settlement", daemon=True).start()
 
 
 def complete(attempt, success, seconds, *, result_status=None, outcome_known=True,
@@ -573,6 +651,14 @@ def api_lease(attempt, engine, *, budget_file=None, max_model_calls=None):
     """Atomically move this attempt to the API capacity before transport."""
     if attempt is None:
         return
+    policy = shared_capacity.policy()
+    with shared_capacity.relocation(policy, engine, budget_file, attempt) as gate:
+        path = _api_lease(attempt, engine, budget_file, max_model_calls, policy)
+        if gate is not None:
+            gate.commit(path, attempt)
+
+
+def _api_lease(attempt, engine, budget_file, max_model_calls, policy):
     with _ledger(budget_file, max_model_calls) as (path, data):
         leases = data.get("leases", {})
         old = leases.get(attempt)
@@ -581,6 +667,7 @@ def api_lease(attempt, engine, *, budget_file=None, max_model_calls=None):
         if old["launch_pending"] or old["workers"]:
             raise BudgetError("cannot change route while a CLI worker exists")
         del leases[attempt]
-        new = account_leases.admission(data, engine + ":api", None)
+        new = account_leases.admission(data, engine + ":api", None, policy)
         leases[attempt] = new
         _save(path, data)
+        return path.path

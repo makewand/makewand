@@ -12,6 +12,7 @@ def compact(data):
     leases = data.get("leases", {})
     kept = []
     archived = data.get("archived_used", 0)
+    capacity_checked, capacity_refs = False, None
     for entry in data["attempts"]:
         finished = entry.get("finished_at")
         # Old Go completions recorded start + elapsed monotonic seconds.
@@ -23,9 +24,17 @@ def compact(data):
                      all(type(v) in (int, float) and math.isfinite(v) and v >= 0
                          for v in (started, elapsed)))
             finished = entry["finished_at"] = started + elapsed if dated else now
-        if (entry.get("status") in ("completed", "released") and entry["id"] not in leases
-                and type(finished) in (int, float) and math.isfinite(finished)
-                and 0 <= finished < cutoff):
+        expired = (entry.get("status") in ("completed", "released") and entry["id"] not in leases
+                   and type(finished) in (int, float) and math.isfinite(finished)
+                   and 0 <= finished < cutoff)
+        if expired:
+            if not capacity_checked:
+                from makewand.shared_capacity import referenced_attempts
+                capacity_refs, capacity_checked = referenced_attempts(), True
+            # Keep the settlement receipt until the shared cache observes it.
+            # An unreadable snapshot never licenses deleting that proof.
+            expired = capacity_refs is not None and entry["id"] not in capacity_refs
+        if expired:
             archived = min(9223372036854775807, archived + (entry["status"] != "released"))
         else:
             kept.append(entry)

@@ -47,6 +47,8 @@ func compactLedger(data map[string]any) {
 	// Most transactions have no expired history. Reuse the decoded slice
 	// rather than allocating and copying it again on both read and save.
 	kept := attempts[:0]
+	capacityChecked := false
+	var capacityRefs map[string]bool
 	for _, raw := range attempts {
 		entry := raw.(map[string]any)
 		settled := entry["status"] == "completed" || entry["status"] == "released"
@@ -61,7 +63,16 @@ func compactLedger(data map[string]any) {
 			}
 		}
 		finished := ledgerNumber(entry["finished_at"])
-		if settled && leases[entry["id"].(string)] == nil && finished >= 0 && !math.IsNaN(finished) && !math.IsInf(finished, 0) && finished < cutoff {
+		expired := settled && leases[entry["id"].(string)] == nil && finished >= 0 && !math.IsNaN(finished) && !math.IsInf(finished, 0) && finished < cutoff
+		if expired {
+			if !capacityChecked {
+				capacityRefs, capacityChecked = capacityReferencedAttempts(), true
+			}
+			// Preserve positive settlement evidence until the shared cache has
+			// stopped referencing it; an unreadable snapshot retains receipts.
+			expired = capacityRefs != nil && !capacityRefs[entry["id"].(string)]
+		}
+		if expired {
 			if entry["status"] != "released" {
 				if archived < int(^uint(0)>>1) {
 					archived++

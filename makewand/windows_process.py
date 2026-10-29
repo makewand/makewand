@@ -421,14 +421,16 @@ def run_windows_subprocess(cmd, timeout=180, cwd=None, input_text=None, stream=F
                     active_proc.kill()
                     active_proc.wait(timeout=.5)
         from makewand.execution_runtime import provider_process_lease
-        if proc is None:
-            provider_process_lease("launch_failed")
-        elif proc.poll() is not None:
-            provider_process_lease("stopped")
-        for thread in threads:
-            thread.join(timeout=.5)
-        for active_proc in (proc, display_proc):
-            if active_proc:
-                for pipe in (active_proc.stdout, active_proc.stderr, active_proc.stdin):
-                    if pipe and not pipe.closed:
-                        pipe.close()
+        try:
+            if proc is None:
+                provider_process_lease("launch_failed")
+            elif proc.poll() is not None:
+                provider_process_lease("stopped")
+        finally:
+            for thread in threads:
+                thread.join(timeout=.5)
+            for active_proc in (proc, display_proc):
+                if active_proc:
+                    for pipe in (active_proc.stdout, active_proc.stderr, active_proc.stdin):
+                        if pipe and not pipe.closed:
+                            pipe.close()

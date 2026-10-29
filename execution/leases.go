@@ -130,6 +130,10 @@ func leaseWorkersAlive(l map[string]any) bool {
 	return false
 }
 func admitLease(data map[string]any, engine string, account *string) (map[string]any, error) {
+	return admitLeaseWithPolicy(data, engine, account, nil)
+}
+
+func admitLeaseWithPolicy(data map[string]any, engine string, account *string, policy *hostCapacityPolicy) (map[string]any, error) {
 	keys := leaseKeys(engine, account)
 	engine = strings.TrimSuffix(keys[0].(string), ":provider")
 	leases, ok := data["leases"].(map[string]any)
@@ -138,20 +142,23 @@ func admitLease(data map[string]any, engine string, account *string) (map[string
 		data["leases"] = leases
 	}
 	now := leaseClock(data)
-	completed := map[string]bool{}
-	if attempts, ok := data["attempts"].([]any); ok {
-		for _, raw := range attempts {
+	attempts := map[string]map[string]any{}
+	if entries, ok := data["attempts"].([]any); ok {
+		for _, raw := range entries {
 			e := raw.(map[string]any)
-			if e["status"] == "completed" {
-				completed[e["id"].(string)] = true
-			}
+			attempts[e["id"].(string)] = e
 		}
 	}
 	for id, raw := range leases {
 		l := raw.(map[string]any)
 		expires, _ := l["expires_at"].(json.Number).Float64()
-		stoppedAttempt := completed[id] && !l["launch_pending"].(bool)
+		stoppedAttempt := attempts[id]["status"] == "completed" && !l["launch_pending"].(bool)
 		if expires <= now && (stoppedAttempt || !leaseProcessAlive(l["owner"].(map[string]any), false)) && !leaseWorkersAlive(l) {
+			// Reaping frees capacity, never the charged attempt. Keep positive
+			// recovery evidence after this lease disappears from its source.
+			if entry := attempts[id]; entry != nil {
+				entry["lease_reaped"] = true
+			}
 			delete(leases, id)
 		}
 	}
@@ -160,10 +167,33 @@ func admitLease(data map[string]any, engine string, account *string) (map[string
 		limits = map[string]any{}
 		data["lease_limits"] = limits
 	}
+	// Load-time compaction preceded dead-lease reaping. A newly admitted lease
+	// must not keep a floor which no remaining active lease references.
+	referenced := map[string]bool{}
+	for _, raw := range leases {
+		for _, key := range raw.(map[string]any)["keys"].([]any) {
+			referenced[key.(string)] = true
+		}
+	}
+	for key := range limits {
+		if !referenced[key] {
+			delete(limits, key)
+		}
+	}
 	for i, key := range keys {
-		limit, err := scopeLimit([]string{"MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"}[i], []int{64, 1, 1}[i])
+		defaultLimit := []int{64, 1, 1}[i]
+		if policy != nil {
+			defaultLimit = policy.Providers[strings.TrimSuffix(engine, ":api")]
+			if defaultLimit == 0 {
+				defaultLimit = 1
+			}
+		}
+		limit, err := scopeLimit([]string{"MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"}[i], defaultLimit)
 		if err != nil {
 			return nil, err
+		}
+		if policy != nil {
+			limit = min(limit, defaultLimit)
 		}
 		if old, ok := jsonInteger(limits[key.(string)]); ok {
 			limit = min(limit, old)
