@@ -45,7 +45,15 @@ def _read_pinned(path):
 def policy():
     from makewand.call_budget import BudgetConfigError
     try:
-        result = _read(Path(layered_budget.default_path()).with_name(POLICY_NAME))
+        value = layered_budget.default_path()
+    except (OSError, RuntimeError) as error:
+        # An unavailable implicit home is not an enabled policy. Keep the
+        # legacy private-ledger path; explicit configuration stays closed.
+        if not os.environ.get("MAKEWAND_CONFIG_DIR") and not os.environ.get("XDG_CONFIG_HOME"):
+            return None
+        raise BudgetConfigError(f"cannot locate host capacity policy: {error}") from error
+    try:
+        result = _read(Path(value).with_name(POLICY_NAME))
     except FileNotFoundError:
         return None
     except (OSError, ValueError, RuntimeError) as error:

@@ -33,8 +33,8 @@ keeps the original coordinator path, never renews the finished tool's heartbeat,
 and preserves live or unobservable worker fences. The initial failure still
 reports validation as unavailable.
 
-When the home environment is absent, Go resolves this optional configuration
-through the operating-system user record, including operator `~` aliases.
+When the home environment is absent, both CLIs resolve this optional
+configuration through the operating-system user record, including operator `~` aliases.
 An unavailable implicit home preserves legacy dispatches and conservatively
 retains possible history references; unreadable explicit paths still fail closed.
 

@@ -22,6 +22,7 @@ POLICY = {"schema": 1, "global_max": 3, "project_max": 1, "tool_max": 2,
 
 class SharedCapacityTests(unittest.TestCase):
     def setUp(self):
+        import threading
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -32,6 +33,27 @@ class SharedCapacityTests(unittest.TestCase):
         for name in ("MAKEWAND_CALL_BUDGET_FILE", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY", "MAKEWAND_PROVIDER_CONCURRENCY"):
             os.environ.pop(name, None)
         (self.root / capacity.POLICY_NAME).write_text(json.dumps(POLICY))
+        # Windows cannot delete the fixture directory while one of our
+        # real recovery workers still has a pinned accounting handle open.
+        self.settlement_workers = []
+        original_defer = capacity._defer_tool_settlement
+
+        def track_settlement(*args, **kwargs):
+            before = set(threading.enumerate())
+            original_defer(*args, **kwargs)
+            self.settlement_workers.extend(worker for worker in threading.enumerate()
+                                           if worker not in before and worker.name == "makewand-tool-settlement")
+
+        tracker = patch.object(capacity, "_defer_tool_settlement", side_effect=track_settlement)
+        tracker.start()
+        self.addCleanup(tracker.stop)
+
+        def join_settlements():
+            for worker in self.settlement_workers:
+                worker.join(timeout=6)
+                self.assertFalse(worker.is_alive(), "fixture left its settlement worker running")
+
+        self.addCleanup(join_settlements)
 
     def reserve(self, name, engine="agy", task_id=None, project=None):
         os.environ["MAKEWAND_PROJECT_ROOT"] = str(self.root / (project or name))
@@ -123,6 +145,50 @@ class SharedCapacityTests(unittest.TestCase):
         self.assertFalse((self.root / capacity.STATE_NAME).exists())
         self.finish("a", a)
         self.finish("b", b)
+
+    def test_unknown_implicit_home_keeps_private_budget_api_and_sandbox(self):
+        from makewand import sandbox
+        source = self.root / "unknown-home.json"
+        with patch.dict(os.environ):
+            for key in ("HOME", "USERPROFILE", "MAKEWAND_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                os.environ.pop(key, None)
+            with patch.object(Path, "home", side_effect=RuntimeError("Could not determine home directory")):
+                attempt = budget.reserve("codex", "fast", task_id="unknown-home", budget_file=str(source))
+                self.assertIsNone(capacity.policy())
+                self.assertIsNone(capacity.referenced_attempts())
+                budget.api_lease(attempt, "codex", budget_file=str(source))
+                budget.complete(attempt, True, 0, budget_file=str(source))
+                with patch.object(sandbox, "_trusted_system_binary", return_value=None):
+                    self.assertEqual(sandbox.sandbox_resource_limit_prefix(), [])
+                data = json.loads(source.read_text())
+                data["attempts"][0]["finished_at"] = time.time() - 49 * 3600
+                source.write_text(json.dumps(data))
+                budget.request_budget("unknown-home", maximum=3, budget_file=str(source))
+                self.assertIn(attempt, {row["id"] for row in json.loads(source.read_text())["attempts"]})
+        budget.request_budget("unknown-home", maximum=3, budget_file=str(source))
+        data = json.loads(source.read_text())
+        self.assertNotIn(attempt, {row["id"] for row in data["attempts"]})
+        self.assertEqual(data["scopes"]["tasks"]["unknown-home"]["used"], 1)
+
+    def test_unknown_home_does_not_hide_explicit_config_or_file_errors(self):
+        with patch.dict(os.environ):
+            for key in ("HOME", "USERPROFILE", "MAKEWAND_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                os.environ.pop(key, None)
+            for error in (RuntimeError("fixture home unavailable"), OSError("fixture user lookup failed")):
+                with self.subTest(home_error=type(error).__name__), patch.object(Path, "home", side_effect=error):
+                    self.assertIsNone(capacity.policy())
+            for key in ("MAKEWAND_CONFIG_DIR", "XDG_CONFIG_HOME"):
+                with self.subTest(explicit=key), patch.dict(os.environ, {key: "~/operator-config"}), \
+                        patch.object(Path, "home", side_effect=RuntimeError("fixture home unavailable")), \
+                        patch.object(Path, "expanduser", side_effect=RuntimeError("fixture home unavailable")):
+                    with self.assertRaises(budget.BudgetConfigError):
+                        capacity.policy()
+            for error in (OSError("fixture policy inaccessible"), RuntimeError("fixture identity changed")):
+                with self.subTest(file_error=type(error).__name__), \
+                        patch.object(capacity.layered_budget, "default_path", return_value=str(self.root / "budget.json")), \
+                        patch.object(capacity, "_read", side_effect=error):
+                    with self.assertRaises(budget.BudgetConfigError):
+                        capacity.policy()
 
     def test_fifo_skips_blocked_provider_and_prefers_less_recent_project(self):
         current = capacity.policy()
@@ -410,7 +476,11 @@ class SharedCapacityTests(unittest.TestCase):
             for entrypoint in ("tests", "sandbox"):
                 with self.subTest(damage=damage, entrypoint=entrypoint):
                     state_path.unlink(missing_ok=True)
-                    with patch.object(capacity, "tool_memory_available", return_value=True):
+                    # These deliberately destroyed states are discarded, not
+                    # repaired. Test the unavailable result here; separate
+                    # recovery tests run and join the actual retry workers.
+                    with patch.object(capacity, "tool_memory_available", return_value=True), \
+                            patch.object(capacity, "_defer_tool_settlement"):
                         if entrypoint == "tests":
                             with patch.object(orchestrator, "_run_local_tests", side_effect=damage_state):
                                 passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
