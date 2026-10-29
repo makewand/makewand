@@ -259,7 +259,7 @@ def execute(request, callback):
             account_ref=request.account_ref, api_policy=request.api_policy,
             budget_file=request.budget_file, max_model_calls=request.max_model_calls,
             deadline_monotonic=deadline, pending=True,
-            wait_for_capacity=context.get("wait_for_capacity", True))
+            wait_for_capacity=context.get("wait_for_capacity", True), working_directory=request.cwd)
     except call_budget.BudgetCancelledError as error:
         return _result(request, "CANCELLED", error=str(error), error_kind="cancelled", outcome_known=True)
     except call_budget.BudgetDeadlineError:
@@ -427,6 +427,8 @@ def _lease_heartbeat(attempt, request):
 
 
 def provider_process_lease(action, pid=None):
+    from makewand import shared_capacity
+    shared_capacity.tool_update(action, pid)
     context = current_context()
     for retry in range(3):
         try:

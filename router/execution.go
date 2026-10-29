@@ -97,12 +97,12 @@ func reserveProvider(ctx context.Context, provider Provider) (context.Context, *
 	if modelID != "" {
 		requestedModel = &modelID
 	}
-	_, workspace := WorkDirFromContext(ctx)
+	workingDir, workspace := WorkDirFromContext(ctx)
 	tier := "standard"
 	if mode, ok := UsageModeFromContext(ctx); ok {
 		tier = UsageModeToPythonTier(mode)
 	}
-	attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: provider.Name(), Tier: tier, Model: requestedModel, Readonly: !workspace, Pending: true})
+	attempt, err := execution.Reserve(ctx, execution.Metadata{Engine: provider.Name(), Tier: tier, Model: requestedModel, Readonly: !workspace, Pending: true, WorkingDir: workingDir})
 	if err != nil {
 		if errors.Is(err, execution.ErrConcurrencyBusy) {
 			return ctx, nil, err

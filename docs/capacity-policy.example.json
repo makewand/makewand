@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "global_max": 3,
+  "project_max": 1,
+  "tool_max": 2,
+  "wait_seconds": 300,
+  "providers": {
+    "codex": 1,
+    "agy": 2,
+    "claude": 1,
+    "grok": 1,
+    "muse": 1
+  }
+}

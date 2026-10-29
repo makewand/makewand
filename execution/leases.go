@@ -130,6 +130,10 @@ func leaseWorkersAlive(l map[string]any) bool {
 	return false
 }
 func admitLease(data map[string]any, engine string, account *string) (map[string]any, error) {
+	return admitLeaseWithPolicy(data, engine, account, nil)
+}
+
+func admitLeaseWithPolicy(data map[string]any, engine string, account *string, policy *hostCapacityPolicy) (map[string]any, error) {
 	keys := leaseKeys(engine, account)
 	engine = strings.TrimSuffix(keys[0].(string), ":provider")
 	leases, ok := data["leases"].(map[string]any)
@@ -161,9 +165,19 @@ func admitLease(data map[string]any, engine string, account *string) (map[string
 		data["lease_limits"] = limits
 	}
 	for i, key := range keys {
-		limit, err := scopeLimit([]string{"MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"}[i], []int{64, 1, 1}[i])
+		defaultLimit := []int{64, 1, 1}[i]
+		if policy != nil {
+			defaultLimit = policy.Providers[strings.TrimSuffix(engine, ":api")]
+			if defaultLimit == 0 {
+				defaultLimit = 1
+			}
+		}
+		limit, err := scopeLimit([]string{"MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"}[i], defaultLimit)
 		if err != nil {
 			return nil, err
+		}
+		if policy != nil {
+			limit = min(limit, defaultLimit)
 		}
 		if old, ok := jsonInteger(limits[key.(string)]); ok {
 			limit = min(limit, old)

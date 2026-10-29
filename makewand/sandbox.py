@@ -27,6 +27,7 @@ starts inside a writable workspace are not masked.
 
 import json
 import logging
+import math
 import os
 import platform
 import signal
@@ -3371,6 +3372,12 @@ def sandbox_resource_limit_prefix() -> List[str]:
     if os.name != "posix":
         return []
     mem = _env_limit(SANDBOX_MEMORY_MAX_ENV, DEFAULT_SANDBOX_MEMORY_MAX, _MEM_RE)
+    from makewand.shared_capacity import policy as capacity_policy
+    if capacity_policy():
+        multiplier = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+        value = math.inf if mem == "infinity" else int(mem[:-1]) * multiplier[mem[-1]] if mem[-1] in multiplier else int(mem)
+        if value > 16 * 1024**3:
+            mem = "16G"
     tasks = _env_limit(SANDBOX_TASKS_MAX_ENV, DEFAULT_SANDBOX_TASKS_MAX, _TASKS_RE)
     systemd_run = _trusted_system_binary("systemd-run")
     if systemd_run and _systemd_scope_usable(systemd_run):
@@ -3862,6 +3869,10 @@ def sandbox_lifecycle(
                         pass
 
 
+from makewand.shared_capacity import controlled_tool
+
+
+@controlled_tool
 def run_in_sandbox(
     cmd: List[str],
     workspace: str,

@@ -57,12 +57,13 @@ func (e *UnknownOutcomeError) Unwrap() error        { return e.Err }
 func (e *UnknownOutcomeError) Is(target error) bool { return target == ErrUnknownOutcome }
 
 type Metadata struct {
-	Engine   string
-	Tier     string
-	Model    *string
-	Stage    string
-	Readonly bool
-	Pending  bool
+	Engine     string
+	Tier       string
+	Model      *string
+	Stage      string
+	Readonly   bool
+	Pending    bool
+	WorkingDir string
 }
 
 type Outcome struct {
@@ -383,160 +384,187 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 	if !ValidIdentifier(metadata.Stage) {
 		return nil, fmt.Errorf("invalid execution stage")
 	}
-	waitUntil, waitErr := leaseWaitDeadline(ctx, time.Now())
+	capacityPolicy, err := loadCapacityPolicy()
+	if err != nil {
+		return nil, err
+	}
+	if capacityPolicy != nil && cfg.LedgerPath == "" {
+		return nil, fmt.Errorf("host capacity requires a model call ledger")
+	}
+	waitUntil, waitErr := leaseWaitDeadlineWithPolicy(ctx, time.Now(), capacityPolicy)
 	if waitErr != nil {
 		return nil, waitErr
 	}
 	attempt := &Attempt{ID: NewID(), TaskID: cfg.TaskID, config: cfg, metadata: metadata, started: time.Now(), spanID: NewID(), provider: true, startCommitted: !metadata.Pending}
+	defer cancelCapacityTicket(capacityPolicy, attempt.ID)
 	hasLease := false
 	if cfg.LedgerPath != "" {
 		delay := 50 * time.Millisecond
 		wasBusy := false
+		nextReport := time.Time{}
 		for {
-			err = withLockedFile(ctx, cfg.LedgerPath, cfg.ledgerDirectory, func(path *accountingPath) error {
-				data, err := readLedger(path, cfg.MaxCalls)
-				if err != nil {
-					return err
-				}
-				if layeredEnabled(nil) && data["scopes"] == nil {
-					legacy := data["maximum"]
-					if err := initializeScopes(data); err != nil {
+			admissionCtx := ctx
+			cancelAdmission := func() {}
+			if capacityPolicy != nil {
+				limit := time.Now().Add(min(5*time.Second, max(time.Second, time.Until(waitUntil))))
+				admissionCtx, cancelAdmission = context.WithDeadline(ctx, limit)
+			}
+			err = withSharedCapacity(admissionCtx, capacityPolicy, cfg, metadata, attempt.ID, func(gate *sharedCapacityGate) error {
+				return withLockedFile(admissionCtx, cfg.LedgerPath, cfg.ledgerDirectory, func(path *accountingPath) error {
+					data, err := readLedger(path, cfg.MaxCalls)
+					if err != nil {
 						return err
 					}
-					data["legacy_maximum"] = legacy
-					legacyUsed, _ := jsonInteger(data["archived_used"])
-					for _, raw := range data["attempts"].([]any) {
-						if raw.(map[string]any)["status"] != "released" {
-							legacyUsed++
+					if layeredEnabled(nil) && data["scopes"] == nil {
+						legacy := data["maximum"]
+						if err := initializeScopes(data); err != nil {
+							return err
+						}
+						data["legacy_maximum"] = legacy
+						legacyUsed, _ := jsonInteger(data["archived_used"])
+						for _, raw := range data["attempts"].([]any) {
+							if raw.(map[string]any)["status"] != "released" {
+								legacyUsed++
+							}
+						}
+						data["legacy_used"] = json.Number(strconv.Itoa(legacyUsed))
+						if err := saveLedger(path, data); err != nil {
+							return err
 						}
 					}
-					data["legacy_used"] = json.Number(strconv.Itoa(legacyUsed))
-					if err := saveLedger(path, data); err != nil {
-						return err
-					}
-				}
-				maximum, _ := jsonInteger(data["maximum"])
-				if data["scopes"] == nil && cfg.MaxCalls > 0 && cfg.MaxCalls < maximum {
-					maximum = cfg.MaxCalls
-					data["maximum"] = json.Number(strconv.Itoa(maximum))
-					if err := saveLedger(path, data); err != nil {
-						return err
-					}
-				}
-				attempts := data["attempts"].([]any)
-				now := ledgerNow()
-				held := 0
-				var claimed map[string]any
-				active := map[string]any{}
-				if raw, exists := data["holds"]; exists {
-					holds, ok := raw.(map[string]any)
-					if !ok {
-						return fmt.Errorf("invalid budget holds")
-					}
-					for id, rawHold := range holds {
-						if id == "" {
-							return fmt.Errorf("invalid budget hold identity")
+					maximum, _ := jsonInteger(data["maximum"])
+					if data["scopes"] == nil && cfg.MaxCalls > 0 && cfg.MaxCalls < maximum {
+						maximum = cfg.MaxCalls
+						data["maximum"] = json.Number(strconv.Itoa(maximum))
+						if err := saveLedger(path, data); err != nil {
+							return err
 						}
-						hold, ok := rawHold.(map[string]any)
+					}
+					attempts := data["attempts"].([]any)
+					now := ledgerNow()
+					held := 0
+					var claimed map[string]any
+					active := map[string]any{}
+					if raw, exists := data["holds"]; exists {
+						holds, ok := raw.(map[string]any)
 						if !ok {
-							return fmt.Errorf("invalid budget hold")
+							return fmt.Errorf("invalid budget holds")
 						}
-						remaining, valid := jsonInteger(hold["remaining"])
-						expiryNumber, expiryOK := hold["expires_at"].(json.Number)
-						expires, expiryErr := expiryNumber.Float64()
-						if !valid || remaining < 0 || !expiryOK || expiryErr != nil {
-							return fmt.Errorf("invalid budget hold capacity or expiry")
-						}
-						if expires <= effectiveClock(data, now) {
-							continue
-						}
-						active[id] = hold
-						if data["scopes"] == nil && remaining > maximum-held {
-							return fmt.Errorf("budget holds exceed maximum")
-						}
-						held += remaining
-						if id == cfg.LeaseID && remaining > 0 {
-							claimed = hold
-						}
-					}
-				}
-				if cfg.LeaseID != "" && claimed == nil {
-					return fmt.Errorf("model call budget lease unavailable")
-				}
-				occupied := held
-				if claimed != nil {
-					occupied--
-				}
-				var keys []any
-				// Persist tightened scope limits/clock even on refused admission,
-				// but commit successful admission in one durable replacement.
-				refuse := func(reason error) error {
-					if err := saveLedger(path, data); err != nil {
-						return err
-					}
-					return reason
-				}
-				if data["scopes"] != nil {
-					keys, err = scopeKeys(data, cfg, now)
-					if err != nil {
-						return err
-					}
-					if claimed != nil && !containsScope(claimed["scopes"], keys[0].([]any)) {
-						return refuse(fmt.Errorf("capacity hold belongs to another task"))
-					}
-					available, err := scopeAvailable(data, keys, active, claimed, now)
-					if err != nil {
-						return refuse(err)
-					}
-					if available <= 0 {
-						return refuse(ErrBudgetExhausted)
-					}
-				} else {
-					used, _ := jsonInteger(data["archived_used"])
-					for _, raw := range attempts {
-						if raw.(map[string]any)["status"] != "released" {
-							used++
+						for id, rawHold := range holds {
+							if id == "" {
+								return fmt.Errorf("invalid budget hold identity")
+							}
+							hold, ok := rawHold.(map[string]any)
+							if !ok {
+								return fmt.Errorf("invalid budget hold")
+							}
+							remaining, valid := jsonInteger(hold["remaining"])
+							expiryNumber, expiryOK := hold["expires_at"].(json.Number)
+							expires, expiryErr := expiryNumber.Float64()
+							if !valid || remaining < 0 || !expiryOK || expiryErr != nil {
+								return fmt.Errorf("invalid budget hold capacity or expiry")
+							}
+							if expires <= effectiveClock(data, now) {
+								continue
+							}
+							active[id] = hold
+							if data["scopes"] == nil && remaining > maximum-held {
+								return fmt.Errorf("budget holds exceed maximum")
+							}
+							held += remaining
+							if id == cfg.LeaseID && remaining > 0 {
+								claimed = hold
+							}
 						}
 					}
-					if used >= maximum-occupied {
-						return ErrBudgetExhausted
+					if cfg.LeaseID != "" && claimed == nil {
+						return fmt.Errorf("model call budget lease unavailable")
 					}
-				}
-				if data["scopes"] != nil {
-					// admitLease tightens lease_limits before it can refuse. A busy
-					// refusal must not persist this caller's lower cap for everyone
-					// else (Python does not either), so restore both maps first.
-					prevLimits, hadLimits := shallowCopyObject(data["lease_limits"])
-					prevLeases, hadLeases := shallowCopyObject(data["leases"])
-					lease, err := admitLease(data, metadata.Engine, cfg.AccountRef)
-					if err != nil {
-						restoreObject(data, "lease_limits", prevLimits, hadLimits)
-						restoreObject(data, "leases", prevLeases, hadLeases)
-						return refuse(err)
+					occupied := held
+					if claimed != nil {
+						occupied--
 					}
-					// Busy admissions must never persist a spent call.
-					scopeSpend(data, keys, 1)
-					data["leases"].(map[string]any)[attempt.ID] = lease
-					hasLease = true
-				}
-				if claimed != nil {
-					remaining, _ := jsonInteger(claimed["remaining"])
-					claimed["remaining"] = json.Number(strconv.Itoa(remaining - 1))
-				}
-				data["maximum"] = json.Number(strconv.Itoa(maximum))
-				data["attempts"] = append(data["attempts"].([]any), map[string]any{
-					"id": attempt.ID, "engine": metadata.Engine, "tier": metadata.Tier, "requested_model": metadata.Model, "readonly": metadata.Readonly,
-					"benchmark_run": nullableString(os.Getenv("MAKEWAND_BENCHMARK_RUN_ID")), "started_at": float64(attempt.started.UnixNano()) / 1e9,
-					"status": func() string {
-						if metadata.Pending {
-							return "reserved"
+					var keys []any
+					// Persist tightened scope limits/clock even on refused admission,
+					// but commit successful admission in one durable replacement.
+					refuse := func(reason error) error {
+						if err := saveLedger(path, data); err != nil {
+							return err
 						}
-						return "started"
-					}(), "scopes": keys, "tokens": nil, "monetary_cost": nil, "task_id": cfg.TaskID, "stage": metadata.Stage,
-					"account_ref": cfg.AccountRef, "api_policy": nullableString(cfg.APIPolicy), "result_status": nil, "outcome_known": false,
+						return reason
+					}
+					if data["scopes"] != nil {
+						keys, err = scopeKeys(data, cfg, now)
+						if err != nil {
+							return err
+						}
+						if claimed != nil && !containsScope(claimed["scopes"], keys[0].([]any)) {
+							return refuse(fmt.Errorf("capacity hold belongs to another task"))
+						}
+						available, err := scopeAvailable(data, keys, active, claimed, now)
+						if err != nil {
+							return refuse(err)
+						}
+						if available <= 0 {
+							return refuse(ErrBudgetExhausted)
+						}
+					} else {
+						used, _ := jsonInteger(data["archived_used"])
+						for _, raw := range attempts {
+							if raw.(map[string]any)["status"] != "released" {
+								used++
+							}
+						}
+						if used >= maximum-occupied {
+							return ErrBudgetExhausted
+						}
+					}
+					if data["scopes"] != nil || gate != nil {
+						// admitLease tightens lease_limits before it can refuse. A busy
+						// refusal must not persist this caller's lower cap for everyone
+						// else (Python does not either), so restore both maps first.
+						prevLimits, hadLimits := shallowCopyObject(data["lease_limits"])
+						prevLeases, hadLeases := shallowCopyObject(data["leases"])
+						lease, err := admitLeaseWithPolicy(data, metadata.Engine, cfg.AccountRef, capacityPolicy)
+						if err != nil {
+							restoreObject(data, "lease_limits", prevLimits, hadLimits)
+							restoreObject(data, "leases", prevLeases, hadLeases)
+							return refuse(err)
+						}
+						// Busy admissions must never persist a spent call.
+						if keys != nil {
+							scopeSpend(data, keys, 1)
+						}
+						data["leases"].(map[string]any)[attempt.ID] = lease
+						hasLease = true
+					}
+					if claimed != nil {
+						remaining, _ := jsonInteger(claimed["remaining"])
+						claimed["remaining"] = json.Number(strconv.Itoa(remaining - 1))
+					}
+					data["maximum"] = json.Number(strconv.Itoa(maximum))
+					data["attempts"] = append(data["attempts"].([]any), map[string]any{
+						"id": attempt.ID, "engine": metadata.Engine, "tier": metadata.Tier, "requested_model": metadata.Model, "readonly": metadata.Readonly,
+						"benchmark_run": nullableString(os.Getenv("MAKEWAND_BENCHMARK_RUN_ID")), "started_at": float64(attempt.started.UnixNano()) / 1e9,
+						"status": func() string {
+							if metadata.Pending {
+								return "reserved"
+							}
+							return "started"
+						}(), "scopes": keys, "tokens": nil, "monetary_cost": nil, "task_id": cfg.TaskID, "stage": metadata.Stage,
+						"account_ref": cfg.AccountRef, "api_policy": nullableString(cfg.APIPolicy), "result_status": nil, "outcome_known": false,
+					})
+					if gate != nil {
+						row := data["attempts"].([]any)[len(data["attempts"].([]any))-1].(map[string]any)
+						row["capacity_project"], row["capacity_label"] = gate.Project, gate.Label
+					}
+					return saveLedger(path, data)
 				})
-				return saveLedger(path, data)
 			})
+			cancelAdmission()
+			if capacityPolicy != nil && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				err = fmt.Errorf("%w: shared capacity transaction busy; no call admitted", ErrConcurrencyBusy)
+			}
 			if wasBusy && errors.Is(err, context.DeadlineExceeded) {
 				err = ErrConcurrencyBusy
 			}
@@ -544,6 +572,10 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 				break
 			}
 			wasBusy = true
+			if capacityPolicy != nil && !time.Now().Before(nextReport) {
+				_, _ = fmt.Fprintf(os.Stderr, "makewand: waiting: %v\n", err)
+				nextReport = time.Now().Add(15 * time.Second)
+			}
 			if available, _ := ctx.Value(capacityFallbackKey{}).(func() bool); available != nil && available() {
 				break
 			}
@@ -592,20 +624,33 @@ func Reserve(ctx context.Context, metadata Metadata) (*Attempt, error) {
 var leaseWaitDecimal = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
 
 func leaseWaitDeadline(ctx context.Context, now time.Time) (time.Time, error) {
+	return leaseWaitDeadlineWithPolicy(ctx, now, nil)
+}
+
+func leaseWaitDeadlineWithPolicy(ctx context.Context, now time.Time, policy *hostCapacityPolicy) (time.Time, error) {
 	deadline, bounded := ctx.Deadline()
 	value := os.Getenv("MAKEWAND_LEASE_WAIT_SECONDS")
 	if value == "" {
 		value = "30"
+		if policy != nil {
+			value = strconv.Itoa(policy.WaitSeconds)
+		}
 	}
 	value = strings.Trim(value, " \t\r\n\v\f")
 	seconds, err := strconv.ParseFloat(value, 64)
 	if err != nil || !leaseWaitDecimal.MatchString(value) || math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds < 0 || seconds*float64(time.Second) >= math.Ldexp(1, 63) {
 		return time.Time{}, fmt.Errorf("MAKEWAND_LEASE_WAIT_SECONDS must be a finite nonnegative decimal fitting int64 nanoseconds")
 	}
+	if policy != nil {
+		seconds = min(seconds, float64(policy.WaitSeconds))
+	}
 	waitUntil := now.Add(time.Duration(seconds * float64(time.Second)))
 	if bounded {
 		remaining := max(time.Duration(0), deadline.Sub(now))
 		latest := deadline.Add(-min(time.Second, remaining/2))
+		if policy != nil {
+			latest = now.Add(remaining / 3)
+		}
 		if latest.Before(waitUntil) {
 			waitUntil = latest
 		}
