@@ -107,6 +107,12 @@ def admission(data, engine, account, capacity_policy=None):
         if (not owner_alive or stopped_attempt) and not workers_alive(lease) and lease["expires_at"] <= now:
             del leases[identifier]
     limits = data.setdefault("lease_limits", {})
+    # Compaction ran before admission reaped dead leases. Drop their unreferenced
+    # floors now, before a new lease can accidentally inherit an obsolete cap.
+    referenced = {key for lease in leases.values() for key in lease["keys"]}
+    for key in list(limits):
+        if key not in referenced:
+            del limits[key]
     for index, (key, variable, default) in enumerate(zip(wanted, (
             "MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"), (64, 1, 1))):
         if capacity_policy:

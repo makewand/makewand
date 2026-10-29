@@ -164,6 +164,19 @@ func admitLeaseWithPolicy(data map[string]any, engine string, account *string, p
 		limits = map[string]any{}
 		data["lease_limits"] = limits
 	}
+	// Load-time compaction preceded dead-lease reaping. A newly admitted lease
+	// must not keep a floor which no remaining active lease references.
+	referenced := map[string]bool{}
+	for _, raw := range leases {
+		for _, key := range raw.(map[string]any)["keys"].([]any) {
+			referenced[key.(string)] = true
+		}
+	}
+	for key := range limits {
+		if !referenced[key] {
+			delete(limits, key)
+		}
+	}
 	for i, key := range keys {
 		defaultLimit := []int{64, 1, 1}[i]
 		if policy != nil {

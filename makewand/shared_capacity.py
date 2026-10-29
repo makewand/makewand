@@ -69,7 +69,7 @@ def policy():
 
 def project(working_directory=None):
     """Group ordinary Git worktrees without invoking repository code."""
-    root = Path(os.environ.get("MAKEWAND_PROJECT_ROOT") or working_directory or os.getcwd()).resolve()
+    root = Path(os.environ.get("MAKEWAND_PROJECT_ROOT") or working_directory or os.getcwd()).expanduser().resolve()
     if not os.environ.get("MAKEWAND_PROJECT_ROOT"):
         for parent in (root, *root.parents):
             marker = parent / ".git"
@@ -177,19 +177,22 @@ def _source_rows(value):
         project_id = entry.get("capacity_project")
         if not project_id:
             project_id = next((scope[1] for scope in entry.get("scopes") or [] if scope[0] == "projects"), "legacy:" + str(Path(value).parent))
+        started = entry.get("started_at")
+        if type(started) not in (int, float) or not math.isfinite(started) or started < 0:
+            started = 0  # unknown legacy age; still count its live lease
         rows[identifier] = {"id": hashlib.sha256((value + "\0" + identifier).encode()).hexdigest(),
                             "kind": "model", "ledger": value, "attempt": identifier,
                             "project": project_id, "label": entry.get("capacity_label") or "existing task",
-                            "task_id": entry.get("task_id"), "started_at": entry.get("started_at", time.time()),
+                            "task_id": entry.get("task_id"), "started_at": started,
                             "lease": copy.deepcopy(lease),
                             "limits": [data.get("lease_limits", {}).get(k, 2**63 - 1) for k in lease["keys"]]}
     return rows, attempts
 
 
 def refresh(state, selected):
-    paths = {str(Path(layered_budget.default_path()).resolve()), selected, *ledger_registry.known_ledgers(),
+    paths = {layered_budget.default_path(), selected, *ledger_registry.known_ledgers(),
              *(row["ledger"] for row in state["active"].values() if row["kind"] == "model")}
-    for value in sorted(paths):
+    for value in sorted({str(Path(path).expanduser().resolve()) for path in paths}):
         previous = {row["attempt"]: row for row in state["active"].values() if row["kind"] == "model" and row["ledger"] == value}
         try:
             rows, attempts = _source_rows(value)
@@ -250,7 +253,9 @@ def fits(ticket, active, current_policy):
 
 
 def diagnostic(state, ticket, current_policy):
-    running = ", ".join(f"{json.dumps(row['label'], ensure_ascii=False)} ({row['lease']['keys'][0][:-9]}, {max(0, int(time.time() - row['started_at']))}s)"
+    def age(row):
+        return f"{max(0, int(time.time() - row['started_at']))}s" if row["started_at"] > 0 else "age unknown"
+    running = ", ".join(f"{json.dumps(row['label'], ensure_ascii=False)} ({row['lease']['keys'][0][:-9]}, {age(row)})"
                         for row in state["active"].values()) or "none"
     models = sum(row["kind"] == "model" for row in state["active"].values())
     tools = len(state["active"]) - models
@@ -300,7 +305,7 @@ def admission(current_policy, engine, account, value, task_id, ticket_id, deadli
             else:
                 state["queue"].append(ticket)
             active = list(state["active"].values())
-            candidates = [row for row in state["queue"] if fits(row, active, current_policy)]
+            candidates = [row for row in state["queue"] if row["kind"] == "model" and fits(row, active, current_policy)]
             eligible = min(candidates, key=lambda row: state.get("project_turns", {}).get(row["project"], 0), default=None)
             if eligible is None or eligible["id"] != ticket_id:
                 save(path, state)
@@ -349,7 +354,7 @@ def relocation(current_policy, engine, value, attempt):
     if current_policy is None:
         yield None
         return
-    value = str(Path(value or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()).resolve())
+    value = str(Path(value or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or layered_budget.default_path()).expanduser().resolve())
     with locked(time.monotonic() + 5) as (path, state):
         refresh(state, value)
         old = next((row for row in state["active"].values() if row["kind"] == "model"
@@ -418,15 +423,17 @@ def tool_scope(current_policy, deadline):
         while True:
             _check_admission_cancelled()
             with locked(wait_until) as (path, state):
-                refresh(state, str(Path(layered_budget.default_path()).resolve()))
+                refresh(state, str(Path(layered_budget.default_path()).expanduser().resolve()))
                 existing = next((r for r in state["queue"] if r["id"] == identifier), None)
                 if existing is None:
                     state["queue"].append(ticket)
                 else:
                     existing["lease"]["expires_at"] = time.time() + 30
                 active = list(state["active"].values())
-                candidates = [r for r in state["queue"] if fits(r, active, current_policy)]
-                eligible = min(candidates, key=lambda r: state.get("project_turns", {}).get(r["project"], 0), default=None)
+                # Tools use FIFO in their own pool. Model project turns must
+                # neither reorder them nor prevent a free tool slot being used.
+                eligible = next((r for r in state["queue"] if r["kind"] == "tool"
+                                 and fits(r, active, current_policy)), None)
                 if eligible and eligible["id"] == identifier:
                     state["active"][identifier] = ticket
                     state["queue"] = [r for r in state["queue"] if r["id"] != identifier]

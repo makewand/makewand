@@ -268,6 +268,66 @@ class SharedCapacityTests(unittest.TestCase):
                 self.assertEqual(tool["lease"]["workers"], [])
                 self.assertFalse(tool["lease"]["launch_pending"])
 
+    def test_ready_model_waiter_cannot_block_independent_tool_pool(self):
+        current = capacity.policy()
+        a = self.reserve("a", "codex")
+        with self.assertRaises(budget.ConcurrencyBusyError):
+            with capacity.admission(current, "codex", None, str(self.root / "queued.json"), "queued", "model-waiter"):
+                self.fail("busy model admitted")
+        self.finish("a", a)
+        try:
+            with patch.object(capacity, "tool_memory_available", return_value=True):
+                with capacity.tool_scope(current, time.monotonic() + .6):
+                    pass
+        finally:
+            capacity.cancel("model-waiter", current)
+
+    def test_ready_tool_waiter_cannot_block_independent_model_pool(self):
+        current = capacity.policy()
+        with patch.object(capacity, "tool_memory_available", return_value=True):
+            with capacity.tool_scope(current, time.monotonic() + 10):
+                with capacity.locked() as (path, state):
+                    ticket = json.loads(json.dumps(next(row for row in state["active"].values() if row["kind"] == "tool")))
+                    ticket["id"] = "tool-waiter"
+                    state["queue"].append(ticket)
+                    capacity.save(path, state)
+                try:
+                    a = self.reserve("a", "codex")
+                    self.finish("a", a)
+                finally:
+                    capacity.cancel("tool-waiter", current)
+
+    def test_tilde_budget_path_preserves_slot_during_api_relocation(self):
+        with patch.dict(os.environ, HOME=str(self.root), USERPROFILE=str(self.root)):
+            a = budget.reserve("codex", "fast", task_id="tilde", budget_file="~/tilde.json")
+            budget.api_lease(a, "codex", budget_file="~/tilde.json")
+            budget.complete(a, True, 0, budget_file="~/tilde.json")
+        self.assertEqual(len(json.loads((self.root / "tilde.json").read_text())["attempts"]), 1)
+
+    def test_reaped_legacy_limit_does_not_poison_agy_two_slot_policy(self):
+        from makewand import account_leases
+        owner = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(20)"])
+        try:
+            dead_owner = account_leases.process_ref(owner.pid)
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+        os.environ["MAKEWAND_ACCOUNT_CONCURRENCY"] = "1"
+        os.environ["MAKEWAND_POOL_CONCURRENCY"] = "1"
+        old = self.reserve("ledger", "agy")
+        path = self.root / "ledger.json"
+        data = json.loads(path.read_text())
+        data["leases"][old].update(owner=dead_owner, expires_at=0)
+        path.write_text(json.dumps(data))
+        os.environ.pop("MAKEWAND_ACCOUNT_CONCURRENCY")
+        os.environ.pop("MAKEWAND_POOL_CONCURRENCY")
+        first = self.reserve("ledger", "agy", task_id="new-first", project="first")
+        try:
+            second = self.reserve("ledger", "agy", task_id="new-second", project="second")
+            self.finish("ledger", second)
+        finally:
+            self.finish("ledger", first)
+
 
 if __name__ == "__main__":
     unittest.main()

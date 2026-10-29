@@ -36,7 +36,7 @@ busy provider. The existing ledger registry imports visible legacy leases;
 already-running old binaries cannot participate in the new admission protocol.
 Let them finish and use the updated CLI for subsequent calls.
 
-Queues prefer projects that have waited since a less recent admission, keeping
+Model queues prefer projects that have waited since a less recent admission, keeping
 FIFO order within equally served projects. A blocked provider does not block
 other eligible providers. The maximum wait is five minutes, reduced to one
 third of the remaining execution deadline. `MAKEWAND_LEASE_WAIT_SECONDS` may
@@ -47,7 +47,7 @@ is unchanged. Cancellation removes a ticket; abandoned tickets expire.
 Heavy **local** work uses its own ceiling of two. The controlled entry points
 are Python `run_local_tests` and non-provider `run_in_sandbox`. They track
 actual subprocess trees, preserve the enclosing deadline, and spend no model
-calls. Linux admission requires at least 32 GiB available (a maximum 16 GiB job
+calls, with a separate FIFO queue. Linux admission requires at least 32 GiB available (a maximum 16 GiB job
 plus 16 GiB headroom). The existing sandbox resource launcher keeps smaller
 limits and clamps larger memory settings to 16 GiB; systemd scopes also set
 `MemorySwapMax=0`. Hard memory enforcement requires the existing platform

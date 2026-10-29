@@ -285,7 +285,10 @@ func capacitySource(value string) (map[string]*capacityEntry, map[string]map[str
 		if label == "" {
 			label = "existing task"
 		}
-		started, _ := entry["started_at"].(json.Number).Float64()
+		started := ledgerNumber(entry["started_at"])
+		if math.IsNaN(started) || math.IsInf(started, 0) || started < 0 {
+			started = 0
+		}
 		taskID, _ := entry["task_id"].(string)
 		limits := []int{math.MaxInt, math.MaxInt, math.MaxInt}
 		if saved, ok := data["lease_limits"].(map[string]any); ok {
@@ -358,6 +361,10 @@ func refreshCapacity(state *sharedCapacityState, selected string) {
 		}
 	}
 	for value := range paths {
+		value, err := canonicalAccountingPath(value)
+		if err != nil {
+			continue
+		}
 		rows, attempts, err := capacitySource(value)
 		if err != nil {
 			continue // an unreadable active source never creates free capacity
@@ -484,7 +491,11 @@ func capacityDiagnostic(state *sharedCapacityState, ticket *capacityEntry, polic
 		} else {
 			tools++
 		}
-		running = append(running, fmt.Sprintf("%q (%s, %.0fs)", row.Label, strings.TrimSuffix(row.Lease["keys"].([]any)[0].(string), ":provider"), max(0, float64(time.Now().UnixNano())/1e9-row.StartedAt)))
+		age := "age unknown"
+		if row.StartedAt > 0 {
+			age = fmt.Sprintf("%.0fs", max(0, float64(time.Now().UnixNano())/1e9-row.StartedAt))
+		}
+		running = append(running, fmt.Sprintf("%q (%s, %s)", row.Label, strings.TrimSuffix(row.Lease["keys"].([]any)[0].(string), ":provider"), age))
 	}
 	sort.Strings(running)
 	return fmt.Sprintf("shared capacity busy: models=%d/%d; tools=%d/%d; project=%q; queue=%d; occupied: %s", models, policy.GlobalMax, tools, policy.ToolMax, ticket.Label, len(state.Queue), strings.Join(running, ", "))
@@ -536,7 +547,7 @@ func withSharedCapacity(ctx context.Context, policy *hostCapacityPolicy, cfg Con
 		}
 		var eligible *capacityEntry
 		for _, row := range state.Queue {
-			if capacityFits(row, &state, policy) {
+			if row.Kind == "model" && capacityFits(row, &state, policy) {
 				if eligible == nil || state.ProjectTurns[row.Project] < state.ProjectTurns[eligible.Project] {
 					eligible = row
 				}
