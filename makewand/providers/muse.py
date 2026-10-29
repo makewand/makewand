@@ -284,6 +284,17 @@ def execute_muse_task(
         from makewand.sandbox import _trusted_system_binary
         systemd_run = _trusted_system_binary("systemd-run")
         use_muse_slice = bool(systemd_run) and is_guard and _is_dbus_systemd_available()
+        launch_prefix = []
+        if use_muse_slice:
+            muse_mem = os.environ.get("MUSE_MEM", "16G")
+            launch_prefix = [
+                systemd_run, "--user", "--scope", "--quiet",
+                "--slice=muse", "--collect",
+                "-p", f"MemoryMax={muse_mem}",
+                "-p", "MemorySwapMax=0",
+                "-p", f"TasksMax={os.environ.get('MAKEWAND_SANDBOX_TASKS_MAX', '512')}",
+                "--",
+            ]
         try:
             with provider_sandbox_launch(
                 "muse", cmd, cwd,
@@ -294,18 +305,9 @@ def execute_muse_task(
                 extra_ro_binds=[p_file] if p_file else None,
                 host_auth_source=host_auth_source,
                 apply_limits=not use_muse_slice,
+                command_prefix=launch_prefix,
             ) as launch:
                 exec_cmd = launch.cmd
-                if use_muse_slice:
-                    muse_mem = os.environ.get("MUSE_MEM", "16G")
-                    exec_cmd = [
-                        systemd_run, "--user", "--scope", "--quiet",
-                        "--slice=muse", "--collect",
-                        "-p", f"MemoryMax={muse_mem}",
-                        "-p", "MemorySwapMax=0",
-                        "-p", f"TasksMax={os.environ.get('MAKEWAND_SANDBOX_TASKS_MAX', '512')}",
-                        "--",
-                    ] + list(exec_cmd)
                 import sys
                 print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
                 note_dispatch_route("cli")

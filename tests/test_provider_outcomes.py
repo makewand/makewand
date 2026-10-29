@@ -128,6 +128,24 @@ class ProviderOutcomeTests(unittest.TestCase):
         fallback.assert_not_called()
         api.assert_not_called()
 
+    def test_muse_slice_wraps_both_preflight_and_provider_process(self):
+        with self.adapter("muse", (0, "fixture result", "", None)) as (execute, process, api), \
+                patch("makewand.providers.muse.detect_muse_guard", return_value=(True, "/fixture/muse")), \
+                patch("makewand.providers.muse.verify_muse_guard", return_value=(True, "")), \
+                patch("makewand.providers.muse._is_dbus_systemd_available", return_value=True), \
+                patch("makewand.sandbox._trusted_system_binary", return_value="/fixture/systemd-run"), \
+                patch("makewand.sandbox._provider_socket_preflight") as probe:
+            result = execute("Review fixture", cwd=self.directory, readonly=True)
+        self.assertTrue(result[0], result[2])
+        process.assert_called_once()
+        probe.assert_called_once()
+        command = process.call_args.args[0]
+        self.assertEqual(probe.call_args.args[0], command)
+        self.assertEqual(command[0], "/fixture/systemd-run")
+        self.assertIn("--slice=muse", command)
+        self.assertIn("MemoryMax=16G", command)
+        api.assert_not_called()
+
     def test_explicit_quota_rejection_remains_known(self):
         for engine in ENGINES[:-1]:
             rejection = QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests")

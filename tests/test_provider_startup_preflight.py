@@ -117,6 +117,20 @@ class SocketPreflightTests(unittest.TestCase):
                                                        allow_network=allow)
                 run.assert_not_called()
 
+    def test_outer_wrapper_is_shared_by_probe_and_actual_launch(self):
+        command = ["fixture-provider", "private-prompt"]
+        prefix = ["fixture-systemd", "--scope", "--"]
+        with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                patch("makewand.sandbox.authorize_unsandboxed_launch", return_value="fixture"), \
+                patch("makewand.sandbox.run_subprocess", return_value=(0, "", "", None)) as run:
+            with sandbox.provider_sandbox_launch("grok", command, str(self.root), readonly=True,
+                                                 command_prefix=prefix) as launch:
+                self.assertEqual(launch.cmd, prefix + command)
+        probe = run.call_args.args[0]
+        self.assertEqual(probe[:len(prefix)], prefix)
+        self.assertNotIn("fixture-provider", probe)
+        self.assertNotIn("private-prompt", probe)
+
     def test_probe_obeys_remaining_dispatch_deadline(self):
         with execution_context(deadline_unix_ms=int((time.time() + 1) * 1000)):
             with patch("makewand.sandbox.run_subprocess", return_value=(0, "", "", None)) as run:
@@ -176,6 +190,14 @@ class SocketPreflightTests(unittest.TestCase):
     def test_live_sandbox_can_still_launch_after_probe_consumes_its_filter(self):
         if not sandbox.is_bwrap_available():
             self.skipTest("bubblewrap unavailable")
+        # A nested container may allow basic bwrap but deny the PID/proc mount
+        # used by the real launch. Check that environment independently first.
+        namespace_probe = [sandbox.resolve_trusted_bwrap(), "--ro-bind", "/", "/",
+                           "--unshare-pid", "--proc", "/proc", "--", "/bin/true"]
+        probe_code, _, probe_err, probe_error = run_subprocess(namespace_probe, timeout=10,
+                                                              separate_stderr=True)
+        if probe_code != 0:
+            self.skipTest(f"bubblewrap PID/proc namespace unavailable: {probe_err or probe_error}")
         home, workspace = self.root / "home", self.root / "work"
         (home / ".codex").mkdir(parents=True)
         workspace.mkdir()

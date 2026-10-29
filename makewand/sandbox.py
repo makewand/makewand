@@ -3486,17 +3486,21 @@ def provider_sandbox_launch(
     extra_env: Optional[dict] = None,
     host_auth_source: Optional[str] = None,
     apply_limits: bool = True,
+    command_prefix: Sequence[str] = (),
 ):
     """
     Single launch path for provider CLIs. With bwrap: mandatory seccomp, private
     provider home (credentials written back on exit) and resource limits.
     Without bwrap: authorize_unsandboxed_launch (read-only too) + audit.
+    command_prefix carries a caller-owned outer wrapper through both the probe
+    and the provider launch (e.g. Muse's guarded systemd slice).
     Yields ProviderLaunch; raises SandboxConfigError / SandboxUnavailableError.
     """
     from makewand.proxy import proxy_environment
     proxy_env = proxy_environment(provider=provider) if allow_network else dict(os.environ)
     launch_env = {key: value for key, value in proxy_env.items() if os.environ.get(key) != value}
     launch_env.update(extra_env or {})
+    outer_prefix = list(command_prefix)
     if not is_bwrap_available():
         if _is_agy_provider(provider) and not _agy_host_credits_disabled():
             raise SandboxUnavailableError(_agy_no_sandbox_credits_message())
@@ -3526,9 +3530,10 @@ def provider_sandbox_launch(
                     os.path.realpath(child_home) != os.path.realpath(str(Path.home()))):
                 refuse_credential_launch("credential source differs from admitted account")
             try:
-                _provider_socket_preflight(cmd, cmd, cwd=cwd, allow_network=allow_network,
+                exec_cmd = outer_prefix + list(cmd)
+                _provider_socket_preflight(exec_cmd, cmd, cwd=cwd, allow_network=allow_network,
                                            extra_env=launch_env)
-                yield ProviderLaunch(list(cmd), (), False, source,
+                yield ProviderLaunch(exec_cmd, (), False, source,
                     env={**launch_env, PROVIDER_WORKER_ENV: "1"})
             finally:
                 try:
@@ -3540,9 +3545,10 @@ def provider_sandbox_launch(
                 if changed:
                     raise ProviderAccountChangedError("selected login changed during direct execution")
         else:
-            _provider_socket_preflight(cmd, cmd, cwd=cwd, allow_network=allow_network,
+            exec_cmd = outer_prefix + list(cmd)
+            _provider_socket_preflight(exec_cmd, cmd, cwd=cwd, allow_network=allow_network,
                                        extra_env=launch_env)
-            yield ProviderLaunch(list(cmd), (), False, source, env={**launch_env, PROVIDER_WORKER_ENV: "1"})
+            yield ProviderLaunch(exec_cmd, (), False, source, env={**launch_env, PROVIDER_WORKER_ENV: "1"})
         return
     if _is_agy_provider(provider) and extra_env:
         # Never point agy away from the sanitized ~/.gemini settings.
@@ -3564,6 +3570,7 @@ def provider_sandbox_launch(
             )
             if apply_limits:
                 exec_cmd = sandbox_resource_limit_prefix() + list(exec_cmd)
+            exec_cmd = outer_prefix + list(exec_cmd)
             _provider_socket_preflight(exec_cmd, cmd, cwd=cwd, allow_network=allow_network,
                                        pass_fds=pass_fds, seccomp_fd=seccomp_fd)
             yield ProviderLaunch(list(exec_cmd), pass_fds, True, None, home)
