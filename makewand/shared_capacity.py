@@ -143,7 +143,7 @@ def validate(state):
     for row in [*state["active"].values(), *state["queue"]]:
         if not isinstance(row, dict) or not all(isinstance(row.get(k), str) for k in ("id", "project", "label")):
             raise ValueError("invalid shared capacity entry")
-        account_leases.validate({"leases": {row["id"]: row["lease"]}})
+        account_leases.validate({"leases": {row["id"]: row.get("lease")}})
         if type(row.get("started_at")) not in (int, float) or not math.isfinite(row["started_at"]):
             raise ValueError("invalid capacity timestamp")
         if row.get("kind") not in ("model", "tool"):
@@ -152,6 +152,23 @@ def validate(state):
             raise ValueError("invalid capacity source")
         if not isinstance(row.get("limits"), list) or len(row["limits"]) != 3 or any(type(v) is not int or v <= 0 for v in row["limits"]):
             raise ValueError("invalid capacity limits")
+
+
+def referenced_attempts():
+    """Lock-free atomic snapshot for compaction, which holds a budget lock.
+
+    None means that history cannot safely be removed. Do not take the shared
+    lock here: admissions already hold it before taking that budget lock.
+    Read even with the policy disabled so a later re-enable can recover.
+    """
+    try:
+        state = _read(Path(layered_budget.default_path()).with_name(STATE_NAME))
+        validate(state)
+    except FileNotFoundError:
+        return set()
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+        return None
+    return {row["attempt"] for row in state["active"].values() if row["kind"] == "model"}
 
 
 def _live(lease, completed=False, now=None):
@@ -498,15 +515,15 @@ def controlled_tool(function):
         values = signature.bind(*args, **kwargs)
         if values.arguments.get("is_provider", False) or _tool.get() is not None:
             return function(*args, **kwargs)
-        current_policy = policy()
-        if current_policy is None:
-            return function(*args, **kwargs)
-        deadline = time.monotonic() + values.arguments.get("timeout", 120)
         from makewand.call_budget import BudgetError
         try:
-            with tool_scope(current_policy, deadline):
-                values.arguments["timeout"] = max(.001, deadline - time.monotonic())
-                return function(*values.args, **values.kwargs)
+            current_policy = policy()
+            if current_policy is not None:
+                deadline = time.monotonic() + values.arguments.get("timeout", 120)
+                with tool_scope(current_policy, deadline):
+                    values.arguments["timeout"] = max(.001, deadline - time.monotonic())
+                    return function(*values.args, **values.kwargs)
         except (BudgetError, OSError, ValueError) as error:
             return -1, "", str(error), "LocalCapacityUnavailable"
+        return function(*args, **kwargs)
     return wrapped

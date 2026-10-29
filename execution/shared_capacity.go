@@ -62,6 +62,30 @@ func capacityPath(name string) (string, error) {
 	return filepath.Join(filepath.Dir(path), name), err
 }
 
+// Compaction holds a budget lock, so read only an atomic snapshot here. Taking
+// the shared lock would reverse the admission lock order. A nil result keeps
+// history conservatively; an absent file has no cached references. This must
+// also work while the optional policy is temporarily disabled.
+func capacityReferencedAttempts() map[string]bool {
+	path, err := capacityPath("shared-capacity.json")
+	if err != nil {
+		return nil
+	}
+	var state sharedCapacityState
+	if err := readCapacityFile(path, &state); errors.Is(err, os.ErrNotExist) {
+		return map[string]bool{}
+	} else if err != nil || validateCapacityState(&state) != nil {
+		return nil
+	}
+	refs := map[string]bool{}
+	for _, row := range state.Active {
+		if row.Kind == "model" {
+			refs[row.Attempt] = true
+		}
+	}
+	return refs
+}
+
 func decodeCapacity(raw []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()

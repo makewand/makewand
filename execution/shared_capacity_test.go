@@ -488,3 +488,63 @@ func TestSharedCapacityInvalidSourceCannotReleaseCachedLiveSlot(t *testing.T) {
 		})
 	}
 }
+
+func TestSharedCapacityIdleCompletionSurvivesInitializeBudget(t *testing.T) {
+	root := sharedCapacityFixture(t, 3)
+	path := filepath.Join(root, "idle.json")
+	cfg := Config{LedgerPath: path, TaskID: "idle", MaxCalls: 3}
+	ctx := ContextWithConfig(t.Context(), cfg)
+	a, err := Reserve(ctx, Metadata{Engine: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+		t.Fatal(err)
+	}
+	var data map[string]any
+	if err := readCapacityFile(path, &data); err != nil {
+		t.Fatal(err)
+	}
+	data["attempts"].([]any)[0].(map[string]any)["finished_at"] = float64(time.Now().Add(-49*time.Hour).UnixNano()) / 1e9
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitializeBudget(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := readCapacityFile(path, &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data["attempts"].([]any)) != 1 {
+		t.Fatal("compaction removed the only cached settlement evidence")
+	}
+	// The Python writer must preserve the same Go receipt before admission.
+	cmd := pythonCommand(t, `import os
+from makewand import call_budget as b
+b.request_budget('idle',maximum=3,budget_file=os.environ['FIXTURE_LEDGER'])`)
+	cmd.Env = append(os.Environ(), "FIXTURE_LEDGER="+path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Python compaction: %v %s", err, out)
+	}
+	other := ContextWithConfig(t.Context(), Config{LedgerPath: filepath.Join(root, "next.json"), TaskID: "next", MaxCalls: 3})
+	b, err := Reserve(other, Metadata{Engine: "codex"})
+	if err != nil {
+		t.Fatal("idle completion permanently occupied Codex", err)
+	}
+	if err := b.Complete(Outcome{Status: Passed, Known: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitializeBudget(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := readCapacityFile(path, &data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data["attempts"].([]any)) != 0 {
+		t.Fatal("unreferenced old receipt never compacted")
+	}
+}

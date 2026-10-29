@@ -43,6 +43,11 @@ to be provably dead after expiry. Source checks use the same bounded effective
 clock as ledger admission. Recovery never refunds or rewrites the call result.
 Both implementations validate source budget ledgers before trusting settlement
 evidence, without compacting away the completed attempts needed by the cache.
+Budget history compaction also retains completed attempts still referenced by
+the coordinator. It reads an atomic snapshot without taking the shared lock,
+preserving lock order; an unreadable snapshot conservatively retains receipts.
+After a refresh removes the cached reference, normal history retention resumes.
+This protection remains in place while the policy is temporarily disabled.
 
 Model queues prefer projects that have waited since a less recent admission, keeping
 FIFO order within equally served projects. A blocked provider does not block

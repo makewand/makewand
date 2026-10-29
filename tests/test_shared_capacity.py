@@ -426,6 +426,91 @@ class SharedCapacityTests(unittest.TestCase):
                             self.assertEqual(result[3], "LocalCapacityUnavailable")
                     self.assertIsNone(capacity._tool.get())
 
+    def test_idle_completion_survives_compaction_until_cache_refresh(self):
+        a = self.reserve("idle", "codex")
+        self.finish("idle", a)
+        source = self.root / "idle.json"
+        data = json.loads(source.read_text())
+        data["attempts"][0]["finished_at"] = time.time() - 49 * 3600
+        source.write_text(json.dumps(data))
+        budget.request_budget("idle", maximum=3, budget_file=str(source))
+        self.assertIn(a, {row["id"] for row in json.loads(source.read_text())["attempts"]})
+        b = self.reserve("next", "codex")
+        self.finish("next", b)
+        budget.request_budget("idle", maximum=3, budget_file=str(source))
+        data = json.loads(source.read_text())
+        self.assertNotIn(a, {row["id"] for row in data["attempts"]})
+        self.assertEqual(data["scopes"]["tasks"]["idle"]["used"], 1)
+
+    def test_compaction_retains_receipt_with_disabled_policy_or_corrupt_cache(self):
+        for condition in ("disabled-policy", "corrupt-cache"):
+            with self.subTest(condition=condition):
+                a = self.reserve(condition, "codex")
+                self.finish(condition, a)
+                source = self.root / (condition + ".json")
+                data = json.loads(source.read_text())
+                data["attempts"][0]["finished_at"] = time.time() - 49 * 3600
+                source.write_text(json.dumps(data))
+                policy_path, state_path = self.root / capacity.POLICY_NAME, self.root / capacity.STATE_NAME
+                policy_text, state_text = policy_path.read_text(), state_path.read_text()
+                try:
+                    if condition == "disabled-policy":
+                        policy_path.unlink()
+                    else:
+                        state_path.write_text('{broken')
+                    budget.request_budget(condition, maximum=3, budget_file=str(source))
+                    self.assertIn(a, {row["id"] for row in json.loads(source.read_text())["attempts"]})
+                finally:
+                    policy_path.write_text(policy_text)
+                    state_path.write_text(state_text)
+                b = self.reserve(condition + "-next", "codex")
+                self.finish(condition + "-next", b)
+                budget.request_budget(condition, maximum=3, budget_file=str(source))
+                self.assertNotIn(a, {row["id"] for row in json.loads(source.read_text())["attempts"]})
+
+    def test_malformed_tool_state_reports_unavailable_before_running(self):
+        from makewand import orchestrator
+        row = {"id": "x", "project": "p", "label": "l", "kind": "tool", "ledger": "",
+               "attempt": "", "started_at": 0, "limits": [1, 1, 1]}
+        for place in ("active", "queue"):
+            for entrypoint in ("tests", "sandbox"):
+                with self.subTest(place=place, entrypoint=entrypoint):
+                    state = {"schema": 1, "active": {}, "queue": []}
+                    state[place] = {"x": row} if place == "active" else [row]
+                    (self.root / capacity.STATE_NAME).write_text(json.dumps(state))
+                    ran = []
+                    with patch.object(capacity, "tool_memory_available", return_value=True):
+                        if entrypoint == "tests":
+                            with patch.object(orchestrator, "_run_local_tests", return_value=(True, None)) as command:
+                                passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
+                            self.assertFalse(passed)
+                            self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
+                            command.assert_not_called()
+                        else:
+                            @capacity.controlled_tool
+                            def command(timeout=2):
+                                ran.append(True)
+                                return 0, "ok", "", None
+                            result = command()
+                            self.assertEqual(result[3], "LocalCapacityUnavailable")
+                            self.assertFalse(ran)
+
+    def test_invalid_tool_policy_reports_unavailable_before_running(self):
+        from makewand import orchestrator
+        for text in ('{broken', '{"schema":2}', '{"schema":1,"providers":[]}'):
+            with self.subTest(text=text):
+                (self.root / capacity.POLICY_NAME).write_text(text)
+                with patch.object(orchestrator, "_run_local_tests", return_value=(True, None)) as command:
+                    passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
+                self.assertFalse(passed)
+                self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
+                command.assert_not_called()
+
+                @capacity.controlled_tool
+                def sandbox(timeout=2):
+                    self.fail("invalid policy ran a local command")
+                self.assertEqual(sandbox()[3], "LocalCapacityUnavailable")
+
 
 if __name__ == "__main__":
     unittest.main()
