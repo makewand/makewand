@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from windows_test_report import ResultError, python_inventory, summarize_go, summarize_python
 from windows_verification_env import clean_checkout, isolated_env
 MODULES = ["test_native_windows", "test_native_windows_pipeline", "test_native_delivery",
-           "test_candidate_recovery", "test_windows_runtime_regression"]
+           "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight"]
 GROUPS = [
     ("python_native", [sys.executable, "-I", "scripts/test_python.py", *MODULES], 2700),
     ("engine", ["go", "test", "-json", "-count=1", "./internal/engine", "-run", "^TestApply|^TestCheckpointIdentity|^TestWindowsApply|^TestEngineProcess|^TestOutputCapture|^TestPreviewProcess|^TestPendingApproval"], 900),

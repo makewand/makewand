@@ -67,6 +67,22 @@ def current_context():
     return dict(_context.get() or {})
 
 
+@contextmanager
+def auxiliary_process_scope():
+    """Keep a no-model helper out of the enclosing provider's process evidence.
+
+    Deadlines and cancellation still apply. This neither admits a model nor
+    refunds any reservation; it only isolates helper subprocess observations.
+    """
+    context = current_context()
+    context.update(_attempt=None, _evidence=None, _provider_invocation=None)
+    token = _context.set(context)
+    try:
+        yield
+    finally:
+        _context.reset(token)
+
+
 def task_id():
     context = current_context()
     value = context.get("task_id") or os.environ.get("MAKEWAND_TASK_ID") or os.environ.get("MAKEWAND_DAEMON_REQUEST_ID")

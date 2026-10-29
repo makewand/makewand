@@ -71,6 +71,7 @@ from makewand.providers.grok import execute_grok_task
 from makewand.providers.local import execute_local_task
 from makewand.providers.aider import execute_aider_task
 from makewand.providers.base import contestant_scope, cancel_contestant, get_current_contestant_scope
+from makewand.workflow import is_startup_environment_failure
 
 AUTO_FIX_MIN_ROUND_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_ROUND_SECONDS", "30.0"))
 AUTO_FIX_MIN_REVIEW_SECONDS = float(os.environ.get("MAKEWAND_AUTOFIX_MIN_REVIEW_SECONDS", "15.0"))
@@ -2007,6 +2008,9 @@ def _run_pipeline_impl(
             if ok and out and out.strip():
                 qa_output = out
                 break
+            if is_startup_environment_failure(result):
+                _print(c(str(err), COLOR_RED))
+                break
             if getattr(result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED", "INVALID_REQUEST"):
                 break
 
@@ -2189,6 +2193,8 @@ def _run_pipeline_impl(
             break
         else:
             _print(c(f"⚠ {eng.upper()} 遇到限制或故障: {err}", COLOR_YELLOW))
+            if is_startup_environment_failure(result):
+                return fail_and_cleanup(str(err), result.status)
             if getattr(result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED", "INVALID_REQUEST"):
                 return fail_and_cleanup("编码结果未确定或预算已耗尽；已停止自动切换提供者。", result.status)
             _print(c("→ 自动切换下一顺位备用引擎接管实现...", COLOR_YELLOW))
@@ -2404,6 +2410,8 @@ def _run_pipeline_impl(
             break
         else:
             _print(c(f"⚠ {r_eng.upper()} 审查未产生有效响应: {err}", COLOR_YELLOW))
+            if is_startup_environment_failure(res):
+                return fail_and_cleanup(str(err), res.status)
             if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                 break
             if r_eng in appended_stand_ins or getattr(res, "error_kind", None) == "concurrency_busy":
@@ -2414,6 +2422,8 @@ def _run_pipeline_impl(
         review_output, resolved_verdict = resolve_review_verdict(
             review_output, reviewer_engine, cwd=cwd, timeout=get_remaining_timeout(timeout),
             repo_root=shadow_repo_root, repo_trust=repo_trust, nonce=review_nonce)
+        if resolved_verdict.get("error_kind") == "startup_environment":
+            return fail_and_cleanup(resolved_verdict["reason"], "UNVERIFIED")
         if _outcome is not None and resolved_verdict.get("execution_status"):
             _outcome["status"] = resolved_verdict["execution_status"]
 
@@ -2471,6 +2481,8 @@ def _run_pipeline_impl(
                 ok, _, _ = fix_result
                 if not protection_check():
                     return False
+                if is_startup_environment_failure(fix_result):
+                    return fail_and_cleanup(str(fix_result.error), fix_result.status)
                 if getattr(fix_result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                     return fail_and_cleanup("修复结果未确定或预算已耗尽；已停止自动切换提供者。", fix_result.status)
                 if ok:
@@ -2490,6 +2502,8 @@ def _run_pipeline_impl(
                         ok, _, _ = fix_result
                         if not protection_check():
                             return False
+                        if is_startup_environment_failure(fix_result):
+                            return fail_and_cleanup(str(fix_result.error), fix_result.status)
                         if getattr(fix_result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                             return fail_and_cleanup("修复结果未确定或预算已耗尽；已停止自动切换提供者。", fix_result.status)
                         if ok:
@@ -2695,6 +2709,8 @@ def _run_pipeline_impl(
                     re_engine = alt_r
                     break
                 _print(c(f"⚠ {alt_r.upper()} 复审未产生有效响应: {re_err}", COLOR_YELLOW))
+                if is_startup_environment_failure(res):
+                    return fail_and_cleanup(str(re_err), res.status)
                 if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
                     return fail_and_cleanup("复审结果未确定或预算已耗尽；已停止自动切换提供者。", res.status)
                 if alt_r in appended_re_stand_ins or getattr(res, "error_kind", None) == "concurrency_busy":
@@ -2704,6 +2720,8 @@ def _run_pipeline_impl(
                 re_output, resolved_verdict = resolve_review_verdict(
                     re_output, re_engine, cwd=cwd, timeout=get_remaining_timeout(timeout),
                     repo_root=shadow_repo_root, repo_trust=repo_trust, nonce=re_review_nonce)
+                if resolved_verdict.get("error_kind") == "startup_environment":
+                    return fail_and_cleanup(resolved_verdict["reason"], "UNVERIFIED")
                 if resolved_verdict.get("execution_status"):
                     return fail_and_cleanup("复审补充裁决结果未确定或预算已耗尽，停止后续派发。", resolved_verdict["execution_status"])
 
@@ -3389,6 +3407,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     attempted = []
     partial = []
     terminal_status = "UNVERIFIED"
+    terminal_error = None
     for review_index, (eng, banner, color) in enumerate(reviewer_ladder):
         usable, why = (True, "") if eng == forced else _engine_usable(eng, cache)
         if not usable:
@@ -3415,6 +3434,9 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             review_res = out
             reviewer_engine = eng
             break
+        if is_startup_environment_failure(result):
+            terminal_error = err
+            break
         if getattr(result, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
             terminal_status = result.status
             break
@@ -3424,7 +3446,9 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     if not review_res:
         from makewand.execution_contract import STATUS_CODES
         no_engine = not attempted
-        if local_only:
+        if terminal_error:
+            reason = str(terminal_error)
+        elif local_only:
             reason = ("本地审查引擎不可用或已被禁用 (根据 --local-only 隐私安全原则阻断向外部云端回退)" if no_engine
                       else "本地审查引擎未能产生有效输出 (根据 --local-only 隐私安全原则阻断向外部云端回退)")
         elif forced:
@@ -3443,7 +3467,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                 "engine": None,
                 "verdict_status": REVIEW_UNVERIFIED,
                 "defects": [reason],
-                "error": "No enabled and healthy review engine" if no_engine else "Independent review engine failed to produce valid output"
+                "error": terminal_error or ("No enabled and healthy review engine" if no_engine else "Independent review engine failed to produce valid output")
             })
         else:
             _print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))

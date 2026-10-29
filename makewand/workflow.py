@@ -16,6 +16,13 @@ def last_result():
     return _last_result.get()
 
 
+def is_startup_environment_failure(value):
+    """Stop fallback only on typed prelaunch evidence, never model text."""
+    from makewand.execution_contract import ExecutionResult
+    return (isinstance(value, ExecutionResult) and value.status == "UNVERIFIED"
+            and value.error_kind == "startup_environment" and value.outcome_known)
+
+
 def provider_outcome(value):
     """Recognize runner-owned legacy errors without guessing from model text."""
     from makewand.execution_contract import ExecutionResult

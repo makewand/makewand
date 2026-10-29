@@ -62,6 +62,16 @@ class SandboxConfigError(RuntimeError):
     """A safe bubblewrap command line cannot be constructed; callers must fail closed."""
 
 
+class ProviderStartupError(SandboxConfigError):
+    """Trusted prelaunch evidence: the provider has not been started."""
+
+    def as_result(self, engine, readonly):
+        from makewand.execution_contract import ExecutionResult
+        return ExecutionResult(False, None, str(self), status="UNVERIFIED",
+                               engine=engine, readonly=readonly,
+                               error_kind="startup_environment", outcome_known=True)
+
+
 # System and generic root directories that must never be bound writable in sandbox (VUL-01/02/06)
 FORBIDDEN_WRITABLE_ROOTS = (
     "/", "/home", "/etc", "/usr", "/var", "/tmp", "/root", "/boot", "/opt", "/sys", "/dev", "/proc"
@@ -1071,8 +1081,8 @@ _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
-def _private_home_base() -> str:
-    """0700 per-user directory holding per-run private provider homes."""
+def _create_private_home(provider: str) -> str:
+    """Create a writable private home under the first usable allowed base."""
     candidates: List[str] = []
     runtime = os.environ.get("XDG_RUNTIME_DIR", "")
     if runtime and os.path.isabs(runtime):
@@ -1081,7 +1091,9 @@ def _private_home_base() -> str:
     if not (cache and os.path.isabs(cache)):
         cache = os.path.join(str(Path.home()), ".cache")
     candidates.append(os.path.join(cache, PRIVATE_HOME_SUBDIR))
+    last_error = None
     for base in candidates:
+        private = None
         try:
             os.makedirs(base, mode=0o700, exist_ok=True)
             st = os.lstat(base)
@@ -1089,10 +1101,25 @@ def _private_home_base() -> str:
                 continue
             if stat.S_IMODE(st.st_mode) & 0o077:
                 os.chmod(base, 0o700)
-            return base
-        except OSError:
+            private = tempfile.mkdtemp(prefix=f"{os.getpid()}-{provider}-", dir=base)
+            os.chmod(private, 0o700)
+            # Existing 0700 directories can still be on a read-only/full mount.
+            # Exercise the actual private home before copying any credentials.
+            with tempfile.TemporaryFile(dir=private) as probe:
+                probe.write(b"\0")
+                probe.flush()
+            _sweep_stale_private_homes(base)
+            return private
+        except OSError as error:
+            last_error = error
+            if private is not None:
+                _robust_force_remove(private)
             continue
-    raise SandboxConfigError("无法创建私有 provider 状态目录（XDG_RUNTIME_DIR / 用户缓存目录均不可用），拒绝挂载 provider 状态")
+    detail = f"；最后的 I/O 错误 [{last_error.errno}] {last_error.strerror}" if last_error is not None else ""
+    raise ProviderStartupError(
+        "启动环境检查失败：无法创建可写的私有 provider 状态目录"
+        f"（XDG_RUNTIME_DIR / 用户缓存目录均不可用）{detail}，拒绝挂载 provider 状态"
+    ) from last_error
 
 
 def _sweep_stale_private_homes(base: str) -> None:
@@ -1996,13 +2023,7 @@ class ProviderHome:
 
     def _ensure_private_dir(self) -> str:
         if self.private_dir is None:
-            base = _private_home_base()
-            _sweep_stale_private_homes(base)
-            try:
-                self.private_dir = tempfile.mkdtemp(prefix=f"{os.getpid()}-{self.provider}-", dir=base)
-                os.chmod(self.private_dir, 0o700)
-            except OSError as exc:
-                raise SandboxConfigError(f"无法创建私有 provider 状态目录 ({exc})，拒绝启动 (fail closed)") from exc
+            self.private_dir = _create_private_home(self.provider)
         return self.private_dir
 
     def _copy_in(self, src: str, priv_root: str, rel: str) -> Optional[Tuple[bytes, int]]:
@@ -3389,6 +3410,68 @@ class ProviderAccountChangedError(RuntimeError):
     """A dispatched host CLI changed login; its remote outcome is unknown."""
 
 
+_SOCKET_PROBE = (
+    "import socket,sys\n"
+    "errors=[]\n"
+    "for name in ('AF_INET','AF_INET6'):\n"
+    " family=getattr(socket,name,None)\n"
+    " if family is None: continue\n"
+    " try:\n"
+    "  with socket.socket(family,socket.SOCK_STREAM): pass\n"
+    " except OSError as error: errors.append(name+': '+str(error))\n"
+    " else: sys.exit(0)\n"
+    "sys.stderr.write('network socket unavailable: '+'; '.join(errors)+'\\n')\n"
+    "sys.exit(77)\n"
+)
+
+
+def _provider_socket_preflight(command, provider_command, *, cwd, allow_network,
+                               pass_fds=(), seccomp_fd=None, extra_env=None):
+    """Check TCP socket creation in the actual launch environment, without a model.
+
+    No DNS lookup, connection, provider CLI or credential request is made.
+    A fresh seccomp pipe is necessary: bubblewrap consumes its input pipe.
+    The actual provider's filter must remain unread until its own launch.
+    """
+    if not allow_network or os.environ.get("MAKEWAND_SANDBOX_UNSHARE_NET", "").lower() in ("1", "true", "yes"):
+        return
+    if not provider_command or list(command[-len(provider_command):]) != list(provider_command):
+        raise ProviderStartupError("启动环境检查失败：无法隔离 provider 命令，拒绝执行探针")
+    from makewand.execution_runtime import auxiliary_process_scope, current_context
+    remaining = current_context().get("_deadline_monotonic")
+    timeout = min(3.0, max(0, remaining - time.monotonic())) if remaining is not None else 3.0
+    if timeout <= 0:
+        raise ProviderStartupError("启动环境检查失败：socket 检查前派发期限已到，模型尚未启动")
+    interpreter = _trusted_system_binary("python3") or os.path.realpath(sys.executable)
+    filter_scope = (seccomp_filter_context(enabled=True, required=True) if seccomp_fd is not None
+                    else contextlib.nullcontext((None, ())))
+    with contextlib.ExitStack() as stack:
+        try:
+            probe_fd, probe_fds = stack.enter_context(filter_scope)
+        except SandboxConfigError as error:
+            raise ProviderStartupError(f"启动环境检查失败：无法准备 socket 探针的 seccomp 隔离 ({error})") from error
+        prefix = list(command[:-len(provider_command)])
+        if seccomp_fd is not None:
+            try:
+                index = prefix.index("--seccomp")
+                if prefix[index + 1] != str(seccomp_fd):
+                    raise ValueError("different filter")
+                prefix[index + 1] = str(probe_fd)
+            except (ValueError, IndexError) as error:
+                raise ProviderStartupError("启动环境检查失败：无法保留 seccomp 隔离，拒绝执行探针") from error
+        probe = prefix + [interpreter, "-I", "-S", "-c", _SOCKET_PROBE]
+        descriptors = tuple(fd for fd in pass_fds if fd != seccomp_fd) + tuple(probe_fds)
+        with auxiliary_process_scope():
+            code, out, err, error = run_subprocess(probe, timeout=timeout, cwd=cwd,
+                                                   pass_fds=descriptors, extra_env=extra_env,
+                                                   separate_stderr=True)
+    if code != 0 or error is not None:
+        detail = str(err or error or out or f"exit {code}").strip()[:512]
+        raise ProviderStartupError(
+            f"启动环境检查失败：socket 能力探针未通过，模型尚未启动 ({detail})"
+        )
+
+
 @contextmanager
 def provider_sandbox_launch(
     provider: str,
@@ -3443,6 +3526,8 @@ def provider_sandbox_launch(
                     os.path.realpath(child_home) != os.path.realpath(str(Path.home()))):
                 refuse_credential_launch("credential source differs from admitted account")
             try:
+                _provider_socket_preflight(cmd, cmd, cwd=cwd, allow_network=allow_network,
+                                           extra_env=launch_env)
                 yield ProviderLaunch(list(cmd), (), False, source,
                     env={**launch_env, PROVIDER_WORKER_ENV: "1"})
             finally:
@@ -3455,6 +3540,8 @@ def provider_sandbox_launch(
                 if changed:
                     raise ProviderAccountChangedError("selected login changed during direct execution")
         else:
+            _provider_socket_preflight(cmd, cmd, cwd=cwd, allow_network=allow_network,
+                                       extra_env=launch_env)
             yield ProviderLaunch(list(cmd), (), False, source, env={**launch_env, PROVIDER_WORKER_ENV: "1"})
         return
     if _is_agy_provider(provider) and extra_env:
@@ -3477,6 +3564,8 @@ def provider_sandbox_launch(
             )
             if apply_limits:
                 exec_cmd = sandbox_resource_limit_prefix() + list(exec_cmd)
+            _provider_socket_preflight(exec_cmd, cmd, cwd=cwd, allow_network=allow_network,
+                                       pass_fds=pass_fds, seccomp_fd=seccomp_fd)
             yield ProviderLaunch(list(exec_cmd), pass_fds, True, None, home)
 
 

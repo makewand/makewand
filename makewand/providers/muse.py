@@ -181,7 +181,7 @@ def execute_muse_task(
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
-        SandboxConfigError,
+        SandboxConfigError, ProviderStartupError,
         verify_writable_sandbox_or_authorized,
     )
     from makewand.git_helper import find_git_root
@@ -323,6 +323,8 @@ def execute_muse_task(
         except SandboxUnavailableError as exc:
             return False, None, str(exc)
         except SandboxConfigError as exc:
+            if isinstance(exc, ProviderStartupError):
+                return exc.as_result("muse", readonly)
             return False, None, f"Muse 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):

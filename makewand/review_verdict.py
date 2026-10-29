@@ -110,6 +110,10 @@ def resolve_review_verdict(
         res = _stage_call("review", dispatch_task, engine, prompt, engine=engine,
                           cwd=cwd, timeout=timeout, tier=tier, stream=False, readonly=True, repo_root=repo_root, repo_trust=repo_trust)
 
+    from makewand.workflow import is_startup_environment_failure
+    if is_startup_environment_failure(res):
+        return text, dict(verdict, execution_status="UNVERIFIED",
+                          error_kind="startup_environment", reason=str(res.error))
     if getattr(res, "status", None) in ("UNKNOWN", "TIMEOUT", "CANCELLED", "BUDGET_EXHAUSTED"):
         return text, dict(verdict, execution_status=res.status,
                           reason="审查补充裁决结果未确定或预算已耗尽，停止后续派发")

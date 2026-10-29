@@ -85,7 +85,7 @@ def execute_aider_task(
         if active_model:
             cmd += ["--model", active_model]
 
-        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError
+        from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError, ProviderStartupError
         from makewand.execution_runtime import mark_provider_invocation
         try:
             with provider_sandbox_launch(
@@ -112,6 +112,8 @@ def execute_aider_task(
         except SandboxUnavailableError as exc:
             return False, None, str(exc)
         except SandboxConfigError as exc:
+            if isinstance(exc, ProviderStartupError):
+                return exc.as_result("aider", readonly)
             return False, None, f"Aider 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     finally:
         if p_file and os.path.exists(p_file):

@@ -97,6 +97,27 @@ deliberately insufficient to claim completion. Evidence is local CLI telemetry,
 not an independently signed provider billing receipt. Live provider format
 compatibility remains unverified; tests use fake CLIs and static samples only.
 
+## Startup environment checks
+
+Private provider homes are selected only after an actual private directory can
+be created and written. An unusable runtime directory falls back to the
+existing user-cache candidate; ownership and private permissions still apply.
+If neither allowed location works, startup fails closed.
+
+Before a network-enabled provider CLI starts, a bounded helper checks whether
+IPv4 or IPv6 TCP sockets can be created in the same launch environment. It
+performs no DNS lookup, connection or model request. This is a local capability
+check, not a proxy, API or quota probe. Network-disabled launches skip it.
+Failures explicitly report a startup environment problem as `UNVERIFIED` with
+`error_kind=startup_environment`. Core generation/review/repair workflows stop
+provider fallback and produce no candidate verdict; failures do not authorize
+automatic retries or host execution.
+
+The helper has separate process observations and its own seccomp pipe. It
+cannot overwrite the provider's process exit code or consume the filter needed
+by the real launch. It adds no model task to the ledger; accounting for the
+enclosing admitted dispatch is unchanged.
+
 ## Retention and reads
 
 Each save also appends one line to `index.jsonl` in the same directory

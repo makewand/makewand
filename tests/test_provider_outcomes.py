@@ -94,6 +94,40 @@ class ProviderOutcomeTests(unittest.TestCase):
         process.assert_not_called()
         api.assert_not_called()
 
+    def test_startup_environment_failure_is_typed_without_cli_or_api_fallback(self):
+        from makewand.sandbox import ProviderStartupError
+        for engine in ENGINES:
+            with self.subTest(engine=engine), self.adapter(engine) as (execute, process, api), \
+                    patch("makewand.sandbox._provider_socket_preflight",
+                          side_effect=ProviderStartupError("启动环境检查失败：fixture socket denied")):
+                result = execute("Review fixture", cwd=self.directory, readonly=True)
+                self.assertIsInstance(result, ExecutionResult)
+                self.assertEqual(result.status, "UNVERIFIED")
+                self.assertEqual(result.error_kind, "startup_environment")
+                self.assertTrue(result.outcome_known)
+                self.assertTrue(result.readonly)
+                self.assertEqual(result.engine, engine)
+                process.assert_not_called()
+                api.assert_not_called()
+
+    def test_actual_startup_failure_stops_review_and_preserves_diagnostic(self):
+        with self.adapter("codex") as (_, process, api), \
+                patch("makewand.sandbox.run_subprocess", return_value=(77, "", "socket: EPERM", None)), \
+                patch.object(orch, "get_git_diff", return_value="diff fixture"), \
+                patch.object(orch, "get_or_update_status", return_value={}), \
+                patch.object(orch, "_engine_usable", return_value=(True, "")), \
+                patch.object(orch, "execute_grok_task") as fallback, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = orch.run_review(cwd=self.directory, output_json=True)
+        self.assertEqual(code, 11)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["verdict_status"], "unverified")
+        self.assertIn("启动环境检查失败", report["error"])
+        self.assertIn("EPERM", report["error"])
+        process.assert_not_called()
+        fallback.assert_not_called()
+        api.assert_not_called()
+
     def test_explicit_quota_rejection_remains_known(self):
         for engine in ENGINES[:-1]:
             rejection = QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests")

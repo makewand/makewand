@@ -43,13 +43,14 @@ class WindowsReleaseProtocolTests(unittest.TestCase):
                 lines.append(line + status)
             if name == duplicate:
                 lines.append(line + status)
-        lines.extend(('', '-' * 70, 'Ran %d tests in 1.000s' % len(self.expected), '', 'OK (skipped=8)', ''))
+        lines.extend(('', '-' * 70, 'Ran %d tests in 1.000s' % len(self.expected), '',
+                      'OK (skipped=%d)' % len(WINDOWS_SKIPS), ''))
         return '\n'.join(lines).encode()
 
     def test_python_complete_inventory_and_exact_platform_skips(self):
         result = summarize_python(self.python_output(), self.expected, 'utf-8')
         self.assertEqual(result['ran'], len(self.expected))
-        self.assertEqual(result['pass'], len(self.expected) - 8)
+        self.assertEqual(result['pass'], len(self.expected) - len(WINDOWS_SKIPS))
         self.assertEqual({r['test']: r['reason'] for r in result['skips']}, WINDOWS_SKIPS)
 
     def test_python_inventory_rejects_fake_footer_missing_duplicate_and_unknown_skip(self):
@@ -64,7 +65,7 @@ class WindowsReleaseProtocolTests(unittest.TestCase):
 
     def test_python_warning_then_standalone_completion_is_preserved(self):
         name = next(n for n in self.expected if n not in WINDOWS_SKIPS)
-        self.assertEqual(summarize_python(self.python_output(warning=name), self.expected, 'utf-8')['pass'], len(self.expected) - 8)
+        self.assertEqual(summarize_python(self.python_output(warning=name), self.expected, 'utf-8')['pass'], len(self.expected) - len(WINDOWS_SKIPS))
 
     def test_python_failure_and_invalid_encoding_fail_closed(self):
         name = next(n for n in self.expected if n not in WINDOWS_SKIPS)

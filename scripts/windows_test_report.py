@@ -4,8 +4,12 @@ import json
 import re
 
 MODULES = ["test_native_windows", "test_native_windows_pipeline", "test_native_delivery",
-           "test_candidate_recovery", "test_windows_runtime_regression"]
+           "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight"]
 WINDOWS_SKIPS = {
+    "test_provider_startup_preflight.PrivateHomeFallbackTests.test_existing_unwritable_runtime_uses_writable_private_cache": "needs POSIX permission enforcement for a normal user",
+    "test_provider_startup_preflight.PrivateHomeFallbackTests.test_symlinked_runtime_base_is_not_used": "POSIX symlink fixture",
+    "test_provider_startup_preflight.SocketPreflightTests.test_probe_uses_its_own_filter_and_preserves_actual_filter_bytes": "seccomp pipes on POSIX",
+    "test_provider_startup_preflight.SocketPreflightTests.test_live_sandbox_can_still_launch_after_probe_consumes_its_filter": "bubblewrap on POSIX",
     "test_native_windows.WindowsPathTests.test_windows_backends_are_not_silently_emulated_on_other_platforms": "The native backend exists on this platform",
     **{"test_candidate_recovery.CandidateRecoveryTests." + name: reason for name, reason in (
         ("test_copy_checks_captured_root_identity_after_path_is_restored", "Windows pins the workspace against root replacement"),
@@ -26,7 +30,7 @@ class ResultError(ValueError):
 
 
 def python_inventory(root):
-    """The current five modules define direct unittest methods, not generated tests.
+    """The selected modules define direct unittest methods, not generated tests.
 
     Avoid importing test fixtures during metadata collection. The actual verbose
     execution must match every declared method, so dynamic or inherited additions
