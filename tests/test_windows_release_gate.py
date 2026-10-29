@@ -29,6 +29,12 @@ class WindowsReleaseProtocolTests(unittest.TestCase):
     def setUp(self):
         self.expected = python_inventory(ROOT)
 
+    def test_native_executor_and_inventory_share_the_complete_module_list(self):
+        import windows_test_gate
+        from windows_test_report import MODULES
+        argv = next(argv for name, argv, _ in windows_test_gate.GROUPS if name == "python_native")
+        self.assertEqual(argv[3:], MODULES)
+
     def python_output(self, changes=None, omit=None, duplicate=None, warning=None):
         lines = []
         for name in sorted(self.expected):

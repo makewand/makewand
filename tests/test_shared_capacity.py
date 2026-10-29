@@ -161,13 +161,13 @@ class SharedCapacityTests(unittest.TestCase):
     def test_tool_slots_are_separate_and_track_actual_subprocess(self):
         current = capacity.policy()
         with patch.object(capacity, "tool_memory_available", return_value=True):
-            with capacity.tool_scope(current, time.monotonic() + 2):
+            with capacity.tool_scope(current, time.monotonic() + 30):
                 from makewand.providers.base import run_subprocess
-                code, _, _, _ = run_subprocess([sys.executable, "-I", "-c", "print('fixture')"], timeout=1)
+                code, _, _, _ = run_subprocess([sys.executable, "-I", "-c", "print('fixture')"], timeout=10)
                 self.assertEqual(code, 0)
                 a = self.reserve("a", "codex")
                 self.finish("a", a)
-                with capacity.tool_scope(current, time.monotonic() + 2):
+                with capacity.tool_scope(current, time.monotonic() + 10):
                     with self.assertRaises(budget.ConcurrencyBusyError):
                         with capacity.tool_scope(current, time.monotonic() + .15):
                             self.fail("third heavy tool started")

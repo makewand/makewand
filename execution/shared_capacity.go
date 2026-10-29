@@ -140,7 +140,7 @@ func capacityProject(workingDir string) (string, string, error) {
 	if !explicit {
 		for parent := root; ; parent = filepath.Dir(parent) {
 			marker := filepath.Join(parent, ".git")
-			if info, err := os.Stat(marker); err == nil && info.IsDir() {
+			if capacityDirectory(marker) {
 				root = parent
 				break
 			}
@@ -170,7 +170,19 @@ func capacityProject(workingDir string) (string, string, error) {
 }
 
 func readCapacityText(value string) (string, error) {
-	file, err := os.OpenFile(value, accountingOpenFlags(os.O_RDONLY), 0)
+	value, err := canonicalAccountingPath(value)
+	if err != nil {
+		return "", err
+	}
+	path, err := openAccountingPath(value, false)
+	if err != nil {
+		return "", err
+	}
+	defer path.close()
+	// Unlike budget readers, Git metadata and the import registry must not
+	// have their permissions changed. Still pin the parent and refuse leaf
+	// symlinks, devices and FIFOs before reading any bytes.
+	file, err := path.root.OpenFile(path.name, accountingOpenFlags(os.O_RDONLY), 0)
 	if err != nil {
 		return "", err
 	}
@@ -187,6 +199,16 @@ func readCapacityText(value string) (string, error) {
 		return "", fmt.Errorf("capacity text exceeds 16 MiB")
 	}
 	return string(raw), err
+}
+
+func capacityDirectory(value string) bool {
+	path, err := openAccountingPath(value, false)
+	if err != nil {
+		return false
+	}
+	defer path.close()
+	info, err := path.root.Stat(path.name)
+	return err == nil && info.IsDir()
 }
 
 func capacityLimits(engine string, policy *hostCapacityPolicy) ([]int, error) {
