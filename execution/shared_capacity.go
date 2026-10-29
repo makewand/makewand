@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -57,9 +58,39 @@ type sharedCapacityGate struct {
 	Policy  *hostCapacityPolicy
 }
 
+var capacityCurrentUser = user.Current
+
+func capacityHomeDirectory() (string, error) {
+	home, err := os.UserHomeDir()
+	if err == nil {
+		return home, nil
+	}
+	account, lookupErr := capacityCurrentUser()
+	if lookupErr != nil || account == nil || account.HomeDir == "" {
+		return "", err
+	}
+	return account.HomeDir, nil
+}
+
 func capacityPath(name string) (string, error) {
 	path, err := DefaultBudgetPath()
-	return filepath.Join(filepath.Dir(path), name), err
+	if err != nil {
+		// Python's Path.home also consults the user database when HOME is
+		// absent. Keep the optional coordinator in that same directory.
+		home, lookupErr := capacityHomeDirectory()
+		if lookupErr != nil {
+			return "", err
+		}
+		path = filepath.Join(home, ".config", "makewand", "call-budget.json")
+	}
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
+		home, err := capacityHomeDirectory()
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, path[2:])
+	}
+	return filepath.Join(filepath.Dir(path), name), nil
 }
 
 // Compaction holds a budget lock, so read only an atomic snapshot here. Taking
@@ -118,7 +149,12 @@ func readCapacityFile(value string, target any) error {
 func loadCapacityPolicy() (*hostCapacityPolicy, error) {
 	value, err := capacityPath("capacity-policy.json")
 	if err != nil {
-		return nil, err
+		if os.Getenv("MAKEWAND_CONFIG_DIR") != "" || os.Getenv("XDG_CONFIG_HOME") != "" {
+			return nil, err // an explicit operator path must remain readable
+		}
+		// No optional configuration location is available. Existing private
+		// or unbudgeted contexts still work; compaction keeps unknown refs.
+		return nil, nil
 	}
 	var policy hostCapacityPolicy
 	if err := readCapacityFile(value, &policy); errors.Is(err, os.ErrNotExist) {
@@ -356,7 +392,7 @@ func validateCapacityState(state *sharedCapacityState) error {
 
 func refreshCapacity(state *sharedCapacityState, selected string) {
 	paths := map[string]bool{selected: true}
-	if path, err := DefaultBudgetPath(); err == nil {
+	if path, err := capacityPath("call-budget.json"); err == nil {
 		// Expand the original operator path in the canonicalization loop below;
 		// filepath.Abs on a leading ~ would turn it into a literal cwd child.
 		paths[path] = true

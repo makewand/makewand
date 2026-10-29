@@ -28,6 +28,15 @@ If shared registration fails before admission returns, the runtime rejects the
 known uninvoked reservation and releases its account lease. This does not
 refund an invoked transport. Settlement retries after transient accounting
 failures without launching another provider or renewing the abandoned lease.
+Final local-tool settlement also retries after lock or storage failures. It
+keeps the original coordinator path, never renews the finished tool's heartbeat,
+and preserves live or unobservable worker fences. The initial failure still
+reports validation as unavailable.
+
+When the home environment is absent, Go resolves this optional configuration
+through the operating-system user record, including operator `~` aliases.
+An unavailable implicit home preserves legacy dispatches and conservatively
+retains possible history references; unreadable explicit paths still fail closed.
 
 `shared-capacity.json` contains only active lease references, short-lived queue
 tickets and project scheduling turns. Admissions hold its lock before the

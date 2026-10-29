@@ -91,9 +91,9 @@ def project(working_directory=None):
 
 
 @contextmanager
-def locked(deadline=None, admission=True):
+def locked(deadline=None, admission=True, *, state_path=None):
     from makewand.call_budget import BudgetDeadlineError, _check_admission_cancelled
-    with accounting_files.pin(Path(layered_budget.default_path()).with_name(STATE_NAME)) as path:
+    with accounting_files.pin(state_path or Path(layered_budget.default_path()).with_name(STATE_NAME)) as path:
         descriptor = path.open(path.lock_name, create=True, writable=True)
         path.lock_fd = descriptor
         acquired = False
@@ -392,10 +392,10 @@ def relocation(current_policy, engine, value, attempt):
         yield Gate(path, state, ticket)
 
 
-def tool_update(action, pid=None, identifier=None):
+def tool_update(action, pid=None, identifier=None, *, state_path=None):
     from makewand.call_budget import BudgetError, BudgetConfigError
     try:
-        _tool_update(action, pid, identifier)
+        _tool_update(action, pid, identifier, state_path=state_path)
     except BudgetError:
         raise
     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
@@ -404,17 +404,20 @@ def tool_update(action, pid=None, identifier=None):
         raise BudgetConfigError(f"cannot update local tool capacity: {error}") from error
 
 
-def _tool_update(action, pid=None, identifier=None):
+def _tool_update(action, pid=None, identifier=None, *, state_path=None, missing_ok=False):
     identifier = identifier or _tool.get()
     if identifier is None:
         return
-    with locked(time.monotonic() + 5, admission=False) as (path, state):
+    with locked(time.monotonic() + 5, admission=False, state_path=state_path) as (path, state):
         row = state["active"].get(identifier)
         if row is None or row["kind"] != "tool":
+            if missing_ok:
+                return  # a deferred settlement was already durably applied
             raise RuntimeError("local tool capacity lease disappeared")
         lease = row["lease"]
         now = time.time()
-        lease.update(heartbeat_at=now, expires_at=now + account_leases.TTL)
+        if action != "settle":
+            lease.update(heartbeat_at=now, expires_at=now + account_leases.TTL)
         if action == "launch":
             lease["launch_pending"] = True
         elif action in ("worker", "job_worker"):
@@ -438,12 +441,35 @@ def _tool_update(action, pid=None, identifier=None):
         save(path, state)
 
 
+def _defer_tool_settlement(identifier, state_path):
+    """Retry only final accounting for this original tool and coordinator.
+
+    Do not renew its heartbeat, launch work, or clear uncertain worker fences.
+    A missing state/row needs no cleanup; invalid existing state stays closed.
+    """
+    def retry():
+        waiter, delay = threading.Event(), .1
+        while True:
+            waiter.wait(delay)
+            try:
+                os.lstat(state_path)  # skip a missing coordinator
+                _tool_update("settle", identifier=identifier, state_path=state_path, missing_ok=True)
+                return
+            except FileNotFoundError:
+                return
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                delay = min(delay * 2, 30)
+
+    threading.Thread(target=retry, name="makewand-tool-settlement", daemon=True).start()
+
+
 @contextmanager
 def tool_scope(current_policy, deadline):
     from makewand.call_budget import BudgetDeadlineError, ConcurrencyBusyError, _check_admission_cancelled
     if deadline <= time.monotonic():
         raise BudgetDeadlineError("local tool deadline expired before admission")
     identifier = uuid.uuid4().hex
+    state_path = str(Path(layered_budget.default_path()).with_name(STATE_NAME).expanduser().resolve())
     project_id, label = project()
     now = time.time()
     ticket = {"id": identifier, "kind": "tool", "ledger": "", "attempt": "", "project": project_id,
@@ -457,7 +483,7 @@ def tool_scope(current_policy, deadline):
     try:
         while True:
             _check_admission_cancelled()
-            with locked(wait_until) as (path, state):
+            with locked(wait_until, state_path=state_path) as (path, state):
                 refresh(state, str(Path(layered_budget.default_path()).expanduser().resolve()))
                 existing = next((r for r in state["queue"] if r["id"] == identifier), None)
                 if existing is None:
@@ -488,7 +514,7 @@ def tool_scope(current_policy, deadline):
         def heartbeat():
             while not stop.wait(5):
                 try:
-                    tool_update("heartbeat", identifier=identifier)
+                    tool_update("heartbeat", identifier=identifier, state_path=state_path)
                 except (OSError, RuntimeError, ValueError):
                     pass
         thread = threading.Thread(target=heartbeat, daemon=True)
@@ -499,7 +525,11 @@ def tool_scope(current_policy, deadline):
             stop.set()
             thread.join(timeout=6)
             try:
-                tool_update("settle", identifier=identifier)
+                try:
+                    tool_update("settle", identifier=identifier, state_path=state_path)
+                except BaseException:
+                    _defer_tool_settlement(identifier, state_path)
+                    raise
             finally:
                 _tool.reset(token)
     finally:

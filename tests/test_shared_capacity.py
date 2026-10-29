@@ -511,6 +511,103 @@ class SharedCapacityTests(unittest.TestCase):
                     self.fail("invalid policy ran a local command")
                 self.assertEqual(sandbox()[3], "LocalCapacityUnavailable")
 
+    def test_tool_settlement_recovers_after_storage_failure_and_config_change(self):
+        import errno
+        import threading
+        allow, done = threading.Event(), threading.Event()
+        state_path = self.root / capacity.STATE_NAME
+        original_save = capacity.save
+
+        def save(path, state):
+            if not state["active"] and not allow.is_set():
+                raise OSError(errno.ENOSPC, "fixture tool settlement unavailable")
+            original_save(path, state)
+            if not state["active"]:
+                done.set()
+
+        with patch.object(capacity, "save", side_effect=save), \
+                patch.object(capacity, "tool_memory_available", return_value=True):
+            try:
+                with self.assertRaises(budget.BudgetError):
+                    with capacity.tool_scope(capacity.policy(), time.monotonic() + 3):
+                        pass
+                other_config = self.root / "other-config"
+                other_config.mkdir()
+                with patch.dict(os.environ, MAKEWAND_CONFIG_DIR=str(other_config)):
+                    allow.set()
+                    self.assertTrue(done.wait(4), "tool settlement never retried after storage recovered")
+                    self.assertFalse((other_config / capacity.STATE_NAME).exists())
+            finally:
+                allow.set()
+        self.assertEqual(json.loads(state_path.read_text())["active"], {})
+        self.assertIsNone(capacity._tool.get())
+        with patch.object(capacity, "tool_memory_available", return_value=True):
+            with capacity.tool_scope(capacity.policy(), time.monotonic() + 2):
+                pass
+
+    def test_tool_settlement_recovers_after_shared_lock_contention(self):
+        from makewand import filelock
+        state_path = self.root / capacity.STATE_NAME
+        holder = None
+        try:
+            with patch.object(capacity, "tool_memory_available", return_value=True):
+                with self.assertRaises(budget.BudgetError):
+                    with capacity.tool_scope(capacity.policy(), time.monotonic() + 3):
+                        holder = open(str(state_path) + ".lock", "r+b")
+                        filelock.flock(holder.fileno(), filelock.LOCK_EX)
+        finally:
+            if holder is not None:
+                filelock.flock(holder.fileno(), filelock.LOCK_UN)
+                holder.close()
+        until = time.monotonic() + 4
+        while time.monotonic() < until:
+            try:
+                if not capacity._read(state_path)["active"]:
+                    break
+            except (OSError, ValueError, RuntimeError):
+                pass
+            time.sleep(.02)
+        self.assertEqual(capacity._read(state_path)["active"], {}, "tool slot retained after lock holder released it")
+
+    def test_deferred_tool_settlement_keeps_worker_fences_without_renewal(self):
+        import errno
+        import threading
+        original_save = capacity.save
+        for action in ("launch", "worker"):
+            with self.subTest(action=action):
+                allow, done = threading.Event(), threading.Event()
+
+                def save(path, state):
+                    settled = any(row.get("settled") for row in state["active"].values())
+                    if settled and not allow.is_set():
+                        raise OSError(errno.ENOSPC, "fixture tool settlement unavailable")
+                    original_save(path, state)
+                    if settled:
+                        done.set()
+
+                with patch.object(capacity, "save", side_effect=save), \
+                        patch.object(capacity, "tool_memory_available", return_value=True):
+                    try:
+                        with self.assertRaises(budget.BudgetError):
+                            with capacity.tool_scope(capacity.policy(), time.monotonic() + 3):
+                                capacity.tool_update(action, os.getpid() if action == "worker" else None)
+                                before = next(iter(capacity._read(self.root / capacity.STATE_NAME)["active"].values()))
+                        allow.set()
+                        self.assertTrue(done.wait(4))
+                    finally:
+                        allow.set()
+                state = capacity._read(self.root / capacity.STATE_NAME)
+                self.assertEqual(len(state["active"]), 1)
+                row = next(iter(state["active"].values()))
+                self.assertTrue(row["settled"])
+                self.assertEqual(row["lease"]["expires_at"], before["lease"]["expires_at"])
+                self.assertEqual(row["lease"]["heartbeat_at"], before["lease"]["heartbeat_at"])
+                self.assertTrue(capacity._live(row["lease"], completed=True, now=row["lease"]["expires_at"] + 1))
+                # Only remove this fixture's deliberately live/uncertain fence.
+                with capacity.locked() as (path, state):
+                    state["active"].clear()
+                    capacity.save(path, state)
+
     def test_registration_failure_releases_uninvoked_reservation(self):
         import errno
         for failure in ("read", "published-save"):
