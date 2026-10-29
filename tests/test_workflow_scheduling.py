@@ -158,6 +158,22 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(result.status, "TIMEOUT")
         self.assertEqual(len(self.calls), 1)
 
+    def test_startup_failure_stops_coder_or_reviewer_fallback(self):
+        from makewand.sandbox import ProviderStartupError
+        for stage in ("generation", "review"):
+            self.calls.clear()
+            def callback(engine, kwargs):
+                if stage == "generation" or kwargs.get("readonly"):
+                    return ProviderStartupError("启动环境检查失败：fixture socket denied").as_result(
+                        engine, kwargs.get("readonly", False))
+            with self.subTest(stage=stage), self.fixtures(callback=callback):
+                result = orch.run_workflow("Implement value", cwd=str(self.repo), force_code=True,
+                                           total_timeout=10)
+                self.assertEqual(result.status, "UNVERIFIED")
+                self.assertIn("启动环境检查失败", result.error)
+                self.assertEqual(len(self.calls), 1 if stage == "generation" else 2)
+                self.assertEqual((self.repo / "app.py").read_text(), "VALUE = 1\n")
+
     def test_direct_command_respects_parent_deadline_and_tuple_compatibility(self):
         timeout_values = []
         with execution_context(deadline_unix_ms=int(time.time() * 1000 + 200)):
@@ -197,6 +213,19 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(code, 17)
         self.assertEqual(dispatch.call_count, 2)
         self.assertIs(json.loads(output.getvalue())["pass"], False)
+
+    def test_verdict_followup_startup_failure_keeps_environment_diagnostic(self):
+        from makewand.sandbox import ProviderStartupError
+        failure = ProviderStartupError("启动环境检查失败：fixture socket denied").as_result("codex", True)
+        with patch.object(orch, "get_git_diff", return_value="changed"), \
+                patch.object(orch, "get_or_update_status", return_value={}), \
+                patch.object(orch, "_engine_usable", return_value=(True, "")), \
+                patch.object(orch, "dispatch_task", side_effect=[(True, "Looks good", None), failure]) as dispatch, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = orch.run_review(cwd=str(self.repo), output_json=True)
+        self.assertEqual(code, EXIT_UNVERIFIED)
+        self.assertEqual(dispatch.call_count, 2)
+        self.assertIn("启动环境检查失败", output.getvalue())
 
     def test_race_reserves_judge_before_any_generation_and_propagates_thread_context(self):
         ledger = self.root / "ledger.json"

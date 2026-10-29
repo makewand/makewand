@@ -55,6 +55,7 @@ class TestClaudeReadonlyFlags(unittest.TestCase):
         with patch("makewand.sandbox.is_bwrap_available", return_value=bwrap), \
              patch("makewand.sandbox.resolve_trusted_bwrap", return_value="/usr/bin/bwrap"), \
              patch("makewand.sandbox.sandbox_resource_limit_prefix", return_value=list(self.LIMIT_PREFIX)), \
+             patch("makewand.sandbox._provider_socket_preflight"), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec") as audit:
             ok, out, err = execute_claude_task("review this", cwd=self.ws, readonly=readonly)

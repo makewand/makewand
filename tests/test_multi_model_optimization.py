@@ -318,11 +318,10 @@ class TestGrokProviderIntegration(unittest.TestCase):
     5. Orchestrator affinity scoring
     """
 
-    @patch("shutil.which", return_value="/opt/grok/bin/grok")
     @patch("makewand.sandbox.is_bwrap_available", return_value=True)
     @patch("makewand.providers.grok.run_subprocess")
-    def test_grok_cli_argument_construction(self, mock_run, mock_bwrap, mock_which):
-        with _FakeProviderHome() as fh:
+    def test_grok_cli_argument_construction(self, mock_run, mock_bwrap):
+        with _FakeProviderHome() as fh, patch("makewand.sandbox._provider_socket_preflight"):
             self._grok_cli_argument_construction(mock_run, str(fh.workspace))
 
     def _grok_cli_argument_construction(self, mock_run, ws):

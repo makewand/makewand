@@ -94,6 +94,58 @@ class ProviderOutcomeTests(unittest.TestCase):
         process.assert_not_called()
         api.assert_not_called()
 
+    def test_startup_environment_failure_is_typed_without_cli_or_api_fallback(self):
+        from makewand.sandbox import ProviderStartupError
+        for engine in ENGINES:
+            with self.subTest(engine=engine), self.adapter(engine) as (execute, process, api), \
+                    patch("makewand.sandbox._provider_socket_preflight",
+                          side_effect=ProviderStartupError("启动环境检查失败：fixture socket denied")):
+                result = execute("Review fixture", cwd=self.directory, readonly=True)
+                self.assertIsInstance(result, ExecutionResult)
+                self.assertEqual(result.status, "UNVERIFIED")
+                self.assertEqual(result.error_kind, "startup_environment")
+                self.assertTrue(result.outcome_known)
+                self.assertTrue(result.readonly)
+                self.assertEqual(result.engine, engine)
+                process.assert_not_called()
+                api.assert_not_called()
+
+    def test_actual_startup_failure_stops_review_and_preserves_diagnostic(self):
+        with self.adapter("codex") as (_, process, api), \
+                patch("makewand.sandbox.run_subprocess", return_value=(77, "", "socket: EPERM", None)), \
+                patch.object(orch, "get_git_diff", return_value="diff fixture"), \
+                patch.object(orch, "get_or_update_status", return_value={}), \
+                patch.object(orch, "_engine_usable", return_value=(True, "")), \
+                patch.object(orch, "execute_grok_task") as fallback, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = orch.run_review(cwd=self.directory, output_json=True)
+        self.assertEqual(code, 11)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["verdict_status"], "unverified")
+        self.assertIn("启动环境检查失败", report["error"])
+        self.assertIn("EPERM", report["error"])
+        process.assert_not_called()
+        fallback.assert_not_called()
+        api.assert_not_called()
+
+    def test_muse_slice_wraps_both_preflight_and_provider_process(self):
+        with self.adapter("muse", (0, "fixture result", "", None)) as (execute, process, api), \
+                patch("makewand.providers.muse.detect_muse_guard", return_value=(True, "/fixture/muse")), \
+                patch("makewand.providers.muse.verify_muse_guard", return_value=(True, "")), \
+                patch("makewand.providers.muse._is_dbus_systemd_available", return_value=True), \
+                patch("makewand.sandbox._trusted_system_binary", return_value="/fixture/systemd-run"), \
+                patch("makewand.sandbox._provider_socket_preflight") as probe:
+            result = execute("Review fixture", cwd=self.directory, readonly=True)
+        self.assertTrue(result[0], result[2])
+        process.assert_called_once()
+        probe.assert_called_once()
+        command = process.call_args.args[0]
+        self.assertEqual(probe.call_args.args[0], command)
+        self.assertEqual(command[0], "/fixture/systemd-run")
+        self.assertIn("--slice=muse", command)
+        self.assertIn("MemoryMax=16G", command)
+        api.assert_not_called()
+
     def test_explicit_quota_rejection_remains_known(self):
         for engine in ENGINES[:-1]:
             rejection = QUOTA_REJECTION.get(engine, "HTTP 429 Too Many Requests")

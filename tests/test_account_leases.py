@@ -155,10 +155,12 @@ class AccountLeaseTests(unittest.TestCase):
         root.mkdir()
         auth = root / "auth.json"
         auth.write_text('{"tokens":{"account_id":"A"}}')
+        work = Path(self.tmp.name) / "work"
+        work.mkdir()
         observed = []
         def callback(remaining):
             command = [sys.executable, "-I", "-c", "import os,json; print(json.load(open(os.path.join(os.environ['CODEX_HOME'],'auth.json')))['tokens']['account_id'])"]
-            with provider_sandbox_launch("codex", command, str(Path(self.tmp.name) / "work"), readonly=True) as launch:
+            with provider_sandbox_launch("codex", command, str(work), readonly=True) as launch:
                 auth.write_text('{"tokens":{"account_id":"B"}}')
                 code, out, err, error = run_subprocess(launch.cmd, extra_env=launch.env)
                 observed.append(out.strip())

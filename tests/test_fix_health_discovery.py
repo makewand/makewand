@@ -463,8 +463,12 @@ class TestGrokCliCacheLayout(_TempHome):
         self.write(".grok/models_cache.json", grok_cli_cache())
         workspace = Path(tempfile.mkdtemp(prefix="mw-fix-grok-ws-"))
         self.addCleanup(shutil.rmtree, workspace, True)
-        with patch("shutil.which", return_value="/opt/grok/bin/grok"), \
+        real_which = shutil.which
+        def fixture_which(name, *args, **kwargs):
+            return "/opt/grok/bin/grok" if name == "grok" else real_which(name, *args, **kwargs)
+        with patch("shutil.which", side_effect=fixture_which), \
              patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+             patch("makewand.sandbox._provider_socket_preflight"), \
              patch.object(grok_provider, "run_subprocess", return_value=(0, "ok", "", None)) as run:
             grok_provider.execute_grok_task("analyze problem", cwd=str(workspace), tier="fast", readonly=True)
         cmd = run.call_args[0][0]

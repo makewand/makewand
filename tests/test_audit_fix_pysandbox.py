@@ -419,7 +419,10 @@ class TestSeccompRequired(unittest.TestCase):
                 patch("makewand.sandbox.is_bwrap_available", return_value=True), \
                 patch("makewand.sandbox.resolve_trusted_bwrap", return_value=FAKE_BWRAP), \
                 patch("makewand.sandbox.sandbox_resource_limit_prefix", return_value=[]), \
-                patch("makewand.sandbox.generate_seccomp_bpf_filter", return_value=b"\0" * 8):
+                patch("makewand.sandbox.generate_seccomp_bpf_filter", return_value=b"\0" * 8), \
+                patch("makewand.sandbox._provider_socket_preflight"):
+            # This is a mount/descriptor plan test with deliberately invalid
+            # filter bytes; the real socket/filter lifecycle is tested separately.
             with self._launch(ws) as launch:
                 self.assertTrue(launch.sandboxed)
                 fd = launch.cmd[launch.cmd.index("--seccomp") + 1]
@@ -430,6 +433,7 @@ class TestSeccompRequired(unittest.TestCase):
                 patch("makewand.sandbox.is_bwrap_available", return_value=True), \
                 patch("makewand.sandbox.resolve_trusted_bwrap", return_value=FAKE_BWRAP), \
                 patch("makewand.sandbox.sandbox_resource_limit_prefix", return_value=[]), \
+                patch("makewand.sandbox._provider_socket_preflight"), \
                 patch("makewand.sandbox.generate_seccomp_bpf_filter", return_value=None):
             with self.assertRaises(SandboxConfigError):
                 with self._launch(ws):
@@ -548,6 +552,7 @@ class TestProviderWorkerMarker(unittest.TestCase):
             patch("makewand.sandbox.is_bwrap_available", return_value=True),
             patch("makewand.sandbox.resolve_trusted_bwrap", return_value=FAKE_BWRAP),
             patch("makewand.sandbox.sandbox_resource_limit_prefix", return_value=[]),
+            patch("makewand.sandbox._provider_socket_preflight"),
         ]
 
     def test_provider_bwrap_launch_sets_marker(self):

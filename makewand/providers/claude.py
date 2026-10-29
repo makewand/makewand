@@ -64,7 +64,7 @@ def execute_claude_task(
     from makewand.health import load_status_cache, save_status_cache
     from makewand.sandbox import (
         is_bwrap_available,
-        SandboxConfigError,
+        SandboxConfigError, ProviderStartupError,
         ProviderAccountChangedError,
         verify_writable_sandbox_or_authorized,
     )
@@ -185,6 +185,8 @@ def execute_claude_task(
     except SandboxUnavailableError as exc:
         return False, None, str(exc)
     except SandboxConfigError as exc:
+        if isinstance(exc, ProviderStartupError):
+            return exc.as_result("claude", readonly)
         return False, None, f"Claude 沙箱构建失败，拒绝执行 (fail closed): {exc}"
     apart = stderr_captured_apart(err, stream)
     combined = f"{out}\n{err}" if apart else out

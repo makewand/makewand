@@ -166,6 +166,8 @@ class TestMuseSandboxPassthrough(unittest.TestCase):
 
     def test_execute_muse_task_wrapped_in_systemd_run_slice(self):
         from makewand.providers.muse import execute_muse_task
+        # Command construction only: fake bwrap omits the real seccomp options.
+        # Real probe/filter execution is covered by test_provider_startup_preflight.
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.health.load_status_cache", return_value={}), \
              patch("makewand.sandbox.is_bwrap_available", return_value=True), \
@@ -173,6 +175,7 @@ class TestMuseSandboxPassthrough(unittest.TestCase):
              patch("makewand.providers.muse.detect_muse_guard", return_value=(True, "/home/alice/.local/libexec/muse-bin/muse")), \
              patch("makewand.providers.muse.verify_muse_guard", return_value=(True, "")), \
              patch("makewand.sandbox.wrap_bwrap", side_effect=lambda cmd, **kwargs: ["bwrap"] + cmd), \
+             patch("makewand.sandbox._provider_socket_preflight"), \
              patch("makewand.providers.muse.run_subprocess", return_value=(0, "ok", "", None)) as mock_run:
             success, out, err = execute_muse_task("echo test", cwd="/tmp", readonly=True)
             self.assertTrue(success)

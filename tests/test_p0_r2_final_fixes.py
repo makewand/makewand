@@ -158,6 +158,8 @@ class FinalFixTests(unittest.TestCase):
                     self.assertEqual(record['windows'], [])
 
     def test_explicit_default_claude_direct_launch_preserves_config_directory(self):
+        workspace = self.root / 'work'
+        workspace.mkdir()
         login = self.home / '.claude'
         login.mkdir()
         (login / '.credentials.json').write_text('{}')
@@ -166,7 +168,7 @@ class FinalFixTests(unittest.TestCase):
         with patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(login)), \
                 patch('makewand.sandbox.is_bwrap_available', return_value=False), \
                 patch('makewand.sandbox.authorize_unsandboxed_launch', return_value='fixture'):
-            with provider_sandbox_launch('claude', ['fake-unused'], str(self.root / 'work'), readonly=True) as launch:
+            with provider_sandbox_launch('claude', ['fake-unused'], str(workspace), readonly=True) as launch:
                 self.assertNotIn('CLAUDE_CONFIG_DIR', launch.env)
                 self.assertEqual(os.environ['CLAUDE_CONFIG_DIR'], str(login))
 
