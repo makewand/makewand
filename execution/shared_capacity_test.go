@@ -310,10 +310,7 @@ func TestSharedCapacityReapedLegacyFloorAllowsTwoAgySlots(t *testing.T) {
 
 func TestSharedCapacityTildeConfigImportsLegacyDefaultLedger(t *testing.T) {
 	root := sharedCapacityFixture(t, 3)
-	policy, err := os.ReadFile(filepath.Join(root, "capacity-policy.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	policy := []byte(`{"schema":1,"global_max":3,"project_max":1,"tool_max":2,"wait_seconds":300,"providers":{"codex":1,"agy":2,"claude":1,"fixture":8}}`)
 	home := t.TempDir()
 	config := filepath.Join(home, "config")
 	if err := os.Mkdir(config, 0700); err != nil {
