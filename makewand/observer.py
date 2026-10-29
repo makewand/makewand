@@ -782,8 +782,9 @@ def observe_all_dialogs(save_report=True, clean_hung=False, confirm_pids: Option
             cleaned_pids = terminate_dispatched_processes(hung_candidates, confirm_pids)
 
     optimizations = analyze_makewand_optimizations(session_reports, metrics, external_sessions=external_sessions)
-    from makewand import ledger_registry
+    from makewand import budget_watch, ledger_registry
     other_ledgers = ledger_registry.recent_activity()
+    budget_flags = budget_watch.flags()
 
     report = {
         "timestamp": datetime.now().isoformat(),
@@ -797,6 +798,7 @@ def observe_all_dialogs(save_report=True, clean_hung=False, confirm_pids: Option
         "hung_candidates": hung_candidates,
         "cleaned_pids": cleaned_pids,
         "other_ledgers": other_ledgers,
+        "budget_flags": budget_flags,
     }
 
     if save_report:
@@ -872,6 +874,16 @@ def format_observation_markdown(report):
         for ledger in report["other_ledgers"]:
             lines.append(f"| `{ledger['path']}` | {ledger['calls']} | {ledger['abnormal']} | "
                          f"{', '.join(ledger['engines'])} | {', '.join(ledger['tasks']) or '-'} |")
+
+    if report.get("budget_flags"):
+        lines.append("")
+        lines.append("### ⚖️ 近 24 小时超出单请求调用规则的迹象（仅提示，是否已获用户授权需人工确认）")
+        lines.append("")
+        lines.append("| 任务 | 迹象 | 详情 |")
+        lines.append("|---|---|---|")
+        names = {"raised_cap": "上限高于默认", "retry_after_failure": "UNKNOWN/超时后重派"}
+        for flag in report["budget_flags"]:
+            lines.append(f"| `{flag['task']}` | {names.get(flag['kind'], flag['kind'])} | {flag['detail']} |")
 
     lines.append("")
     lines.append("#### 🛠️ Makewand 针对性优化研判与建议：")

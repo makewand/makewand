@@ -360,6 +360,15 @@ class OutcomeLedger:
         if set(details) - {"review_validated", "candidate_approved", "caller", "request_id", "candidate_hash", "failure_kind"}:
             raise TypeError("unsupported outcome metadata")
         row.update(_outcome_details(dict(row, **details)))
+        # Only new explicit approvals have this gate. Keep legacy records
+        # readable so inspection does not erase their missing metadata.
+        if row.get("candidate_approved") is True:
+            if row.get("review_validated") is not True or not row["passed"]:
+                raise ValueError("candidate approval requires validated review work")
+            if row["seconds"] is None or row["calls"] is None:
+                raise ValueError("candidate approval requires measured seconds and actual calls")
+            if not row.get("candidate_hash"):
+                raise ValueError("candidate approval requires --candidate-hash (candidate_hash)")
         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
         self._ensure_dir()
         if not _O_NOFOLLOW and os.path.islink(self.outcomes_path):
@@ -380,6 +389,9 @@ class OutcomeLedger:
                         details = dict(details, request_id=inferred)
                         row.update(_outcome_details(dict(row, **details)))
                         payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                if row.get("candidate_approved") is True and not row.get("request_id"):
+                    raise ValueError("candidate approval requires --request-id or MAKEWAND_TASK_ID "
+                                     "(request_id); no unique dispatched call could be linked")
                 # A truncated tail line without a trailing newline (crash
                 # mid-append, hand-truncated file) must not swallow this
                 # record: terminate that line first, under the write lock.

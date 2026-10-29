@@ -9,6 +9,7 @@ probe mutex from py-reliability#3.
 """
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -50,6 +51,8 @@ class _IsolatedStatus(unittest.TestCase):
             patch.object(health, "STATUS_CACHE_FILE", self.status_file),
             patch.object(health, "LEGACY_TRIO_CACHE", root / "nolegacy" / "trio.json"),
             patch.object(usage, "USAGE_WINDOW_FILE", root / "usage_window.json"),
+            # Dispatch evidence and the UNKNOWN stderr log stay out of the user's cache.
+            patch.dict(os.environ, {"MAKEWAND_EXECUTION_EVIDENCE_DIR": str(root / "cache" / "execution-evidence")}),
         ]
         for p in patches:
             p.start()

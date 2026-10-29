@@ -5,8 +5,10 @@ import re
 
 MODULES = ["test_native_windows", "test_native_windows_pipeline", "test_native_delivery",
            "test_candidate_recovery", "test_windows_runtime_regression", "test_provider_startup_preflight",
-           "test_shared_capacity"]
+           "test_shared_capacity", "test_cli_failure_log", "test_budget_watch", "test_diagnostics_closeout"]
 WINDOWS_SKIPS = {
+    "test_cli_failure_log.CliFailureLogTest.test_existing_wider_log_is_tightened": "POSIX permission bits",
+    "test_cli_failure_log.CliFailureLogTest.test_non_regular_log_is_skipped_without_blocking": "needs FIFOs",
     "test_shared_capacity.SharedCapacityTests.test_dead_owner_does_not_release_live_worker": "Linux process identity required",
     "test_provider_startup_preflight.PrivateHomeFallbackTests.test_existing_unwritable_runtime_uses_writable_private_cache": "needs POSIX permission enforcement for a normal user",
     "test_provider_startup_preflight.PrivateHomeFallbackTests.test_symlinked_runtime_base_is_not_used": "POSIX symlink fixture",

@@ -204,6 +204,10 @@ makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
 
 `mark <工具> <时长>` 的时长为 d/h/m/s 组合（如 `6h`、`93h17m`、`2d`，最长 365 天），`--reason` 可选。`outcome <工具> <档> <类型> pass|fail` 可附 `--model`、`--effort`、`--seconds`、`--calls`。标记与成绩保存在 makewand 私有状态目录的 `routing/` 下（`MAKEWAND_ROUTING_DIR` 可改）。三个命令都不调用模型；在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
 
+记录成绩时沿用派发的 `--request-id` 和发起工具 `--caller`（或继承 `MAKEWAND_TASK_ID` / `MAKEWAND_CALLER`）。新 shell 未携带请求 ID 时，只在同项目、同提供者和模型下存在唯一近期未验收调用时自动关联；歧义不会靠猜测消除。审查工作的 `pass|fail` 与候选裁决分开：用 `--candidate-verdict pass|fail|unverified`、实测 `--seconds` 和实际 `--calls` 记录裁决；新批准还必须有 `--candidate-hash <完整候选的SHA256>` 和可关联的请求 ID。缺这些数据时仍可仅记录工作质量，不能记为候选批准。旧记录保持可读，不补写未知的 ID 或哈希。
+
+`makewand observe` 会提示超过默认上限的请求及 UNKNOWN/超时后的后续调用，供核对授权；这些提示本身不证明违规。未分类 CLI 失败的脱敏诊断保存在用户缓存 `makewand/unclassified-cli-failures.jsonl`：仅保留已知 CLI 自身独立 stderr 的末尾，不收集模型回答或 Codex 会话内容，文件有容量上限；诊断写入失败不影响调用结果。
+
 ### 10. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
 
 Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / 守护进程）之间保证双向无缝映射与透明别名支持：

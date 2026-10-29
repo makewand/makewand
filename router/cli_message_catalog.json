@@ -208,7 +208,8 @@
       },
       "kinds": {
         "quota": [
-          "usage limit reached \\(http \\d{3} · attempt \\d+\\)"
+          "usage limit reached \\(http \\d{3} · attempt \\d+\\)",
+          "agent loop failed: model failed: api error 429 \\[request_id=[0-9a-f-]{36}\\]: subscription quota exhausted\\."
         ],
         "rate": [
           "rate limited \\(http \\d{3} · attempt \\d+\\)",
