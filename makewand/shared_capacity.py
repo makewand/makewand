@@ -154,24 +154,25 @@ def validate(state):
             raise ValueError("invalid capacity limits")
 
 
-def _live(lease, completed=False):
+def _live(lease, completed=False, now=None):
     # Keep precisely the existing account-lease recovery rule: time alone
     # never releases an owner, a child process, or an unobservable process.
     stopped = completed and not lease["launch_pending"]
     return not ((not account_leases.alive(lease["owner"]) or stopped)
                 and not account_leases.workers_alive(lease)
-                and lease["expires_at"] <= time.time())
+                and lease["expires_at"] <= (time.time() if now is None else now))
 
 
 def _source_rows(value):
     from makewand.call_budget import _validate
     data = _read(value)
     _validate(data)  # do not compact: completed rows prove safe settlement
+    now = layered_budget.effective_clock(data)
     attempts = {row["id"]: row for row in data["attempts"]}
     rows = {}
     for identifier, lease in data.get("leases", {}).items():
         entry = attempts.get(identifier, {})
-        if not _live(lease, entry.get("status") == "completed"):
+        if not _live(lease, entry.get("status") == "completed", now):
             attempts.setdefault(identifier, {})["_capacity_reaped"] = True
             continue
         project_id = entry.get("capacity_project")
@@ -186,7 +187,7 @@ def _source_rows(value):
                             "task_id": entry.get("task_id"), "started_at": started,
                             "lease": copy.deepcopy(lease),
                             "limits": [data.get("lease_limits", {}).get(k, 2**63 - 1) for k in lease["keys"]]}
-    return rows, attempts
+    return rows, attempts, now
 
 
 def refresh(state, selected):
@@ -195,15 +196,20 @@ def refresh(state, selected):
     for value in sorted({str(Path(path).expanduser().resolve()) for path in paths}):
         previous = {row["attempt"]: row for row in state["active"].values() if row["kind"] == "model" and row["ledger"] == value}
         try:
-            rows, attempts = _source_rows(value)
+            rows, attempts, now = _source_rows(value)
         except (OSError, ValueError, RuntimeError):
             # Never turn an unreadable active source into a free slot.
             continue
         for identifier, old in previous.items():
             if identifier in rows:
                 continue
-            settled = attempts.get(identifier, {}).get("status") in ("completed", "released")
-            if settled or attempts.get(identifier, {}).get("_capacity_reaped"):
+            entry = attempts.get(identifier, {})
+            settled = entry.get("status") in ("completed", "released")
+            # Old binaries removed dead leases without recording reaping.
+            # Require the original attempt AND death/expiry of the cached
+            # lifecycle; missing/reset/unreadable sources alone prove nothing.
+            legacy_reaped = identifier in attempts and not _live(old["lease"], now=now)
+            if settled or entry.get("lease_reaped") is True or entry.get("_capacity_reaped") or legacy_reaped:
                 state["active"].pop(old["id"], None)
         for row in rows.values():
             state["active"][row["id"]] = row
@@ -270,7 +276,7 @@ class Gate:
     def commit(self, value, attempt):
         if attempt is None:
             raise ValueError("host capacity requires a model call ledger")
-        rows, _ = _source_rows(str(value))
+        rows, _, _ = _source_rows(str(value))
         row = rows.get(attempt)
         if row is None:
             raise ValueError("admitted model call has no capacity lease")
@@ -370,6 +376,18 @@ def relocation(current_policy, engine, value, attempt):
 
 
 def tool_update(action, pid=None, identifier=None):
+    from makewand.call_budget import BudgetError, BudgetConfigError
+    try:
+        _tool_update(action, pid, identifier)
+    except BudgetError:
+        raise
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+        # Lifecycle failures must reach the trusted entry points as a known
+        # unavailable result, including errors raised during final settlement.
+        raise BudgetConfigError(f"cannot update local tool capacity: {error}") from error
+
+
+def _tool_update(action, pid=None, identifier=None):
     identifier = identifier or _tool.get()
     if identifier is None:
         return

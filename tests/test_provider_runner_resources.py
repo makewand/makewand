@@ -29,6 +29,30 @@ class ProviderRunnerResourceTests(unittest.TestCase):
         return base.run_subprocess([sys.executable, "-I", "-c", script],
                                    cwd=self.directory.name, **options)
 
+    def test_stopped_lease_failure_still_closes_child_pipes(self):
+        from makewand.call_budget import BudgetConfigError
+        from makewand import execution_runtime
+        processes = []
+        original = base.subprocess.Popen
+
+        def start(*args, **kwargs):
+            proc = original(*args, **kwargs)
+            processes.append(proc)
+            return proc
+
+        def lease(action, pid=None):
+            if action == "stopped":
+                raise BudgetConfigError("capacity state lost")
+
+        with patch.object(base.subprocess, "Popen", side_effect=start), \
+                patch.object(execution_runtime, "provider_process_lease", side_effect=lease):
+            with self.assertRaises(BudgetConfigError):
+                self.run_child("print('done')", timeout=2)
+        self.assertTrue(processes)
+        for proc in processes:
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(all(pipe is None or pipe.closed for pipe in (proc.stdin, proc.stdout, proc.stderr)))
+
     def assert_not_running(self, pid):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:

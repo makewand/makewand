@@ -328,6 +328,104 @@ class SharedCapacityTests(unittest.TestCase):
         finally:
             self.finish("ledger", first)
 
+    def dead_owner(self):
+        owner = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(20)"])
+        try:
+            return capacity.account_leases.process_ref(owner.pid)
+        finally:
+            owner.kill()
+            owner.wait(timeout=5)
+
+    def test_legacy_reaper_missing_lease_recovers_only_dead_cached_owner(self):
+        a = self.reserve("a", "codex")
+        source = self.root / "a.json"
+        data = json.loads(source.read_text())
+        data["leases"].pop(a)
+        source.write_text(json.dumps(data))  # legacy reaper leaves attempt charged
+        with capacity.locked() as (path, state):
+            row = next(row for row in state["active"].values() if row["attempt"] == a)
+            row["lease"]["expires_at"] = 0
+            capacity.refresh(state, str(source))
+            self.assertIn(row["id"], state["active"], "live owner was released")
+            row["lease"]["owner"] = self.dead_owner()
+            row["lease"]["workers"] = [capacity.account_leases.process_ref(os.getpid())]
+            capacity.refresh(state, str(source))
+            self.assertIn(row["id"], state["active"], "live worker was released")
+            row["lease"]["workers"] = []
+            entries = data["attempts"]
+            data["attempts"] = []
+            source.write_text(json.dumps(data))
+            capacity.refresh(state, str(source))
+            self.assertIn(row["id"], state["active"], "reset source freed an unproven slot")
+            data["attempts"] = entries
+            source.write_text(json.dumps(data))
+            capacity.refresh(state, str(source))
+            self.assertNotIn(row["id"], state["active"], "dead legacy slot never recovered")
+            capacity.save(path, state)
+        self.assertEqual(data["attempts"][0]["status"], "started")
+        self.assertEqual(data["scopes"]["tasks"]["a"]["used"], 1)
+        b = self.reserve("b", "codex")
+        self.finish("b", b)
+
+    def test_dead_source_lease_uses_original_ledger_clock(self):
+        a = self.reserve("a", "codex")
+        source = self.root / "a.json"
+        data = json.loads(source.read_text())
+        now = time.time()
+        data["scopes"]["clock"] = now + 10
+        data["leases"][a].update(owner=self.dead_owner(), expires_at=now + 5)
+        source.write_text(json.dumps(data))
+        with capacity.locked() as (path, state):
+            capacity.refresh(state, str(source))
+            self.assertFalse(any(row["attempt"] == a for row in state["active"].values()))
+
+    def test_reaper_records_death_without_refunding_call(self):
+        a = self.reserve("a", "codex")
+        data = json.loads((self.root / "a.json").read_text())
+        data["leases"][a].update(owner=self.dead_owner(), expires_at=0)
+        capacity.account_leases.admission(data, "agy", None, capacity.policy())
+        self.assertNotIn(a, data["leases"])
+        self.assertIs(data["attempts"][0].get("lease_reaped"), True)
+        self.assertEqual(data["attempts"][0]["status"], "started")
+        self.assertEqual(data["scopes"]["tasks"]["a"]["used"], 1)
+        (self.root / "a.json").write_text(json.dumps(data))
+        with capacity.locked() as (path, state):
+            capacity.refresh(state, str(self.root / "a.json"))
+            self.assertFalse(any(row["attempt"] == a for row in state["active"].values()))
+            capacity.save(path, state)
+
+    def test_tool_state_loss_reports_unavailable_instead_of_raising(self):
+        from makewand import orchestrator
+        state_path = self.root / capacity.STATE_NAME
+        for damage in ("delete", "reset", "corrupt"):
+            def damage_state(*args, **kwargs):
+                if damage == "delete":
+                    state_path.unlink()
+                elif damage == "reset":
+                    state_path.write_text('{"schema":1,"active":{},"queue":[]}')
+                else:
+                    state_path.write_text('{broken')
+                return True, None
+
+            for entrypoint in ("tests", "sandbox"):
+                with self.subTest(damage=damage, entrypoint=entrypoint):
+                    state_path.unlink(missing_ok=True)
+                    with patch.object(capacity, "tool_memory_available", return_value=True):
+                        if entrypoint == "tests":
+                            with patch.object(orchestrator, "_run_local_tests", side_effect=damage_state):
+                                passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
+                            self.assertFalse(passed)
+                            self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
+                        else:
+                            @capacity.controlled_tool
+                            def command(timeout=2):
+                                damage_state()
+                                return 0, "ok", "", None
+                            result = command()
+                            self.assertEqual(result[0], -1)
+                            self.assertEqual(result[3], "LocalCapacityUnavailable")
+                    self.assertIsNone(capacity._tool.get())
+
 
 if __name__ == "__main__":
     unittest.main()

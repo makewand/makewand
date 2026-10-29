@@ -142,20 +142,23 @@ func admitLeaseWithPolicy(data map[string]any, engine string, account *string, p
 		data["leases"] = leases
 	}
 	now := leaseClock(data)
-	completed := map[string]bool{}
-	if attempts, ok := data["attempts"].([]any); ok {
-		for _, raw := range attempts {
+	attempts := map[string]map[string]any{}
+	if entries, ok := data["attempts"].([]any); ok {
+		for _, raw := range entries {
 			e := raw.(map[string]any)
-			if e["status"] == "completed" {
-				completed[e["id"].(string)] = true
-			}
+			attempts[e["id"].(string)] = e
 		}
 	}
 	for id, raw := range leases {
 		l := raw.(map[string]any)
 		expires, _ := l["expires_at"].(json.Number).Float64()
-		stoppedAttempt := completed[id] && !l["launch_pending"].(bool)
+		stoppedAttempt := attempts[id]["status"] == "completed" && !l["launch_pending"].(bool)
 		if expires <= now && (stoppedAttempt || !leaseProcessAlive(l["owner"].(map[string]any), false)) && !leaseWorkersAlive(l) {
+			// Reaping frees capacity, never the charged attempt. Keep positive
+			// recovery evidence after this lease disappears from its source.
+			if entry := attempts[id]; entry != nil {
+				entry["lease_reaped"] = true
+			}
 			delete(leases, id)
 		}
 	}

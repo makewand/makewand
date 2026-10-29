@@ -100,11 +100,15 @@ def admission(data, engine, account, capacity_policy=None):
     leases = data.setdefault("leases", {})
     # A persisted clock far ahead of real time would keep a dead owner's lease unexpired.
     now = effective_clock(data)
-    completed = {entry["id"] for entry in data.get("attempts", []) if entry.get("status") == "completed"}
+    attempts = {entry["id"]: entry for entry in data.get("attempts", [])}
     for identifier, lease in list(leases.items()):
         owner_alive = alive(lease["owner"])
-        stopped_attempt = identifier in completed and not lease["launch_pending"]
+        stopped_attempt = attempts.get(identifier, {}).get("status") == "completed" and not lease["launch_pending"]
         if (not owner_alive or stopped_attempt) and not workers_alive(lease) and lease["expires_at"] <= now:
+            if identifier in attempts:
+                # Preserve proof for shared caches after the lease itself is
+                # gone. Recovery never changes status or refunds a model call.
+                attempts[identifier]["lease_reaped"] = True
             del leases[identifier]
     limits = data.setdefault("lease_limits", {})
     # Compaction ran before admission reaped dead leases. Drop their unreferenced

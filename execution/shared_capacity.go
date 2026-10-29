@@ -228,41 +228,46 @@ func capacityLimits(engine string, policy *hostCapacityPolicy) ([]int, error) {
 }
 
 func capacityLive(lease map[string]any, completed bool) bool {
-	expires, _ := lease["expires_at"].(json.Number).Float64()
-	stopped := completed && !lease["launch_pending"].(bool)
-	return !((!leaseProcessAlive(lease["owner"].(map[string]any), false) || stopped) && !leaseWorkersAlive(lease) && expires <= float64(time.Now().UnixNano())/1e9)
+	return capacityLiveAt(lease, completed, float64(time.Now().UnixNano())/1e9)
 }
 
-func capacitySource(value string) (map[string]*capacityEntry, map[string]map[string]any, error) {
+func capacityLiveAt(lease map[string]any, completed bool, now float64) bool {
+	expires, _ := lease["expires_at"].(json.Number).Float64()
+	stopped := completed && !lease["launch_pending"].(bool)
+	return !((!leaseProcessAlive(lease["owner"].(map[string]any), false) || stopped) && !leaseWorkersAlive(lease) && expires <= now)
+}
+
+func capacitySource(value string) (map[string]*capacityEntry, map[string]map[string]any, float64, error) {
 	var data map[string]any
 	if err := readCapacityFile(value, &data); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	if err := validateLeases(data); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	entries, ok := data["attempts"].([]any)
 	if !ok {
-		return nil, nil, fmt.Errorf("invalid capacity source attempts")
+		return nil, nil, 0, fmt.Errorf("invalid capacity source attempts")
 	}
 	attempts := map[string]map[string]any{}
 	for _, raw := range entries {
 		entry, ok := raw.(map[string]any)
 		if !ok {
-			return nil, nil, fmt.Errorf("invalid capacity source attempt")
+			return nil, nil, 0, fmt.Errorf("invalid capacity source attempt")
 		}
 		id, ok := entry["id"].(string)
 		if !ok || id == "" || attempts[id] != nil {
-			return nil, nil, fmt.Errorf("invalid capacity source identity")
+			return nil, nil, 0, fmt.Errorf("invalid capacity source identity")
 		}
 		attempts[id] = entry
 	}
 	rows := map[string]*capacityEntry{}
+	now := leaseClock(data)
 	leases, _ := data["leases"].(map[string]any)
 	for identifier, raw := range leases {
 		lease := raw.(map[string]any)
 		entry := attempts[identifier]
-		if !capacityLive(lease, entry["status"] == "completed") {
+		if !capacityLiveAt(lease, entry["status"] == "completed", now) {
 			if entry == nil {
 				entry = map[string]any{}
 				attempts[identifier] = entry
@@ -301,7 +306,7 @@ func capacitySource(value string) (map[string]*capacityEntry, map[string]map[str
 		hash := sha256.Sum256([]byte(value + "\x00" + identifier))
 		rows[identifier] = &capacityEntry{ID: hex.EncodeToString(hash[:]), Kind: "model", Ledger: value, Attempt: identifier, Project: project, Label: label, TaskID: taskID, StartedAt: started, Limits: limits, Lease: lease}
 	}
-	return rows, attempts, nil
+	return rows, attempts, now, nil
 }
 
 func validateCapacityState(state *sharedCapacityState) error {
@@ -367,7 +372,7 @@ func refreshCapacity(state *sharedCapacityState, selected string) {
 		if err != nil {
 			continue
 		}
-		rows, attempts, err := capacitySource(value)
+		rows, attempts, now, err := capacitySource(value)
 		if err != nil {
 			continue // an unreadable active source never creates free capacity
 		}
@@ -375,8 +380,13 @@ func refreshCapacity(state *sharedCapacityState, selected string) {
 			if old.Kind != "model" || old.Ledger != value || rows[old.Attempt] != nil {
 				continue
 			}
-			status := attempts[old.Attempt]["status"]
-			if status == "completed" || status == "released" || attempts[old.Attempt]["_capacity_reaped"] == true {
+			entry := attempts[old.Attempt]
+			status := entry["status"]
+			// Old reapers left no marker. An existing original attempt plus a
+			// provably dead, expired cached lifecycle allows recovery; a reset
+			// or missing source/attempt still retains the cached slot.
+			legacyReaped := entry != nil && !capacityLiveAt(old.Lease, false, now)
+			if status == "completed" || status == "released" || entry["lease_reaped"] == true || entry["_capacity_reaped"] == true || legacyReaped {
 				delete(state.Active, key)
 			}
 		}
@@ -564,7 +574,7 @@ func withSharedCapacity(ctx context.Context, policy *hostCapacityPolicy, cfg Con
 		if err := fn(&sharedCapacityGate{Project: project, Label: label, Policy: policy}); err != nil {
 			return err
 		}
-		rows, _, err := capacitySource(cfg.LedgerPath)
+		rows, _, _, err := capacitySource(cfg.LedgerPath)
 		if err != nil {
 			return err
 		}

@@ -232,7 +232,7 @@ func TestSharedCapacitySourceMissingStartedTimeKeepsLiveSlot(t *testing.T) {
 			if err := os.WriteFile(path, raw, 0600); err != nil {
 				t.Fatal(err)
 			}
-			rows, _, err := capacitySource(path)
+			rows, _, _, err := capacitySource(path)
 			if err != nil || rows["live"] == nil || rows["live"].StartedAt != 0 {
 				t.Fatalf("lost legacy live lease: %v %v", rows, err)
 			}
@@ -336,4 +336,101 @@ func TestSharedCapacityTildeConfigImportsLegacyDefaultLedger(t *testing.T) {
 	if !errors.Is(err, ErrConcurrencyBusy) {
 		t.Fatal("legacy default ledger was not imported", err)
 	}
+}
+
+func TestSharedCapacityRecoveryAfterLegacyReaper(t *testing.T) {
+	root := sharedCapacityFixture(t, 3)
+	owner := pythonCommand(t, "import time;time.sleep(20)")
+	if err := owner.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadOwner := leaseProcessRef(owner.Process.Pid)
+	if err := owner.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = owner.Wait()
+	path := filepath.Join(root, "crashed.json")
+	now := float64(time.Now().UnixNano()) / 1e9
+	data := map[string]any{"schema": 1, "maximum": 3,
+		"attempts": []any{map[string]any{"id": "crashed", "status": "started"}},
+		"leases": map[string]any{"crashed": map[string]any{"keys": []any{"codex:provider", "codex:unknown", "codex:unknown:subscription"},
+			"owner": deadOwner, "workers": []any{}, "launch_pending": false, "expires_at": now + 30}}}
+	write := func() {
+		t.Helper()
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	rows, _, _, err := capacitySource(path)
+	if err != nil || rows["crashed"] == nil {
+		t.Fatalf("cache fixture: %v %v", rows, err)
+	}
+	row := rows["crashed"]
+	state := &sharedCapacityState{Schema: 1, Active: map[string]*capacityEntry{row.ID: row}}
+	delete(data["leases"].(map[string]any), "crashed")
+	write() // old reapers remove the lease but keep the charged attempt
+	row.Lease["expires_at"] = json.Number("0")
+	row.Lease["owner"] = leaseProcessRef(os.Getpid())
+	refreshCapacity(state, path)
+	if state.Active[row.ID] == nil {
+		t.Fatal("released live cached owner")
+	}
+	row.Lease["owner"] = deadOwner
+	row.Lease["workers"] = []any{leaseProcessRef(os.Getpid())}
+	refreshCapacity(state, path)
+	if state.Active[row.ID] == nil {
+		t.Fatal("released live cached worker")
+	}
+	row.Lease["workers"] = []any{}
+	entries := data["attempts"]
+	data["attempts"] = []any{}
+	write()
+	refreshCapacity(state, path)
+	if state.Active[row.ID] == nil {
+		t.Fatal("reset source released an unproven cached slot")
+	}
+	data["attempts"] = entries
+	write()
+	refreshCapacity(state, path)
+	if state.Active[row.ID] != nil {
+		t.Fatal("dead cached slot survived legacy reaping")
+	}
+
+	t.Run("source clock", func(t *testing.T) {
+		data["leases"] = map[string]any{"crashed": row.Lease}
+		row.Lease["expires_at"] = now + 5
+		data["scopes"] = map[string]any{"clock": now + 10}
+		write()
+		rows, _, _, err := capacitySource(path)
+		if err != nil || len(rows) != 0 {
+			t.Fatalf("source and reaper clock disagree: %v %v", rows, err)
+		}
+	})
+
+	t.Run("persistent reaping evidence", func(t *testing.T) {
+		if err := readCapacityFile(path, &data); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := admitLease(data, "agy", nil); err != nil {
+			t.Fatal(err)
+		}
+		entry := data["attempts"].([]any)[0].(map[string]any)
+		if entry["lease_reaped"] != true || entry["status"] != "started" {
+			t.Fatalf("lost recovery evidence or refunded call: %v", entry)
+		}
+		write()
+		// The positive source marker also settles an older cache snapshot.
+		row.Lease["owner"] = leaseProcessRef(os.Getpid())
+		row.Lease["expires_at"] = json.Number(fmt.Sprint(now + 30))
+		state.Active[row.ID] = row
+		refreshCapacity(state, path)
+		if state.Active[row.ID] != nil {
+			t.Fatal("source reaping evidence did not settle cached slot")
+		}
+	})
 }

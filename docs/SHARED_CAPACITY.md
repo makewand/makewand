@@ -35,6 +35,12 @@ is positive settlement evidence. Never delete or edit these files to clear a
 busy provider. The existing ledger registry imports visible legacy leases;
 already-running old binaries cannot participate in the new admission protocol.
 Let them finish and use the updated CLI for subsequent calls.
+Dead-lease reapers preserve `lease_reaped: true` on the original charged
+attempt, so a later refresh can remove its cached slot even after the source
+lease is gone. For older reapers without that marker, recovery requires the
+original attempt to remain present and the cached owner and all known workers
+to be provably dead after expiry. Source checks use the same bounded effective
+clock as ledger admission. Recovery never refunds or rewrites the call result.
 
 Model queues prefer projects that have waited since a less recent admission, keeping
 FIFO order within equally served projects. A blocked provider does not block
@@ -55,6 +61,10 @@ resource launcher to be available. This does not control arbitrary Bash,
 official CLI tool execution outside these entry points, already-running tools,
 or old Go binaries. No provider sandbox receives writable coordinator files or
 a wider worker-command whitelist.
+If a tool's coordinator state disappears or becomes invalid during cleanup,
+the trusted entry point reports validation as unavailable. Child teardown and
+pipe cleanup still complete; successful command output alone cannot turn that
+coordination failure into a passed validation.
 
 Absent a policy file, existing library behaviour and limits are preserved.
 Environment concurrency limits can tighten an enabled policy. Persisted lower

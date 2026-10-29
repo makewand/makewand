@@ -92,6 +92,30 @@ def run_windows(cmd, **kwargs):
 
 
 class TestWindowsRunnerCapturesStderrApart(unittest.TestCase):
+    def test_stopped_lease_failure_still_closes_child_pipes(self):
+        from makewand.call_budget import BudgetConfigError
+        from makewand import execution_runtime
+        processes = []
+        original = subprocess.Popen
+
+        def start(*args, **kwargs):
+            proc = original(*args, **kwargs)
+            processes.append(proc)
+            return proc
+
+        def lease(action, pid=None):
+            if action == "stopped":
+                raise BudgetConfigError("capacity state lost")
+
+        with patch.object(subprocess, "Popen", side_effect=start), \
+                patch.object(execution_runtime, "provider_process_lease", side_effect=lease):
+            with self.assertRaises(BudgetConfigError):
+                run_windows(cli_script("done", ""))
+        self.assertTrue(processes)
+        for proc in processes:
+            self.assertIsNotNone(proc.poll())
+            self.assertTrue(all(pipe is None or pipe.closed for pipe in (proc.stdin, proc.stdout, proc.stderr)))
+
     def test_windows_branch_preserves_worker_and_proxy_environment(self):
         import json
         extra = {"MAKEWAND_PROVIDER_WORKER": "1", "HTTP_PROXY": "http://fixture:8181",
