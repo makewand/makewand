@@ -26,6 +26,12 @@ from makewand.pacing import (
 
 
 class TestDynamicQuotaPacing(unittest.TestCase):
+    def official_quota(self, percentage, reset):
+        return patch("makewand.health._get_official_subscription_quota", return_value={
+            "source": "official", "status": "healthy", "percentage": percentage,
+            "resets_at": reset, "window_minutes": 10080, "desc": "bound official fixture",
+            "reserve_percent": 8, "reserve_error": None})
+
     def test_parse_reset_time_to_seconds_left(self):
         # 1. ISO format future
         future_dt = datetime.now() + timedelta(hours=5, minutes=30)
@@ -67,7 +73,8 @@ class TestDynamicQuotaPacing(unittest.TestCase):
             "reason": "40% remaining",
             "resets_at": reset_time
         }
-        p = calculate_dynamic_pacing("codex", info)
+        with self.official_quota(40, reset_time):
+            p = calculate_dynamic_pacing("codex", info)
         self.assertEqual(p["pacing_state"], PACING_HARVEST)
         self.assertEqual(p["recommended_tier"], "deep")
         self.assertEqual(p["recommended_effort"], "max")
@@ -82,7 +89,8 @@ class TestDynamicQuotaPacing(unittest.TestCase):
             "reason": "90% remaining",
             "resets_at": reset_time
         }
-        p = calculate_dynamic_pacing("claude", info)
+        with self.official_quota(90, reset_time):
+            p = calculate_dynamic_pacing("claude", info)
         self.assertEqual(p["pacing_state"], PACING_UNDER_BURNED)
         self.assertEqual(p["recommended_tier"], "deep")
         self.assertGreater(p["routing_boost"], 1.5)
@@ -96,7 +104,8 @@ class TestDynamicQuotaPacing(unittest.TestCase):
             "reason": "30% remaining",
             "resets_at": reset_time
         }
-        p = calculate_dynamic_pacing("claude", info)
+        with self.official_quota(30, reset_time):
+            p = calculate_dynamic_pacing("claude", info)
         self.assertEqual(p["pacing_state"], PACING_OVER_BURNED)
         self.assertEqual(p["recommended_tier"], "fast")
         self.assertEqual(p["recommended_effort"], "low")
@@ -112,7 +121,8 @@ class TestDynamicQuotaPacing(unittest.TestCase):
                 "resets_at": reset_time
             }
         }
-        tier, model, effort = resolve_dynamic_tier_and_effort("codex", requested_tier="auto", cache=cache)
+        with self.official_quota(95, reset_time):
+            tier, model, effort = resolve_dynamic_tier_and_effort("codex", requested_tier="auto", cache=cache)
         self.assertEqual(tier, "deep")
         self.assertIn("astra", model.lower())
 

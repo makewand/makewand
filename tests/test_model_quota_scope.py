@@ -154,6 +154,17 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertIsNone(result["percentage"])
         self.assertEqual(result["source"], "unknown")
 
+    def test_unbound_percentage_text_never_becomes_current_official_quota(self):
+        from makewand.pacing import calculate_dynamic_pacing, PACING_LIMITED
+        info = {"status": "healthy", "reason": "old account: 0% left", "resets_at": self.reset,
+                "updated_at": datetime.now().isoformat()}
+        for provider in ("codex", "claude", "grok", "muse"):
+            with self.subTest(provider=provider):
+                quota = health.calculate_provider_quota(provider, info)
+                self.assertEqual(quota["source"], "unknown")
+                self.assertIsNone(quota["percentage"])
+                self.assertNotEqual(calculate_dynamic_pacing(provider, info)["pacing_state"], PACING_LIMITED)
+
     def quota(self, model, used, minutes=300):
         return dict(self.identity, windows=[{"model": model, "used_percent": used,
                                             "window_minutes": minutes, "pool_ref": self.identity["pool_ref"],

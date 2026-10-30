@@ -2161,20 +2161,9 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
             "is_unlimited": True,
             "source": "not_applicable",
         }
-    elif reason and re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE):
-        pct_match = re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE)
-        pct = int(pct_match.group(1))
-        res = {
-            "percentage": max(0, min(100, pct)),
-            "status": _quota_status(pct, reserve, healthy_at=20, inclusive=False),
-            **_quota_reserve_metadata(reserve, reserve_error),
-            "desc": _quota_reserve_description(f"官方报告剩余额度: {pct}%", reserve, reserve_error),
-            "resets_at": resets_at,
-            "is_unlimited": False,
-            "source": "official",
-        }
     else:
-        # Check official snapshot/session quota before falling back to local counter estimate
+        # A percentage in an unbound health reason is history, not proof of
+        # the selected account/model's current quota.
         official_quota = _get_official_subscription_quota(provider, resets_at=resets_at)
         if official_quota:
             res = official_quota

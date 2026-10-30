@@ -211,7 +211,10 @@ class DispatchCase(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result = getattr(module, f"execute_{engine}_task")("review this", cwd=self._tmp.name, readonly=True,
                                                                stream=stream)
-        status = health.load_status_cache().get(engine, {}).get("status")
+        from makewand.model_quota import projected_status
+        from makewand.discovery import get_provider_model_tier
+        status = projected_status(engine, health.load_status_cache().get(engine, {}),
+                                  get_provider_model_tier(engine)["model"]).get("status")
         if health.STATUS_CACHE_FILE.exists():
             health.STATUS_CACHE_FILE.unlink()
         return result, status

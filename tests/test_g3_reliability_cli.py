@@ -128,9 +128,10 @@ class TestQuotaHonesty(_CliCase):
         data = json.loads(out)
         self.assertEqual(data["engine"], "python")
         self.assertIn("不是官方", data["quota_semantics"])
-        self.assertEqual(data["providers"]["claude"]["quota"]["source"], "local_estimate")
-        self.assertEqual(data["providers"]["codex"]["quota"]["source"], "official")
-        self.assertEqual(data["providers"]["codex"]["quota"]["percentage"], 42)
+        self.assertEqual(data["providers"]["claude"]["quota"]["source"], "unknown")
+        self.assertIsNone(data["providers"]["claude"]["quota"]["percentage"])
+        self.assertEqual(data["providers"]["codex"]["quota"]["source"], "unknown")
+        self.assertIsNone(data["providers"]["codex"]["quota"]["percentage"], "bare health text has no account/window binding")
         self.assertIsNone(data["providers"]["grok"]["quota"]["percentage"], "never probed is not 0%")
         self.assertIn("muse login", data["providers"]["muse"]["quota"]["desc"])
 
@@ -141,7 +142,7 @@ class TestQuotaHonesty(_CliCase):
              patch("makewand.cli.select_optimal_engine_pair", return_value=(["claude"], ["muse"], {})):
             code, out, _ = self.run_main("status")
         self.assertEqual(code, 0)
-        self.assertIn("本地调用计数估算", out)
+        self.assertIn("本地调用计数仅用于削峰", out)
         self.assertIn("不是官方剩余配额", out)
         self.assertNotIn("剩余额度:", out)
         self.assertIn("muse login", out)
