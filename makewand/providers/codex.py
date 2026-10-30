@@ -127,8 +127,9 @@ def execute_codex_task(
     if cache.get("codex", {}).get("status") == "limited":
         if relay.available:
             return relay("[Makewand -> Codex] 订阅配额已耗尽，无缝自动降级为 OpenAI API 模式接力执行...", cwd=cwd)
-        return False, None, relay.unavailable(f"Codex CLI 当前额度受限: {cache['codex'].get('reason')}",
-                                     "可配置 OPENAI_API_KEY 作为备用 API 自动接力")
+        from makewand.model_quota import refuse_before_launch
+        return refuse_before_launch(relay.unavailable(f"Codex CLI 当前额度受限: {cache['codex'].get('reason')}",
+                                     "可配置 OPENAI_API_KEY 作为备用 API 自动接力"))
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -170,6 +171,11 @@ def execute_codex_task(
         input_text = prompt
     else:
         cmd.append(prompt)
+
+    from makewand.model_quota import before_cli_launch
+    quota_refusal = before_cli_launch('codex', target_model)
+    if quota_refusal is not None:
+        return quota_refusal
 
     from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
     from makewand.execution_runtime import mark_provider_invocation
@@ -230,7 +236,7 @@ def execute_codex_task(
 
     is_limited, reason, resets = parse_codex_quota(out, err if apart else None, prompt=prompt)
     if is_limited:
-        record_engine_limit("codex", reason, resets)
+        record_engine_limit("codex", reason, resets, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Codex] 订阅触发限流 ({reason})，无缝切换为 OpenAI API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Codex CLI 执行中触发额度限制: {reason}", "可配置 OPENAI_API_KEY 实现自动接力")

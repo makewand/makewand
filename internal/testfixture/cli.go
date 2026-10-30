@@ -151,6 +151,51 @@ func run(spec Spec, args []string) int {
 		}
 	}
 	switch spec.Mode {
+	case "codex-quota":
+		if len(args) == 1 && args[0] == "--help" {
+			fmt.Fprintln(os.Stdout, "Commands:\n  app-server  Read-only metadata fixture")
+			return 0
+		}
+		if len(args) != 3 || args[0] != "app-server" || args[1] != "--listen" || args[2] != "stdio://" {
+			return 97
+		}
+		decoder, encoder := json.NewDecoder(os.Stdin), json.NewEncoder(os.Stdout)
+		for {
+			var request struct {
+				Method string `json:"method"`
+				ID     *int   `json:"id"`
+			}
+			if err := decoder.Decode(&request); err != nil {
+				return 0
+			}
+			if spec.LogDir != "" {
+				f, err := os.OpenFile(filepath.Join(spec.LogDir, "quota-methods.txt"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+				if err != nil {
+					return 94
+				}
+				_, err = fmt.Fprintln(f, request.Method)
+				_ = f.Close()
+				if err != nil {
+					return 94
+				}
+			}
+			var result any = map[string]any{}
+			switch request.Method {
+			case "initialize":
+			case "initialized":
+				continue
+			case "account/rateLimits/read":
+				result = json.RawMessage(spec.Stdout)
+				if spec.StateFile != "" && os.WriteFile(spec.StateFile, []byte(spec.FirstError), 0o600) != nil {
+					return 94
+				}
+			default:
+				return 97 // A quota test must never start a model or tool request.
+			}
+			if encoder.Encode(map[string]any{"id": request.ID, "result": result}) != nil {
+				return 94
+			}
+		}
 	case "", "output":
 		fmt.Fprint(os.Stdout, spec.Stdout)
 		fmt.Fprint(os.Stderr, spec.Stderr)

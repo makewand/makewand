@@ -86,7 +86,8 @@ def execute_grok_task(
     if cache.get("grok", {}).get("status") == "limited":
         if relay.available:
             return relay("[Makewand -> Grok] 订阅当前受限，无缝自动降级为 xAI API 模式接力执行...", cwd=cwd)
-        return False, None, relay.unavailable(f"Grok Build 当前不可用: {cache['grok'].get('reason')}", "可配置 XAI_API_KEY 作为备用 API 自动接力")
+        from makewand.model_quota import refuse_before_launch
+        return refuse_before_launch(relay.unavailable(f"Grok Build 当前不可用: {cache['grok'].get('reason')}", "可配置 XAI_API_KEY 作为备用 API 自动接力"))
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -132,6 +133,11 @@ def execute_grok_task(
         target_effort = normalize_provider_effort("grok", effort or resolved.get("effort"))
         if target_effort and target_effort != "none":
             cmd.extend(["--reasoning-effort", target_effort])
+
+        from makewand.model_quota import before_cli_launch
+        quota_refusal = before_cli_launch('grok', target_model)
+        if quota_refusal is not None:
+            return quota_refusal
 
         from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError, ProviderStartupError
         from makewand.execution_runtime import mark_provider_invocation
@@ -191,7 +197,7 @@ def execute_grok_task(
 
     is_limited, reason, resets = parse_grok_quota(out, err if apart else None)
     if is_limited:
-        record_engine_limit("grok", reason, resets)
+        record_engine_limit("grok", reason, resets, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Grok] 订阅触发限制 ({reason})，无缝切换为 xAI API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Grok Build 执行中检测到限制: {reason}", "可配置 XAI_API_KEY 实现自动接力")

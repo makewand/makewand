@@ -79,6 +79,25 @@ class DiscoveryProvenanceTests(unittest.TestCase):
             self.assertTrue(result["is_dynamic"])
             self.assertEqual(result["model"], "gpt-selected-profile")
 
+    def test_default_codex_home_cannot_borrow_secondary_profile_catalog(self):
+        self.write(".codex-2/models_cache.json", {"models": [{"slug": "gpt-secondary-profile"}]})
+        self.assertFalse(get_provider_model_tier("codex")["is_dynamic"])
+        self.assertEqual(discover_available_models()["codex"]["source"], "builtin")
+
+    def test_muse_efforts_follow_each_visible_models_catalog(self):
+        from makewand.discovery import _muse_effort_map
+        self.write(".config/muse/model-catalog/catalog.json", {"rows": [
+            {"model_id": "muse-fixture-1", "visibility": "visible",
+             "reasoning_effort_variants": [{"tier": "minimal"}, {"tier": "high"}]},
+            {"model_id": "muse-fixture-2", "visibility": "visible",
+             "reasoning_effort_variants": [{"tier": "max"}]},
+            {"model_id": "muse-hidden-fixture", "visibility": "hidden",
+             "reasoning_effort_variants": [{"tier": "max"}]}]})
+        efforts = _muse_effort_map()
+        self.assertEqual(efforts["muse-fixture-1"], ["minimal", "high"])
+        self.assertEqual(efforts["muse-fixture-2"], ["max"])
+        self.assertNotIn("muse-hidden-fixture", efforts)
+
     def test_claude_catalog_effort_comes_only_from_listed_options(self):
         self.write(".claude/cache/model-catalog/catalog.json", {"catalog": {"config": {"models": [
             {"id": "claude-fixture-9", "name": "Fixture", "thinking": {"effort_options": [{"id": "high"}]}}

@@ -153,6 +153,8 @@ def calculate_dynamic_pacing(
         if cache is None:
             cache = load_status_cache()
         info = cache.get(provider, {})
+    from makewand.model_quota import projected_status
+    info = projected_status(provider, info)
 
     quota_data = calculate_provider_quota(provider, info)
     percentage = quota_data.get("percentage")
@@ -176,7 +178,7 @@ def calculate_dynamic_pacing(
         return {
             "provider": provider,
             "pacing_state": PACING_LIMITED,
-            "quota_percentage": 0,
+            "quota_percentage": percentage,
             "recommended_tier": "fast",
             "recommended_effort": "low",
             "routing_boost": -999.0,
@@ -186,7 +188,7 @@ def calculate_dynamic_pacing(
         }
 
     # Never probed, expired failure verdict, or stale healthy verdict: neutral.
-    if status == "unknown":
+    if status == "unknown" and info.get("status") not in ("healthy", "warning"):
         return _neutral(provider, f"{provider.upper()} 状态未知 (未探测或旧状态已过期)，按中性处理；建议运行 'makewand probe'")
     if quota_data.get("stale"):
         return _neutral(provider, f"{provider.upper()} 状态缓存已超过 {STATUS_STALE_SECONDS // 3600} 小时未刷新，按中性处理；建议运行 'makewand probe'",

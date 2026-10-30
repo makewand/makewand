@@ -1004,6 +1004,10 @@ def _dispatch_failure_superseded(engine: str, info: Dict[str, Any]) -> bool:
 def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
     now_dt = datetime.now()
     for model_name, info in cache.items():
+        if isinstance(info, dict):
+            from makewand.model_quota import projected_status
+            info = projected_status(model_name, info)
+            cache[model_name] = info
         if isinstance(info, dict) and info.get("status") == "limited":
             resets_at = info.get("resets_at")
             updated_at = info.get("updated_at", "")
@@ -1016,8 +1020,10 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                     resets_at = deadline.isoformat()
                     info["resets_at"] = resets_at
             if is_reset_time_passed(resets_at, updated_at):
-                info["status"] = "healthy"
-                info["reason"] = f"已过配额重置窗口 ({resets_at})，已自动恢复待命"
+                info["status"] = "unknown"
+                info["verified"] = False
+                info["expired_from"] = "limited"
+                info["reason"] = f"已过配额重置窗口 ({resets_at})；当前额度与可用性待验证"
                 info["resets_at"] = None
                 info["updated_at"] = now_dt.isoformat()
         elif isinstance(info, dict) and info.get("status") in STATUS_TTL_SECONDS:
@@ -1156,8 +1162,20 @@ def save_status_cache(cache: Dict[str, Any]):
                     elif isinstance(v, dict):
                         disk_item = disk_data.get(k, {})
                         if isinstance(disk_item, dict):
+                            if k == "agy":
+                                from makewand.model_quota import projected_status
+                                disk_item = projected_status(k, disk_item)
+                                disk_data[k] = disk_item
+                            if "legacy_native_limit" in disk_item and "legacy_native_limit" not in v:
+                                v = dict(v, legacy_native_limit=disk_item["legacy_native_limit"])
+                            if "quota_limits" in disk_item or "quota_limits" in v:
+                                from makewand.model_quota import merge_limits
+                                limits = merge_limits(disk_item.get("quota_limits", []), v.get("quota_limits", []))
+                                disk_item["quota_limits"] = limits
+                                v = dict(v, quota_limits=limits)
                             # If incoming status is 'unknown' while disk has active status ('limited' or 'healthy'), preserve disk
-                            if v.get("status") == "unknown" and disk_item.get("status") in ("limited", "healthy"):
+                            if (v.get("status") == "unknown" and disk_item.get("status") in ("limited", "healthy")
+                                    and not v.get("quota_limits")):
                                 continue
                             # An older snapshot never overwrites a newer verdict. A disk
                             # timestamp that is no evidence of when it was written (e.g.
@@ -1221,7 +1239,7 @@ def record_engine_failure(
     save_status_cache({model_name: entry})
 
 
-def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = None) -> None:
+def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = None, *, model=None) -> None:
     """
     Directly writes a live rate-limit/429 status event into the shared status cache.
     Allows immediate cross-session visibility without waiting for periodic polling probes.
@@ -1232,15 +1250,9 @@ def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = Non
     if resets_at == "需登录授权" or "登录" in str(reason or ""):
         record_engine_failure(model_name, "needs_auth", f"{reason} · {get_reauth_hint(model_name)}")
         return
-    now = datetime.now().isoformat()
-    status_entry = {
-        model_name: {
-            "status": "limited",
-            "reason": reason,
-            "resets_at": resets_at,
-            "updated_at": now
-        }
-    }
+    from makewand.model_quota import refusal
+    entry = refusal(model_name, reason, resets_at, model)
+    status_entry = {model_name: dict(entry, quota_limits=[entry])}
     save_status_cache(status_entry)
 
 class ProbePolicyError(ValueError):
@@ -1794,10 +1806,11 @@ QUOTA_SOURCE_LABELS = {
     "assumed": "无额度信号，未做估算",
     "status": "由健康状态推定",
     "unknown": "未探测",
+    "not_applicable": "不适用云端额度",
 }
 
 
-def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = None, *, model=None) -> Optional[Dict[str, Any]]:
     """Read recent quota evidence for the CLI's selected account root.
 
     Windows expire at their reset or after 15 minutes without an observation.
@@ -1836,7 +1849,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
             return now + ttl + 60
         return min([now, modified] + [value for value in parsed if value is not None])
 
-    def add(used, minutes, reset, observed, origin, window_key, scoped=None, model=""):
+    def add(used, minutes, reset, observed, origin, window_key, scoped=None, model="", scope="", limit_id=""):
         try:
             if isinstance(used, bool):
                 return
@@ -1863,7 +1876,9 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                              "window": label, "window_key": window_key,
                              "resets_at": datetime.fromtimestamp(reset_time, timezone.utc).isoformat() if reset_time else None,
                              "observed": observed, "selected_source": origin,
-                             "scoped_percent": scoped, "model": model, "pool_ref": identity["pool_ref"]})
+                             "scoped_percent": scoped, "model": model, "scope": scope,
+                             "limit_id": limit_id, "pool_ref": identity["pool_ref"],
+                             "observed_at": datetime.fromtimestamp(observed, timezone.utc).isoformat()})
         except (ValueError, TypeError, OverflowError, OSError):
             reasons.add("invalid_window")
 
@@ -1897,10 +1912,11 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                         reasons.add("missing_observation_time")
                         continue
                     minutes = window.get("WindowMinutes") or None
-                    model = window.get("Model") or ""
+                    window_model = window.get("Model") or ""
                     add(window.get("UsedPercent"), minutes, window.get("ResetAt"),
                         observed_at(modified, window.get("SourceAt"), snapshot.get("taken_at")),
-                        "quota_snapshot", window.get("WindowKey") or model + "|" + str(minutes), model=model)
+                        "quota_snapshot", window.get("WindowKey") or window_model + "|" + str(minutes),
+                        model=window_model, scope=window.get("Scope") or "", limit_id=window.get("LimitID") or "")
             else:
                 for key, minutes, reset_key in (("WeeklyPct", 10080, "WeeklyResetAt"),
                                                ("FiveHourPct", 300, "FiveHourResetAt"),
@@ -1971,10 +1987,9 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                             reasons.add("missing_observation_time")
                             continue
                         observed = observed_at(modified, record.get("timestamp"), payload.get("timestamp"))
-                        model = limits.get("model") or ""
+                        window_model = limits.get("model") or ""
                         limit_id = limits.get("limit_id")
-                        if not model and limit_id and limit_id != "codex":
-                            model = limit_id
+                        scope = "unknown" if not window_model and limit_id and limit_id != "codex" else ""
                         for slot in ("primary", "secondary"):
                             window = limits.get(slot)
                             if not isinstance(window, dict) or "used_percent" not in window:
@@ -1987,7 +2002,9 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                             except (TypeError, ValueError, OverflowError):
                                 duration = None
                             add(window["used_percent"], duration, window.get("resets_at"), observed,
-                                "codex_session", model + "|" + (str(duration) if duration else "unknown_" + slot), model=model)
+                                "codex_session", ("bucket:" + limit_id if scope == "unknown" else window_model) + "|" +
+                                (str(duration) if duration else "unknown_" + slot),
+                                model=window_model, scope=scope, limit_id=limit_id or "")
                         # Merge each independently observed account/model window.
                     except (ValueError, TypeError, AttributeError):
                         continue
@@ -2012,7 +2029,8 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                     continue
                 add(window.get("used_percent"), window.get("window_minutes"),
                     window.get("reset_at_ms", 0) / 1000 or None, at,
-                    "execution_evidence", window.get("window_key"), model=window.get("model") or "")
+                    "execution_evidence", window.get("window_key"), model=window.get("model") or "",
+                    scope=window.get("scope") or "", limit_id=window.get("limit_id") or "")
             except (ValueError, TypeError, KeyError, AttributeError):
                 continue
 
@@ -2034,17 +2052,19 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
         previous = windows.get(key)
         if previous is None or (candidate["observed"], candidate["selected_source"] == "codex_session") >= (previous["observed"], previous["selected_source"] == "codex_session"):
             windows[key] = candidate
-    shared = [entry for entry in windows.values() if not entry["model"]]
+    from makewand.model_quota import model_matches
+    shared = [entry for entry in windows.values() if entry["scope"] != "unknown"
+              and model_matches(entry["model"], model)]
     if not shared:
         return {"percentage": None, "status": "unknown", "source": "unknown",
-                "desc": "只有模型子限额，账号共享额度未知", "is_unlimited": False,
+                "desc": "当前账号/模型没有可关联的额度窗口；余量未知", "is_unlimited": False,
                 "resets_at": None, "windows": list(windows.values()), **identity}
     worst = max(shared, key=lambda entry: entry["used_percent"])
     remaining = round(100 - worst["used_percent"], 2)
-    scoped = max([entry["used_percent"] for entry in windows.values() if entry["model"]] + [worst.get("scoped_percent") or 0])
     scoped_message = ""
-    if isinstance(scoped, (int, float)) and not isinstance(scoped, bool) and scoped >= 99:
-        scoped_message = " · 顶配模型周限额已达 100%（仅提示）"
+    if model is None and any((entry["model"] and entry["used_percent"] >= 100) or
+                            entry.get("scoped_percent") == 100 for entry in windows.values()):
+        scoped_message = " · 部分模型子限额已达 100%（仅适用于对应模型，未确认范围不用于拦截）"
     return {"percentage": remaining, "status": _quota_status(remaining, reserve),
             **_quota_reserve_metadata(reserve, reserve_error),
             "desc": _quota_reserve_description(f"官方报告{worst['window']}剩余额度: {remaining:g}% (已用 {worst['used_percent']:g}%){scoped_message}", reserve, reserve_error),
@@ -2057,18 +2077,17 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                         for entry in windows.values()]}
 
 
-def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = None, *, model=None) -> Dict[str, Any]:
     """
-    Returns a quota *indicator* (0-100) for display and pacing.
+    Return observed quota for the selected account and optional model.
 
-    Only percentages parsed from provider output ("NN% left") are official
-    ("source": "official"). Everything else is either inferred from the health
-    status or estimated from makewand's own local call counts
-    ("source": "local_estimate"); callers must not present those as real quota.
-    "unknown" (never probed) is neutral: it is not an exhausted quota.
+    Missing observations remain unknown; dispatch counts and health verdicts
+    never become subscription percentages.
     """
     if info is None:
         info = load_status_cache().get(provider, {})
+    from makewand.model_quota import projected_status
+    info = projected_status(provider, info, model)
 
     status = info.get("status", "unknown")
     reason = info.get("reason", "")
@@ -2077,8 +2096,9 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
 
     reserve, reserve_error = _quota_reserve_setting()
     reserve_quota = None
-    if _is_quota_reserve_gate(info) and status in ("limited", "unknown", "healthy", "warning"):
-        official = _get_official_subscription_quota(provider, resets_at=resets_at)
+    if (provider in ("codex", "claude") and
+            (status in ("unknown", "healthy", "warning") or _is_quota_reserve_gate(info))):
+        official = _get_official_subscription_quota(provider, resets_at=resets_at, model=model)
         if official and official.get("source") == "official":
             reserve_quota = official
 
@@ -2096,7 +2116,7 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
     elif status == "limited":
         reset_desc = f" (预计解封: {resets_at})" if resets_at else " (已达当前限额)"
         res = {
-            "percentage": 0,
+            "percentage": None,
             "status": "limited",
             "desc": f"额度已耗尽{reset_desc}",
             "resets_at": resets_at,
@@ -2119,7 +2139,7 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         if status == "needs_auth" and "重新登录" not in desc:
             desc = f"{desc} · {get_reauth_hint(provider)}"
         res = {
-            "percentage": 0,
+            "percentage": None,
             "status": status,
             "desc": desc,
             "resets_at": None,
@@ -2129,12 +2149,12 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
     # 4. Unlimited local models or enterprise tiers
     elif provider == "local":
         res = {
-            "percentage": 100,
+            "percentage": None,
             "status": "healthy",
-            "desc": "本地私有模型 · 无云端额度 · 0 Token 成本",
+            "desc": "本地私有模型 · 无云端订阅额度限制；受本机资源约束",
             "resets_at": None,
             "is_unlimited": True,
-            "source": "assumed",
+            "source": "not_applicable",
         }
     elif reason and re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE):
         pct_match = re.search(r"(\d+)\s*%\s*(?:left|remaining|剩余)", reason, re.IGNORECASE)
@@ -2154,49 +2174,11 @@ def calculate_provider_quota(provider: str, info: Optional[Dict[str, Any]] = Non
         if official_quota:
             res = official_quota
         else:
-            # 5. Estimate from rolling usage and burn rate penalty
-            try:
-                from makewand.usage import get_burn_rate_penalty, get_engine_usage_stats
-                penalty, pen_reason = get_burn_rate_penalty(provider)
-                u24 = get_engine_usage_stats(window_hours=24.0).get(provider, {}).get("total", 0)
-
-                if penalty <= -4.0:
-                    pct = 5
-                    desc = f"高频调用削峰保护中 (24h 调用: {u24}次)"
-                elif penalty <= -3.0:
-                    pct = 20
-                    desc = f"额度消耗较快 (24h 调用: {u24}次)"
-                elif penalty <= -2.0:
-                    pct = 40
-                    desc = f"滑动窗口用量活跃 (24h 调用: {u24}次)"
-                elif penalty <= -1.0:
-                    pct = 65
-                    desc = f"滑动窗口运行平稳 (24h 调用: {u24}次)"
-                else:
-                    if u24 == 0:
-                        pct = 100
-                        desc = "额度充沛 · 滑动窗口无压力"
-                    else:
-                        pct = max(75, 100 - min(25, u24 * 2))
-                        desc = f"额度充沛 · 运行健康 (24h 调用: {u24}次)"
-
-                res = {
-                    "percentage": pct,
-                    "status": "healthy" if pct >= 25 else "warning",
-                    "desc": f"{desc} [本地调用计数估算，非真实配额]",
-                    "resets_at": resets_at,
-                    "is_unlimited": False,
-                    "source": "local_estimate",
-                }
-            except Exception:
-                res = {
-                    "percentage": 85,
-                    "status": "healthy",
-                    "desc": "运行健康 [本地调用计数估算，非真实配额]",
-                    "resets_at": resets_at,
-                    "is_unlimited": False,
-                    "source": "local_estimate",
-                }
+            # Dispatch counts and burn-rate controls are local pressure signals,
+            # never evidence of a subscription's remaining allowance.
+            res = {"percentage": None, "status": "unknown", "source": "unknown",
+                   "desc": "供应商剩余额度未知；本地调用计数不换算为额度百分比",
+                   "resets_at": resets_at, "is_unlimited": False}
 
     res.setdefault("reserve_percent", reserve)
     res.setdefault("reserve_error", reserve_error)

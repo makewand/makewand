@@ -51,12 +51,12 @@ class TestDynamicQuotaPacing(unittest.TestCase):
 
         p_loc = calculate_dynamic_pacing("local", {"status": "healthy"})
         self.assertEqual(p_loc["pacing_state"], PACING_BALANCED)
-        self.assertEqual(p_loc["quota_percentage"], 100)
+        self.assertIsNone(p_loc["quota_percentage"])
 
     def test_limited_provider_pacing(self):
         p_ltd = calculate_dynamic_pacing("claude", {"status": "limited", "reason": "limit reached", "resets_at": "tomorrow"})
         self.assertEqual(p_ltd["pacing_state"], PACING_LIMITED)
-        self.assertEqual(p_ltd["quota_percentage"], 0)
+        self.assertIsNone(p_ltd["quota_percentage"])
         self.assertEqual(p_ltd["routing_boost"], -999.0)
 
     def test_harvest_window_pacing(self):

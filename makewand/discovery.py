@@ -861,8 +861,10 @@ def refresh_agy_models_cache(cache_file: Optional[Path] = None, timeout: float =
 class DiscoveredMuseModels(tuple):
     """Container for discovered Muse Code model catalog."""
 
-    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str]):
-        return super().__new__(cls, (models, configured_default, configured_effort))
+    def __new__(cls, models: List[Tuple[str, str]], configured_default: Optional[str], configured_effort: Optional[str], efforts=None):
+        result = super().__new__(cls, (models, configured_default, configured_effort))
+        result.efforts = efforts or {}
+        return result
 
     @property
     def models(self) -> List[Tuple[str, str]]:
@@ -903,6 +905,7 @@ def _discover_local_muse_models() -> DiscoveredMuseModels:
     Returns DiscoveredMuseModels(models, configured_default, configured_effort).
     """
     discovered_muse: List[Tuple[str, str]] = []
+    model_efforts = {}
     seen = set()
     configured_default = None
     configured_effort = None
@@ -937,6 +940,8 @@ def _discover_local_muse_models() -> DiscoveredMuseModels:
                             mid = r.get("model_id") or r.get("id") or r.get("slug")
                             if not _valid_model_id(mid):
                                 continue
+                            if mid not in model_efforts and isinstance(r.get("reasoning_effort_variants"), list):
+                                model_efforts[mid] = _effort_names(r["reasoning_effort_variants"])
                             desc = r.get("description") or r.get("display_label") or ""
                             if (mid, desc) not in seen:
                                 seen.add((mid, desc))
@@ -970,7 +975,7 @@ def _discover_local_muse_models() -> DiscoveredMuseModels:
     if not configured_default and catalog_default:
         configured_default = catalog_default
 
-    return DiscoveredMuseModels(discovered_muse, configured_default, configured_effort)
+    return DiscoveredMuseModels(discovered_muse, configured_default, configured_effort, model_efforts)
 
 
 def _discover_local_grok_models() -> List[Tuple[str, str]]:
@@ -1142,7 +1147,7 @@ def _effort_names(levels) -> List[str]:
     seen = set()
     for level in levels or []:
         if isinstance(level, dict):
-            raw = level.get("effort") or level.get("id") or level.get("value")
+            raw = level.get("effort") or level.get("id") or level.get("value") or level.get("tier")
         else:
             raw = level
         if not isinstance(raw, str):
@@ -1159,7 +1164,6 @@ def _iter_codex_bases():
         yield Path(os.environ["CODEX_HOME"]).expanduser()
         return
     yield Path.home() / ".codex"
-    yield Path.home() / ".codex-2"
 
 
 def _codex_effort_map() -> Dict[str, List[str]]:
@@ -1231,9 +1235,7 @@ def _muse_effort_map() -> Dict[str, List[str]]:
         return found
     for mid, _desc in discovered.models:
         if _valid_model_id(mid) and mid not in found:
-            # The muse catalog names models, not per-model efforts. Empty means
-            # "use the built-in effort list for this id".
-            found[str(mid)] = []
+            found[str(mid)] = getattr(discovered, "efforts", {}).get(mid, [])
     return found
 
 
@@ -1367,7 +1369,7 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
         if os.environ.get("CODEX_HOME"):
             codex_bases.append(Path(os.environ["CODEX_HOME"]).expanduser())
         else:
-            codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+            codex_bases.append(Path.home() / ".codex")
 
         found = set()
         configured_model = None
@@ -1625,7 +1627,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         if os.environ.get("CODEX_HOME"):
             codex_bases.append(Path(os.environ["CODEX_HOME"]).expanduser())
         else:
-            codex_bases.extend([Path.home() / ".codex", Path.home() / ".codex-2"])
+            codex_bases.append(Path.home() / ".codex")
 
         for base in codex_bases:
             if not base.exists():
