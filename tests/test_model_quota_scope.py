@@ -94,6 +94,69 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertIsNotNone(model_quota.quota_reason("agy", "claude-opus-5-5-high", quota=False, info=data))
         self.assertIsNone(model_quota.quota_reason("agy", "claude-sonnet-5-5-high", quota=False, info=data))
 
+    def test_legacy_gemini_observation_preserves_new_agy_verdicts(self):
+        for status in ("needs_auth", "error", "healthy", "limited"):
+            with self.subTest(status=status):
+                legacy = {"status": "limited", "reason": "Google AI 配额暂时耗尽",
+                          "resets_at": self.reset,
+                          "updated_at": (datetime.now() - timedelta(minutes=2)).isoformat()}
+                self.root.joinpath("status.json").write_text(json.dumps({"agy": legacy}), encoding="utf-8")
+                current = {"status": status, "reason": "fixture newer " + status,
+                           "resets_at": self.reset if status == "limited" else None,
+                           "updated_at": datetime.now().isoformat(), "verified": status == "healthy"}
+                health.save_status_cache({"agy": current})
+                data = self.info("agy")
+                for model in (None, "gemini-4-argon-high", "claude-opus-5-5-high"):
+                    with self.subTest(model=model):
+                        projected = model_quota.projected_status("agy", data, model)
+                        self.assertEqual({key: projected[key] for key in current}, current)
+                self.assertEqual(data["legacy_native_limit"], legacy)
+
+    def test_expired_legacy_gemini_observation_is_removed_from_cache(self):
+        for status in ("needs_auth", "error", "healthy", "limited"):
+            with self.subTest(status=status):
+                legacy = {"status": "limited", "reason": "Google AI 配额暂时耗尽",
+                          "resets_at": (datetime.now() - timedelta(minutes=1)).isoformat(),
+                          "updated_at": (datetime.now() - timedelta(hours=1)).isoformat()}
+                current = {"status": status, "reason": "fixture current " + status,
+                           "resets_at": self.reset if status == "limited" else None,
+                           "updated_at": datetime.now().isoformat()}
+                self.root.joinpath("status.json").write_text(json.dumps({"agy": {
+                    **current, "legacy_native_limit": legacy}}), encoding="utf-8")
+                loaded = self.info("agy")
+                self.assertNotIn("legacy_native_limit", loaded)
+                self.assertEqual({key: loaded[key] for key in current}, current)
+                health.save_status_cache({"agy": {**current, "legacy_native_limit": legacy}})
+                saved = json.loads(self.root.joinpath("status.json").read_text())["agy"]
+                self.assertNotIn("legacy_native_limit", saved)
+                self.assertEqual({key: saved[key] for key in current}, current)
+
+    def test_expired_raw_legacy_gemini_limit_becomes_unknown_without_revival(self):
+        health.save_status_cache({"agy": {"status": "limited", "reason": "Google AI 配额暂时耗尽",
+            "resets_at": (datetime.now() - timedelta(minutes=1)).isoformat(),
+            "updated_at": (datetime.now() - timedelta(hours=1)).isoformat()}})
+        data = self.info("agy")
+        self.assertEqual(data["status"], "unknown")
+        self.assertFalse(data["verified"])
+        self.assertNotIn("legacy_native_limit", data)
+        self.assertIsNone(model_quota.quota_reason("agy", "gemini-4-argon-high", quota=False, info=data))
+
+    def test_agy_auth_relay_survives_active_legacy_gemini_observation(self):
+        from makewand.providers.agy import execute_agy_task
+        health.save_status_cache({"agy": {"status": "limited", "reason": "Google AI 配额暂时耗尽",
+            "resets_at": self.reset, "updated_at": (datetime.now() - timedelta(minutes=1)).isoformat()}})
+        health.record_engine_failure("agy", "needs_auth", "fixture login required")
+        with patch.dict(os.environ, MAKEWAND_API_POLICY="allow_paid"), \
+             patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.config.has_api_configured", return_value=True), \
+             patch("makewand.providers.api_client.call_api_chat", return_value=(True, "fixture relay answer", None)) as api, \
+             patch("makewand.providers.agy.run_subprocess") as cli:
+            result = execute_agy_task("fixture", cwd=str(self.root), model="claude-opus-5-5-high", readonly=True)
+        self.assertTrue(result[0], result)
+        self.assertEqual(result[1], "fixture relay answer")
+        api.assert_called_once()
+        cli.assert_not_called()
+
     def test_version_probe_preserves_other_models_refusal_without_spending_a_model(self):
         health.record_engine_limit("agy", "fixture argon refusal", self.reset, model="gemini-4-argon-high")
         with patch("makewand.config.get_all_supported_providers", return_value=["agy"]), \

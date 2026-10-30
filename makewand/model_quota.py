@@ -81,19 +81,29 @@ def projected_status(provider, info, model=None, identity=None):
     # supplies no evidence about AGY's Claude pools. Preserve the observation
     # and its time, while ceasing to advertise a tool-wide refusal.
     legacy = info.get("legacy_native_limit")
-    if (provider == "agy" and info.get("status") == "limited"
-            and info.get("reason") == "Google AI 配额暂时耗尽" and not info.get("quota_scope")):
+    legacy_is_current = (provider == "agy" and info.get("status") == "limited"
+                         and info.get("reason") == "Google AI 配额暂时耗尽"
+                         and not info.get("quota_scope"))
+    if legacy_is_current:
         legacy = {key: info.get(key) for key in ("status", "reason", "resets_at", "updated_at")}
-    if isinstance(legacy, dict):
-        result = dict(info, legacy_native_limit=legacy)
+    if provider == "agy" and isinstance(legacy, dict):
+        result = dict(info)
         active = (status_age_seconds(legacy) is not None and
                   not is_reset_time_passed(legacy.get("resets_at"), legacy.get("updated_at", "")))
-        if active and model_matches("gemini", model):
-            result.update(legacy)
-            result.pop("quota_scope", None)
+        if active:
+            result["legacy_native_limit"] = legacy
         else:
+            result.pop("legacy_native_limit", None)
+        # Neutralize only the old unscoped Google verdict. Its retained
+        # observation must never erase a later login, error, health or
+        # unrelated tool-wide limit verdict during a cache read/save.
+        if legacy_is_current:
             result.update(status="unknown", verified=False, resets_at=None,
                           reason="旧Google模型限流记录不作为AGY Claude模型的额度证据；具体余量未知")
+        if (active and model_matches("gemini", model)
+                and (legacy_is_current or info.get("status") == "unknown" or info.get("quota_scope"))):
+            result.update(legacy)
+            result.pop("quota_scope", None)
         info = result
     if not isinstance(info.get("quota_limits"), list):
         return info
