@@ -83,7 +83,10 @@ class AgyDispatchCase(unittest.TestCase):
              patch.object(agy, "run_subprocess", side_effect=runner), \
              contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result = execute_agy_task("审查这段代码", cwd=self._tmp.name, readonly=True, stream=stream)
-        status = health.load_status_cache()["agy"]["status"]
+        from makewand.model_quota import projected_status
+        from makewand.discovery import get_provider_model_tier
+        status = projected_status("agy", health.load_status_cache()["agy"],
+                                  get_provider_model_tier("agy")["model"])["status"]
         if health.STATUS_CACHE_FILE.exists():
             health.STATUS_CACHE_FILE.unlink()
         return result, status

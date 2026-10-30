@@ -101,8 +101,9 @@ def execute_claude_task(
     if cache.get("claude", {}).get("status") == "limited":
         if relay.available:
             return relay("[Makewand -> Claude] 订阅额度受限，无缝自动降级为 Anthropic API 模式接力执行...", cwd=cwd)
-        return False, None, relay.unavailable(f"Claude Code 当前额度受限: {cache['claude'].get('reason')}",
-                                     "可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力")
+        from makewand.model_quota import refuse_before_launch
+        return refuse_before_launch(relay.unavailable(f"Claude Code 当前额度受限: {cache['claude'].get('reason')}",
+                                     "可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力"))
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -152,6 +153,11 @@ def execute_claude_task(
     if target_effort and target_effort != "none":
         cmd.extend(["--effort", target_effort])
 
+    from makewand.model_quota import before_cli_launch
+    quota_refusal = before_cli_launch('claude', target_model, relay=relay, cwd=cwd)
+    if quota_refusal is not None:
+        return quota_refusal
+
     from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
     from makewand.execution_runtime import mark_provider_invocation
     try:
@@ -200,7 +206,7 @@ def execute_claude_task(
     is_limited, reason, resets = parse_claude_quota(out, err if apart else None)
     if is_limited:
         from makewand.health import record_engine_limit
-        record_engine_limit("claude", reason, resets)
+        record_engine_limit("claude", reason, resets, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Claude] 订阅触发限流 ({reason})，无缝切换为 Anthropic API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Claude Code 执行中触发额度限制: {reason}", "可配置 ANTHROPIC_API_KEY 实现自动接力")

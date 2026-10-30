@@ -210,6 +210,7 @@ def cmd_route(args) -> None:
         except ValueError as error:
             _fail(f"错误：--self {error}")
     simple = bool(getattr(args, "simple", False))
+    from makewand.health import load_status_cache
     try:
         policy = load_policy()
     except ValueError as error:
@@ -225,6 +226,7 @@ def cmd_route(args) -> None:
         include_legacy=bool(getattr(args, "legacy", False)) and not simple,
         request_id=getattr(args, "request_id", None),
         retry_approved=bool(getattr(args, "retry_approved", False)),
+        status_reader=load_status_cache,
     )
     try:
         try:

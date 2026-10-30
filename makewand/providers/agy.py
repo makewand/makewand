@@ -195,7 +195,8 @@ def execute_agy_task(
     if cache.get("agy", {}).get("status") == "limited":
         if relay.available:
             return relay("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", cwd=cwd)
-        return False, None, relay.unavailable(f"Antigravity 当前不可用: {cache['agy'].get('reason')}", "可配置 GEMINI_API_KEY 作为备用 API 自动接力")
+        from makewand.model_quota import refuse_before_launch
+        return refuse_before_launch(relay.unavailable(f"Antigravity 当前不可用: {cache['agy'].get('reason')}", "可配置 GEMINI_API_KEY 作为备用 API 自动接力"))
 
     # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
     host_auth_source = None
@@ -239,6 +240,7 @@ def execute_agy_task(
                 _avail = None
             final_model, final_effort = resolve_agy_model(target_model, requested_effort, _avail)
             cmd.extend(["--model", final_model])
+            target_model = final_model
             if final_effort and final_effort != "none":
                 cmd.extend(["--effort", final_effort])
         else:
@@ -246,6 +248,11 @@ def execute_agy_task(
             target_effort = normalize_provider_effort("agy", requested_effort)
             if target_effort and target_effort != "none":
                 cmd.extend(["--effort", target_effort])
+
+        from makewand.model_quota import before_cli_launch
+        quota_refusal = before_cli_launch('agy', target_model, relay=relay, cwd=cwd)
+        if quota_refusal is not None:
+            return quota_refusal
 
         from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError, SandboxConfigError, ProviderStartupError
         from makewand.execution_runtime import mark_provider_invocation
@@ -331,7 +338,7 @@ def execute_agy_task(
                 pass
             return False, combined, fail_reason
     if is_limited:
-        record_engine_limit("agy", reason, resets_at)
+        record_engine_limit("agy", reason, resets_at, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Antigravity] 订阅触发配额限制 ({reason})，无缝切换为 Gemini API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Antigravity 配额受限: {reason}", "可配置 GEMINI_API_KEY 实现自动接力")

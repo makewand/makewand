@@ -215,7 +215,8 @@ def execute_muse_task(
     if cache.get("muse", {}).get("status") == "limited":
         if relay.available:
             return relay("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", cwd=cwd)
-        return False, None, relay.unavailable(f"Muse Code 当前不可用: {cache['muse'].get('reason')}", "可配置 META_API_KEY 作为备用 API 自动接力")
+        from makewand.model_quota import refuse_before_launch
+        return refuse_before_launch(relay.unavailable(f"Muse Code 当前不可用: {cache['muse'].get('reason')}", "可配置 META_API_KEY 作为备用 API 自动接力"))
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
@@ -277,6 +278,11 @@ def execute_muse_task(
             cmd.extend(["--prompt-file", str(p_file)])
         else:
             cmd.append(prompt)
+
+        from makewand.model_quota import before_cli_launch
+        quota_refusal = before_cli_launch('muse', target_model, relay=relay, cwd=cwd)
+        if quota_refusal is not None:
+            return quota_refusal
 
         from makewand.sandbox import provider_sandbox_launch, SandboxUnavailableError
         from makewand.execution_runtime import mark_provider_invocation
@@ -351,7 +357,7 @@ def execute_muse_task(
 
     is_limited, reason, resets = parse_muse_quota(out, err if apart else None)
     if is_limited:
-        record_engine_limit("muse", reason, resets)
+        record_engine_limit("muse", reason, resets, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Muse Code 执行中检测到限制: {reason}", "可配置 META_API_KEY 实现自动接力")

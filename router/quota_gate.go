@@ -16,7 +16,10 @@
 // behaves exactly as it did before quota awareness.
 package router
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // QuotaController is the router's view of the quota subsystem. *QuotaSnapshotter
 // satisfies it; tests can supply a fake.
@@ -28,7 +31,7 @@ type QuotaController interface {
 
 // quotaBandFor returns the soft-ranking band for a provider based on predicted
 // headroom. Unknown providers and a nil controller rank as OK (neutral).
-func (r *Router) quotaBandFor(provider string) QuotaBand {
+func (r *Router) quotaBandFor(provider string, models ...string) QuotaBand {
 	if r.quota == nil {
 		return QuotaBandOK
 	}
@@ -37,7 +40,37 @@ func (r *Router) quotaBandFor(provider string) QuotaBand {
 		return QuotaBandOK
 	}
 	_, sealed := r.quota.Sealed(provider)
+	if len(models) == 1 {
+		// Percentages remain soft ranking signals. A matching sublimit may
+		// affect this candidate, but must not penalize sibling models.
+		windows := make([]QuotaWindow, 0, len(q.Windows))
+		for _, window := range q.Windows {
+			if window.Scope == "unknown" || !quotaModelMatches(window.Model, models[0]) {
+				continue
+			}
+			window.Model = ""
+			windows = append(windows, window)
+		}
+		q.Windows = windows
+	}
 	return r.quotaPolicy.band(q, sealed)
+}
+
+func quotaModelMatches(scope, model string) bool {
+	if scope == "" {
+		return true
+	}
+	scope, model = strings.ToLower(scope), strings.ToLower(model)
+	model = strings.TrimSuffix(model, "[1m]")
+	if scope == model {
+		return true
+	}
+	for _, family := range []string{"haiku", "sonnet", "opus", "fable"} {
+		if scope == family {
+			return strings.HasPrefix(model, "claude-"+family+"-")
+		}
+	}
+	return scope == strings.TrimSuffix(model, "[1m]")
 }
 
 // quotaHardBlocked reports whether a provider is under an active confirmed-

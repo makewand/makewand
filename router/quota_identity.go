@@ -371,6 +371,9 @@ func currentQuotaWindows(q ProviderQuota) ProviderQuota {
 			continue
 		}
 		q.Windows = append(q.Windows, w)
+		if w.Scope == "unknown" {
+			continue
+		}
 		pct := w.UsedPercent
 		if w.Model != "" {
 			if q.ScopedPct == nil || pct > *q.ScopedPct {

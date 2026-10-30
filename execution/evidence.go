@@ -22,6 +22,7 @@ type ProviderEvidence struct {
 	IdentityKnown   bool             `json:"identity_known"`
 	PoolRef         string           `json:"pool_ref,omitempty"`
 	Model           string           `json:"actual_model,omitempty"`
+	ResolvedModel   string           `json:"resolved_model,omitempty"`
 	Source          string           `json:"source"`
 	ObservedAt      int64            `json:"observed_at_ms"`
 	Windows         []EvidenceWindow `json:"windows"`
@@ -37,6 +38,8 @@ type ProviderEvidence struct {
 
 type EvidenceWindow struct {
 	Model       string  `json:"model"`
+	Scope       string  `json:"scope,omitempty"`
+	LimitID     string  `json:"limit_id,omitempty"`
 	Key         string  `json:"window_key"`
 	Minutes     int     `json:"window_minutes"`
 	UsedPercent float64 `json:"used_percent"`

@@ -213,13 +213,13 @@ class TestLimitedProviderStaysLimited(unittest.TestCase):
                 self.assertEqual(entry["status"], "limited")
                 self.assertEqual(entry["resets_at"], resets)
 
-    def test_passed_reset_heals_on_reload(self):
+    def test_passed_reset_is_unknown_on_reload(self):
         observed = datetime.now() - timedelta(hours=3)
         past = datetime.now() - timedelta(hours=1)
         self.status_file.write_text(json.dumps({"claude": {
             "status": "limited", "reason": "limit", "updated_at": observed.isoformat(),
             "resets_at": _month_day(past, past.strftime("%H:%M"))}}), encoding="utf-8")
-        self.assertEqual(health.load_status_cache()["claude"]["status"], "healthy")
+        self.assertEqual(health.load_status_cache()["claude"]["status"], "unknown")
 
 
 if __name__ == "__main__":

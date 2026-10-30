@@ -211,7 +211,7 @@ class QuotaTextTests(unittest.TestCase):
     def test_quota_argv_uses_the_installed_go_component(self):
         # setUp replaces route_select.quota_argv; _REAL_QUOTA_ARGV is the real one.
         with patch("makewand.cli._find_go_binary", return_value="/opt/mw/bin/makewand-server"):
-            self.assertEqual(_REAL_QUOTA_ARGV(), ("/opt/mw/bin/makewand-server", "quota"))
+            self.assertEqual(_REAL_QUOTA_ARGV(), ("/opt/mw/bin/makewand-server", "quota", "--json"))
         with patch("makewand.cli._find_go_binary", return_value=None):
             self.assertIsNone(_REAL_QUOTA_ARGV())
 

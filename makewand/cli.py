@@ -178,8 +178,8 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
             "offline_flags": ["--local-only", "--offline", "--provider local"],
             "repo_trust_levels": ["trusted", "untrusted"],
         },
-        "quota_semantics": ("Python 入口的额度数值除 source=official (CLI 输出中的官方百分比) 外，均来自本地调用计数估算"
-                            "或健康状态推定，不是官方 5 小时/每周剩余额度；官方额度读取仅在 Go 组件 'makewand-server quota' 中实现"),
+        "quota_semantics": ("source=official 表示可关联当前账号与额度窗口的官方观测；缺少证据时余量未知。"
+                            "本地调用计数不是官方剩余配额，不换算成额度百分比。"),
         "stale_after_seconds": STATUS_STALE_SECONDS,
         "providers": providers,
     }
@@ -230,8 +230,8 @@ def cmd_status(args):
     from makewand.proxy import proxy_status
     print("代理来源: " + {"environment": "环境变量", "config_default": "配置默认值", "none": "无"}[proxy_status()["source"]])
     print("API 费用策略: " + ("allow_paid（允许云 API 按量计费）" if policy == "allow_paid" else "subscription_only（禁止 Makewand 云 API 调用）"))
-    print(c("额度说明: 除标注“官方报告”外，下方额度条为本地调用计数估算或由健康状态推定，不是官方剩余配额；"
-            "官方 5 小时/每周额度读取仅在 Go 组件 'makewand-server quota' 中实现。", COLOR_YELLOW))
+    print(c("额度说明: 缺少当前账号/模型的官方观测时余量未知；本地调用计数仅用于削峰，不是官方剩余配额。",
+            COLOR_YELLOW))
     cache = _status_cache(args)
 
     status_badges = {

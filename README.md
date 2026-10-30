@@ -19,7 +19,7 @@ curl -fsSL https://makewand.org/install.sh | bash
 - **🔌 全生态工具自适应拓扑**：根据已安装工具、显式启用配置和健康缓存选择实现与审查引擎。只有一个工具时使用单独的只读复审调用，仍需测试及有效裁决。
 - **💰 明确的 API 费用策略**：默认 `subscription_only`，禁止 Makewand 直接调用云 API，即使环境中已有 API key 也不会自动转为付费回退。设置 `MAKEWAND_API_POLICY=allow_paid` 或配置 `"api_policy": "allow_paid"` 才允许按量计费的 API 与回退；订阅 CLI 限额、登录失效或未安装时，也只有在 `allow_paid` 下才转用已配置的 API key，否则这类引擎不算可用。`makewand status` 展示当前策略。官方 CLI 自身的计费模式、订阅配额和本机资源消耗仍由相应工具及配置决定。
 - **⚡ 额度感知与自适应降级 (Quota-Aware Routing)**：
-  - Python 状态看板使用缓存、本地调用估算和 CLI 报告，不将估算当成官方剩余额度；Go `quota` 提供支持工具的官方额度读取。
+  - 额度按当前账号、模型和实际窗口处理；Codex 支持官方只读额度查询。缺少官方读数时显示未知，本地调用计数不换算成订阅余量。
   - 限额与登录失效只依据各 CLI 自己打印的消息判定（`makewand/cli_message_catalog.json`，Go 路由器内嵌同一份），模型回答、工具输出或提示回显中的相同字样不算。
   - 在已启用且可用的候选引擎间回退；额度、认证或审查失败可能阻止交付。
 - **🛡️ 跨模型独立红队审查 (Cross-Model Review)**：
@@ -202,6 +202,8 @@ makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
 
 `route <类型> <难度>` 的类型为 review、implement、test、research、doc，难度为 mechanical、normal、hard。它在完整的模型 × 推理深度目录中，从够用的最便宜档位（1–3）起选：跳过 `~/.config/mw-hub/policy`（或 `MW_HUB_POLICY`）里暂停中的工具、`mark` 标记期内的工具，以及官方周额度达到阈值的 codex/claude（默认 90%/85%），再按 `outcome` 记录的通过率用 Thompson 采样排序。`--self <工具>` 把与你同家的候选排在最后，`--not <工具>` 排除与它同家族的候选（审查时传实现方），`--tier N` 指定起始档，`--risk high` 从最强档起，`--simple` 只用精简三档表，`--json` 输出全部候选；验收不过时按输出末尾的提示升一档。派活命令自带的时限见下文“调用与资源预算”。
 
+`route` 和 Python 订阅 CLI 启动还共用当前账号/模型的额度检查：真实拒绝记录与官方各时间窗口分别保留，默认剩余额度保护值仍为 8%，周阈值仍为上述 90%/85%。模型子限额只影响相应模型，AGY 的 Gemini 限流不会推断为 Opus/Sonnet 没额度；`mark` 仍是用户明确设置的整工具暂停。Codex 通过只读 `account/rateLimits/read` 查询实际窗口，不发送生成请求；未知桶不会冒充模型或共享额度。Go 原生路由的 70%/90% 档位仍用于软排序，与操作方设置的启动保护阈值含义不同。未观察到额度、身份或重置后新状态时显示未知；本地削峰与并发保护继续独立生效。
+
 `mark <工具> <时长>` 的时长为 d/h/m/s 组合（如 `6h`、`93h17m`、`2d`，最长 365 天），`--reason` 可选。`outcome <工具> <档> <类型> pass|fail` 可附 `--model`、`--effort`、`--seconds`、`--calls`。标记与成绩保存在 makewand 私有状态目录的 `routing/` 下（`MAKEWAND_ROUTING_DIR` 可改）。三个命令都不调用模型；在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
 
 记录成绩时沿用派发的 `--request-id` 和发起工具 `--caller`（或继承 `MAKEWAND_TASK_ID` / `MAKEWAND_CALLER`）。新 shell 未携带请求 ID 时，只在同项目、同提供者和模型下存在唯一近期未验收调用时自动关联；歧义不会靠猜测消除。审查工作的 `pass|fail` 与候选裁决分开：用 `--candidate-verdict pass|fail|unverified`、实测 `--seconds` 和实际 `--calls` 记录裁决；新批准还必须有 `--candidate-hash <完整候选的SHA256>` 和可关联的请求 ID。缺这些数据时仍可仅记录工作质量，不能记为候选批准。旧记录保持可读，不补写未知的 ID 或哈希。
@@ -221,6 +223,8 @@ Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / �
 - **跨语言参数对齐**：命令行支持 `--mode` 与 `--tier` 互为别名，无论传入 `fast`、`balanced`、`power` 还是 `fast`、`standard`、`deep`，系统均能自适应双向转换与持久化配置。
 
 ### 调用与资源预算
+
+`--max-model-calls` 按 Makewand 派发任务计数。官方 CLI 在一次派发内可能进行多轮内部模型调用，内部轮次及供应商报告的调用数需另行核对；它们也不换算为订阅剩余额度。需要内部轮次上限时，还需使用对应 CLI 支持的限制。
 
 ```bash
 makewand run "修复边界用例" --max-model-calls 3 --call-budget-file /tmp/task-budget.json

@@ -28,6 +28,22 @@ func TestQuotaBandForReflectsSnapshot(t *testing.T) {
 	}
 }
 
+func TestQuotaBandForModelDoesNotPenalizeSiblingOrOpaqueBucket(t *testing.T) {
+	src := &fakeSource{name: "claude", q: ProviderQuota{HasData: true, Authed: true, WeeklyPct: fptr(20),
+		Windows: []QuotaWindow{{Model: "Fable", UsedPercent: 100}, {Scope: "unknown", UsedPercent: 100}}}}
+	snap := NewQuotaSnapshotter(time.Hour, src)
+	snap.Refresh(context.Background())
+	r := newTestRouterWithQuota(snap)
+	if r.quotaBandFor("claude", "claude-fable-5-1[1m]") != QuotaBandCritical {
+		t.Fatal("matching model's sublimit did not affect its soft band")
+	}
+	for _, model := range []string{"claude-opus-5-5", "claude-sonnet-5"} {
+		if r.quotaBandFor("claude", model) != QuotaBandOK {
+			t.Fatal("another model or opaque bucket penalized", model)
+		}
+	}
+}
+
 func TestQuotaBandReordersCandidates(t *testing.T) {
 	// Two candidates, equal on every other signal; the exhausted one must sort last.
 	cands := []candidate{

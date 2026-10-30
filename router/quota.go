@@ -120,6 +120,8 @@ type ProviderQuota struct {
 // QuotaWindow separates shared pool limits from model-specific sublimits.
 type QuotaWindow struct {
 	PoolRef       string
+	LimitID       string
+	Scope         string
 	Model         string
 	WindowKey     string
 	WindowMinutes int
@@ -170,7 +172,7 @@ func (q ProviderQuota) EffectiveUsedPct() (float64, bool) {
 		}
 	}
 	for _, w := range q.Windows {
-		if w.Model == "" {
+		if w.Model == "" && w.Scope != "unknown" {
 			known = true
 			if w.UsedPercent > worst {
 				worst = w.UsedPercent
@@ -381,9 +383,11 @@ func (s *QuotaSnapshotter) WithDiskCache(path string, ttl time.Duration) *QuotaS
 // (Claude OAuth, Codex session logs, agy login-state) using default paths.
 // interval<=0 defaults to 120s.
 func NewDefaultQuotaSnapshotter(interval time.Duration) *QuotaSnapshotter {
+	codex := NewCodexQuotaSource("").(*codexQuotaSource)
+	codex.readMetadata = true
 	s := NewQuotaSnapshotter(interval,
 		NewClaudeQuotaSource(""),
-		NewCodexQuotaSource(""),
+		codex,
 		NewAgyQuotaSource(""),
 	)
 	if home, err := os.UserHomeDir(); err == nil {
@@ -542,6 +546,9 @@ func (s *QuotaSnapshotter) refresh(ctx context.Context, tick bool) {
 			defer wg.Done()
 			rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			defer cancel()
+			if untrusted {
+				rctx = context.WithValue(rctx, quotaNoCLIContext{}, true)
+			}
 			q, err := src.Read(rctx)
 			results[i] = result{q: q, err: err, read: true}
 		}(i, src)
@@ -1058,6 +1065,7 @@ type codexQuotaSource struct {
 	sessionsDir  string
 	selectedHome bool
 	identity     quotaIdentityMemo
+	readMetadata bool
 }
 
 // NewCodexQuotaSource follows exactly one selected CLI credential root.
@@ -1079,6 +1087,7 @@ func (c *codexQuotaSource) quotaIdentity() ProviderQuota {
 
 func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q := c.quotaIdentity()
+	selected := q
 	if !q.IdentityKnown {
 		return q, nil
 	}
@@ -1146,9 +1155,9 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 			if info.ModTime().Before(at) {
 				at = info.ModTime()
 			}
-			model := rl.Model
+			model, scope := rl.Model, ""
 			if model == "" && rl.LimitID != "" && rl.LimitID != "codex" {
-				model = rl.LimitID
+				scope = "unknown"
 			}
 			for slot, w := range []*codexWindow{rl.Primary, rl.Secondary} {
 				if w == nil || w.UsedPercent == nil || *w.UsedPercent < 0 || *w.UsedPercent > 100 {
@@ -1163,10 +1172,13 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 				}
 				minutes := w.windowMinutes()
 				key := model + "|" + strconv.Itoa(minutes)
+				if scope == "unknown" {
+					key = "bucket:" + rl.LimitID + "|" + strconv.Itoa(minutes)
+				}
 				if minutes == 0 {
 					key += "|unknown_" + strconv.Itoa(slot)
 				}
-				candidate := QuotaWindow{PoolRef: q.PoolRef, Model: model, WindowKey: key, WindowMinutes: minutes, UsedPercent: *w.UsedPercent, SourceAt: at, ResetAt: reset}
+				candidate := QuotaWindow{PoolRef: q.PoolRef, Model: model, Scope: scope, LimitID: rl.LimitID, WindowKey: key, WindowMinutes: minutes, UsedPercent: *w.UsedPercent, SourceAt: at, ResetAt: reset}
 				if previous, ok := windows[key]; !ok || !previous.SourceAt.After(at) {
 					windows[key] = candidate
 				}
@@ -1189,6 +1201,11 @@ func (c *codexQuotaSource) Read(ctx context.Context) (ProviderQuota, error) {
 	q.Authed = true
 	q = mergeExecutionQuota(q)
 	q = currentQuotaWindows(q)
+	if c.readMetadata && ctx.Value(quotaNoCLIContext{}) != true && ctx.Err() == nil {
+		if live, err := readCodexQuotaRPC(ctx, selected); err == nil && live.HasData {
+			q = mergeQuotaObservations(q, live)
+		}
+	}
 	if !quotaMatches(q, c.quotaIdentity()) {
 		return c.quotaIdentity(), nil
 	}

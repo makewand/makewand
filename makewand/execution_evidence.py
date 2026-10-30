@@ -228,7 +228,11 @@ def protocol(evidence, raw):
             limits = obj.get("rate_limits") or payload.get("rate_limits")
             if not at or at > time.time() * 1000 + 60000 or not isinstance(limits, dict):
                 continue
-            scoped = limits.get("model") or (limits.get("limit_id") if limits.get("limit_id") != "codex" else "") or ""
+            scoped = limits.get("model") or ""
+            limit_id = limits.get("limit_id") or ""
+            scope = "unknown" if not scoped and limit_id and limit_id != "codex" else ""
+            if limit_id and not _model(limit_id):
+                continue
             if scoped and not _model(scoped):
                 continue
             for slot, key in enumerate(("primary", "secondary")):
@@ -245,8 +249,11 @@ def protocol(evidence, raw):
                 if window.get("resets_at") is not None and reset is None:
                     continue
                 window_key = scoped + "|" + str(minutes) + ("|unknown_" + str(slot) if minutes == 0 else "")
+                if scope == "unknown":
+                    window_key = "bucket:" + limit_id + "|" + str(minutes) + ("|unknown_" + str(slot) if minutes == 0 else "")
                 candidate = dict(model=scoped, window_key=window_key, window_minutes=minutes,
-                                 used_percent=used, observed_at_ms=at, reset_at_ms=reset or 0)
+                                 used_percent=used, observed_at_ms=at, reset_at_ms=reset or 0,
+                                 scope=scope, limit_id=limit_id)
                 existing = next((w for w in evidence["windows"] if w["window_key"] == window_key), None)
                 if existing is not None:
                     if existing["observed_at_ms"] <= at:

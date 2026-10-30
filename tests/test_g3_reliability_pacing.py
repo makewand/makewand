@@ -74,9 +74,18 @@ class _NoLedger(unittest.TestCase):
 class TestContinuousPacing(_NoLedger):
     """py-reliability#9 (a): no step jumps at the thresholds."""
 
-    @staticmethod
-    def official(pct, seconds_left):
+    def setUp(self):
+        super().setUp()
+        self.observation = None
+        guard = patch("makewand.health._get_official_subscription_quota", side_effect=lambda *args, **kwargs: self.observation)
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def official(self, pct, seconds_left):
         reset = (datetime.now() + timedelta(seconds=seconds_left)).strftime("%Y-%m-%d %H:%M:%S")
+        self.observation = {"source": "official", "status": "healthy", "percentage": pct,
+                            "resets_at": reset, "window_minutes": 10080, "desc": "bound official fixture",
+                            "reserve_percent": 8, "reserve_error": None}
         return {"status": "healthy", "reason": f"{pct}% remaining", "resets_at": reset,
                 "updated_at": datetime.now().isoformat()}
 

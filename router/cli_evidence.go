@@ -97,9 +97,12 @@ func collectCLIProtocol(e *execution.ProviderEvidence, raw []byte) {
 		if rl == nil {
 			continue
 		}
-		scoped := rl.Model
-		if scoped == "" && rl.LimitID != "codex" {
-			scoped = rl.LimitID
+		scoped, scope := rl.Model, ""
+		if scoped == "" && rl.LimitID != "" && rl.LimitID != "codex" {
+			scope = "unknown"
+		}
+		if rl.LimitID != "" && !execution.ValidIdentifier(rl.LimitID) {
+			continue
 		}
 		if scoped != "" && !execution.ValidIdentifier(scoped) {
 			continue
@@ -117,6 +120,9 @@ func collectCLIProtocol(e *execution.ProviderEvidence, raw []byte) {
 				continue
 			}
 			key := scoped + "|" + strconv.Itoa(minutes)
+			if scope == "unknown" {
+				key = "bucket:" + rl.LimitID + "|" + strconv.Itoa(minutes)
+			}
 			if minutes == 0 {
 				key += "|unknown_" + strconv.Itoa(slot)
 			}
@@ -124,7 +130,7 @@ func collectCLIProtocol(e *execution.ProviderEvidence, raw []byte) {
 			if !reset.IsZero() {
 				resetMS = reset.UnixMilli()
 			}
-			candidate := execution.EvidenceWindow{Model: scoped, Key: key, Minutes: minutes, UsedPercent: *w.UsedPercent, ObservedAt: at.UnixMilli(), ResetAt: resetMS}
+			candidate := execution.EvidenceWindow{Model: scoped, Scope: scope, LimitID: rl.LimitID, Key: key, Minutes: minutes, UsedPercent: *w.UsedPercent, ObservedAt: at.UnixMilli(), ResetAt: resetMS}
 			found := false
 			for i, old := range e.Windows {
 				if old.Key == key {
@@ -271,7 +277,7 @@ func mergeExecutionQuota(q ProviderQuota) ProviderQuota {
 			if w.ResetAt > 0 {
 				reset = time.UnixMilli(w.ResetAt)
 			}
-			next.Windows = append(next.Windows, QuotaWindow{PoolRef: record.PoolRef, Model: w.Model, WindowKey: w.Key, WindowMinutes: w.Minutes, UsedPercent: w.UsedPercent, SourceAt: at, ResetAt: reset})
+			next.Windows = append(next.Windows, QuotaWindow{PoolRef: record.PoolRef, Model: w.Model, Scope: w.Scope, LimitID: w.LimitID, WindowKey: w.Key, WindowMinutes: w.Minutes, UsedPercent: w.UsedPercent, SourceAt: at, ResetAt: reset})
 			if at.After(next.SourceAt) {
 				next.SourceAt = at
 			}

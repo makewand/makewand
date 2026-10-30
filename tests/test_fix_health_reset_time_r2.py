@@ -73,12 +73,12 @@ class TestOutOfRangeObservation(_IsolatedStatus):
                 with self.subTest(updated_at=updated_at, resets=resets):
                     self.write_status({"claude": {"status": "limited", "reason": "x", "resets_at": resets,
                                                   "updated_at": updated_at}})
-                    self.assertIn(health.load_status_cache()["claude"]["status"], ("limited", "healthy"))
+                    self.assertIn(health.load_status_cache()["claude"]["status"], ("limited", "unknown"))
 
     def test_observation_in_year_one_counts_as_long_ago(self):
         self.write_status({"claude": {"status": "limited", "reason": "x", "resets_at": None,
                                       "updated_at": "0001-01-01T00:00:00"}})
-        self.assertEqual(health.load_status_cache()["claude"]["status"], "healthy")
+        self.assertEqual(health.load_status_cache()["claude"]["status"], "unknown")
 
     def test_parser_pacing_and_reset_check_tolerate_them(self):
         for updated_at in OUT_OF_RANGE:
@@ -120,7 +120,7 @@ class TestBareClockWithoutObservation(_IsolatedStatus):
         self.assertEqual(parse_reset_datetime("in 15 minutes", now=datetime(2026, 10, 12, 11, 0)),
                          _local(2026, 10, 12, 11, 15))
 
-    def test_limit_without_timestamp_heals_once_the_time_passed(self):
+    def test_limit_without_timestamp_is_unknown_once_the_time_passed(self):
         now = datetime.now()
         if not 2 <= now.hour <= 21:
             self.skipTest("needs an hour of margin on both sides of the clock within today")
@@ -130,7 +130,7 @@ class TestBareClockWithoutObservation(_IsolatedStatus):
         self.write_status({"claude": {"status": "limited", "reason": "x", "resets_at": passed, "updated_at": ""},
                            "codex": {"status": "limited", "reason": "x", "resets_at": upcoming, "updated_at": ""}})
         cache = health.load_status_cache()
-        self.assertEqual(cache["claude"]["status"], "healthy")
+        self.assertEqual(cache["claude"]["status"], "unknown")
         self.assertEqual(cache["codex"]["status"], "limited")
 
 

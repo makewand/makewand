@@ -74,6 +74,27 @@ class QuotaFreshnessTests(unittest.TestCase):
         with patch("makewand.health._get_official_subscription_quota", return_value=quota):
             self.assertEqual(_sanitize_cache({"codex": {"status": "unknown"}})["codex"]["status"], "limited")
 
+    def test_opaque_rpc_bucket_does_not_block_other_models(self):
+        from makewand.model_quota import quota_reason
+        self.snapshot(Windows=[{
+            "PoolRef": account_identity("codex")["pool_ref"], "Model": "", "Scope": "unknown",
+            "LimitID": "opaque_bucket", "WindowKey": "bucket:opaque_bucket|300",
+            "WindowMinutes": 300, "UsedPercent": 100, "SourceAt": iso(self.now),
+            "ResetAt": iso(self.now + 3600)}])
+        quota = _get_official_subscription_quota("codex")
+        self.assertIsNone(quota["percentage"])
+        self.assertEqual(quota["windows"][0]["scope"], "unknown")
+        self.assertIsNone(quota_reason("codex", "gpt-fixture", quota=quota, info={}))
+
+    def test_model_sublimit_can_be_read_without_changing_shared_quota(self):
+        from makewand.model_quota import quota_reason
+        self.session({"model": "gpt-fixture", "primary": self.window(100, 300)})
+        self.assertIsNone(_get_official_subscription_quota("codex")["percentage"])
+        selected = _get_official_subscription_quota("codex", model="gpt-fixture")
+        self.assertEqual(selected["percentage"], 0)
+        self.assertIsNotNone(quota_reason("codex", "gpt-fixture", quota=selected, info={}))
+        self.assertIsNone(quota_reason("codex", "gpt-other", quota=selected, info={}))
+
     def test_stale_snapshot_does_not_override_fresh_selected_session(self):
         self.snapshot(age=3600, WeeklyPct=100, ResetAt=iso(self.now + 3600))
         self.session({"primary": self.window(23)})

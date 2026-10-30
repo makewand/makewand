@@ -7,7 +7,7 @@
 
 - policy 的 PAUSED 里还没到期的；
 - 账本里还没过期的额度标记；
-- codex / claude 的官方周额度达到策略阈值；
+- 当前账号/模型的有效拒绝记录、官方周额度策略及各额度窗口保护阈值；
 - ``not_tool`` 的同家族候选：provider 同家族，或所带模型属于该工具的模型家族
   （按 discovery.model_family；agy 代理的 claude-* 属于 claude，gpt-oss 属于 codex）。
 
@@ -218,7 +218,7 @@ def quota_argv():
     """官方额度命令的 argv；找不到 Go 组件时返回 None。"""
     from makewand.cli import _find_go_binary
     binary = _find_go_binary()
-    return (binary, "quota") if binary else None
+    return (binary, "quota", "--json") if binary else None
 
 
 def default_quota_reader() -> dict:
@@ -240,6 +240,18 @@ def default_quota_reader() -> dict:
     except (OSError, subprocess.SubprocessError):
         return {}
     stdout = completed.stdout if isinstance(getattr(completed, "stdout", None), str) else ""
+    try:
+        import json
+        structured = json.loads(stdout)
+        if isinstance(structured, dict):
+            # The native command refreshes the account-keyed snapshot. Reuse
+            # the existing identity/freshness validation, including every
+            # independent model/window, rather than parsing display lines.
+            from makewand.health import _get_official_subscription_quota
+            return {provider: _get_official_subscription_quota(provider) or False
+                    for provider in _QUOTA_PROVIDERS}
+    except (ValueError, TypeError):
+        pass
     try:
         return parse_quota_text(stdout)
     except Exception:
@@ -264,6 +276,7 @@ def select(
     discovered: Optional[Mapping] = None,
     request_id: Optional[str] = None,
     retry_approved: bool = False,
+    status_reader=None,
 ) -> RouteResult:
     """选择这一档要派的候选。
 
@@ -305,20 +318,32 @@ def select(
         if _pause_reason(policy, row.provider, moment) or _mark_reason(marks.get(row.provider), moment) or row.provider in request_blocks:
             blocked_early.append(row.provider)
     quota = _read_quota(rows, blocked_early, quota_reader)
+    # Explicit readers keep deterministic/offline callers free of wall-clock
+    # and status-file reads. The CLI supplies its status reader explicitly.
+    if status_reader is None and quota_reader is default_quota_reader:
+        from makewand.health import load_status_cache
+        status_reader = load_status_cache
+    cached_status = status_reader() if status_reader is not None else {}
+    if not isinstance(cached_status, Mapping):
+        cached_status = {}
 
     skipped = []
     seen_skipped = set()
     # provider → 因模型家族跳过的模型（只跳过这些组合，这家其余模型照常参选）。
     family_models = {}
+    quota_models = {}
     available = []
     for index, row in enumerate(rows):
-        reason = (
+        provider_reason = (
             _pause_reason(policy, row.provider, moment)
             or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
-            or _quota_reason(row.provider, quota, policy)
-            or _family_reason(row.provider, not_tool)
         )
+        quota_reason = None if provider_reason else _quota_reason(
+            row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
+        reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
+        if quota_reason:
+            quota_models.setdefault(row.provider, set()).add(_row_model(row))
         model = None if reason else _same_model_family(row, not_tool)
         if reason or model:
             # 完整目录里同一 provider 有多个模型×推理深度组合：跳过原因
@@ -335,6 +360,9 @@ def select(
         (provider, reason or _model_family_reason(family_models[provider], not_tool))
         for provider, reason in skipped
     ]
+    partial = {row.provider for _, row in available} & set(quota_models)
+    skipped = [(provider, "部分模型受限（" + ", ".join(sorted(quota_models[provider])) + "）：" + reason
+                if provider in partial and reason else reason) for provider, reason in skipped]
 
     # 一次读出账本快照批量算统计，避免每个候选都全量读 outcomes.jsonl。
     batch_requests = [
@@ -469,23 +497,9 @@ def _mark_reason(mark, now: float) -> Optional[str]:
     return "额度标记未过期"
 
 
-def _quota_reason(provider: str, quota: Mapping, policy: Policy) -> Optional[str]:
-    if provider == "codex":
-        limit = policy.codex_max_weekly
-    elif provider == "claude":
-        limit = policy.claude_max_weekly
-    else:
-        return None
-    # 这家没有读数时不排除。派活失败再由调用方记标记。
-    if provider not in quota:
-        return None
-    percent, resets = _coerce_quota_entry(quota[provider])
-    if percent is None or percent < limit:
-        return None
-    reason = f"周额度已用 {_format_percent(percent)}%，达到阈值 {_format_percent(limit)}%"
-    if resets:
-        reason += f"（{resets}）"
-    return reason
+def _quota_reason(provider: str, quota: Mapping, policy: Policy, model=None, info=None) -> Optional[str]:
+    from makewand.model_quota import quota_reason
+    return quota_reason(provider, model, quota=quota.get(provider, False), info=info, policy=policy)
 
 
 def _validate_not_tool(not_tool: Optional[str]) -> None:

@@ -560,12 +560,26 @@ def start(attempt, *, budget_file=None, max_model_calls=None):
     _transition(attempt, False, budget_file, max_model_calls)
 
 
+def note_resolved_model(attempt, model, *, budget_file=None, max_model_calls=None):
+    """Record a trusted command resolution; requested/observed model stay distinct."""
+    if attempt is None:
+        return
+    with _ledger(budget_file, max_model_calls) as (path, data):
+        for entry in data["attempts"]:
+            if entry["id"] == attempt:
+                if entry["status"] == "started" and not entry.get("resolved_model"):
+                    entry["resolved_model"] = model
+                    _save(path, data)
+                return
+        raise BudgetError("model task reservation disappeared")
+
+
 def release_unstarted(attempt, *, budget_file=None, max_model_calls=None):
     _transition(attempt, True, budget_file, max_model_calls)
 
 
 def reject_unlaunched(attempt, *, budget_file=None, max_model_calls=None):
-    """Trusted runtime account refusal before any transport invocation."""
+    """Trusted runtime account/quota refusal before any transport invocation."""
     _transition(attempt, True, budget_file, max_model_calls, account_refusal=True)
 
 

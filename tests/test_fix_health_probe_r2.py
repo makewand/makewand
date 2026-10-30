@@ -76,7 +76,8 @@ class _Isolated(unittest.TestCase):
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.health.run_subprocess", side_effect=fake_run):
             cache = health.get_or_update_status(force_probe=True)
-        return cache["agy"], [c for c in calls if _is_real_agy_call(c)]
+        from makewand.model_quota import projected_status
+        return projected_status("agy", cache["agy"], health.AGY_PROBE_MODEL), [c for c in calls if _is_real_agy_call(c)]
 
     @staticmethod
     def usable(cache_entry):
@@ -126,16 +127,16 @@ class TestProbeRecordedFailuresStayProtected(_Isolated):
         entry, _ = self.probe((1, "", QUOTA, None))
         self.assertEqual(entry["status"], "limited")
         entry, calls = self.probe((1, "", QUOTA, None))
-        self.assertEqual((entry["status"], len(calls)), ("limited", 1))
+        self.assertEqual((entry["status"], len(calls)), ("limited", 0))
         entry, calls = self.probe((0, "ok\n", "", None))
-        self.assertEqual((entry["status"], entry.get("verified"), len(calls)), ("healthy", True, 1))
+        self.assertEqual((entry["status"], len(calls)), ("limited", 0))
 
-    def test_dispatch_recorded_quota_limit_gets_a_real_call(self):
+    def test_dispatch_recorded_quota_limit_never_spends_a_probe_call(self):
         health.record_engine_limit("agy", "Google AI 配额暂时耗尽", "待重置")
         entry, calls = self.probe((1, "", QUOTA, None))
-        self.assertEqual((entry["status"], len(calls)), ("limited", 1))
+        self.assertEqual((entry["status"], len(calls)), ("limited", 0))
         entry, calls = self.probe((0, "ok\n", "", None))
-        self.assertEqual((entry["status"], entry.get("verified")), ("healthy", True))
+        self.assertEqual((entry["status"], len(calls)), ("limited", 0))
 
     def test_no_real_call_without_a_live_failure(self):
         health.record_engine_failure("agy", "error", REGION_REASON)

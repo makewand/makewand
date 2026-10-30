@@ -20,6 +20,7 @@ class _ProviderInvocation:
     def __init__(self):
         self.used = False
         self.account_refused = False
+        self.preflight_refused = False
         self.settled = False
         self.lock = threading.Lock()
 
@@ -340,12 +341,16 @@ def execute(request, callback):
                     result = _result(request, "UNKNOWN", error="provider outcome unavailable after dispatch", attempt_id=attempt,
                         duration_ms=max(0, int((time.monotonic() - started) * 1000)), error_kind="provider_exception", outcome_known=False)
             invocation = current_context()["_provider_invocation"]
-            if invocation.account_refused and not invocation.used:
+            if (invocation.account_refused or invocation.preflight_refused) and not invocation.used:
                 try:
                     call_budget.reject_unlaunched(reservation, budget_file=request.budget_file,
                                                   max_model_calls=request.max_model_calls)
-                    result = _result(request, "INVALID_REQUEST", error="selected login changed before launch",
-                                     attempt_id=attempt, error_kind="account_configuration", outcome_known=True)
+                    if invocation.account_refused:
+                        result = _result(request, "INVALID_REQUEST", error="selected login changed before launch",
+                                         attempt_id=attempt, error_kind="account_configuration", outcome_known=True)
+                    else:
+                        result = _result(request, "FAILED", error=result.error,
+                                         attempt_id=attempt, error_kind="quota_preflight", outcome_known=True)
                 except (OSError, RuntimeError, ValueError):
                     result = _result(request, "UNKNOWN", error="account refusal accounting unavailable",
                                      attempt_id=attempt, error_kind="accounting", outcome_known=False)
