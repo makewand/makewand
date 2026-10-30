@@ -81,9 +81,13 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 	// Compare the opaque credential image after the read as well as the plain
 	// account binding. No token field is decoded, logged, hashed or persisted.
 	authPath := filepath.Join(q.CredentialRoot, "auth.json")
+	authInfo, err := cliInspectIdentityMetadata(authPath)
+	if err != nil {
+		return q, err
+	}
 	auth, err := cliReadIdentityMetadata(authPath)
 	if err != nil || quotaAccountRef("codex", quotaAccountID("codex", auth)) != q.AccountRef {
-		return identity, errors.New("Codex login changed before quota read")
+		return identity, errors.New("codex login changed before quota read")
 	}
 	dir, err := os.MkdirTemp("", "makewand-codex-quota-")
 	if err != nil {
@@ -110,7 +114,7 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 	killCLIProcess(help)
 	helpCleanup()
 	if err != nil || helpCapture.Exceeded() || !codexAppServerHelp.Match(helpCapture.StdoutBytes()) {
-		return q, errors.New("Codex does not advertise read-only app-server metadata")
+		return q, errors.New("codex does not advertise read-only app-server metadata")
 	}
 	cmd := exec.CommandContext(ctx, bin, "app-server", "--listen", "stdio://")
 	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, env, time.Second
@@ -155,12 +159,12 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 			}
 			if response.ID != nil && *response.ID == id {
 				if len(response.Error) > 0 || len(response.Result) == 0 {
-					return nil, errors.New("Codex quota metadata request refused")
+					return nil, errors.New("codex quota metadata request refused")
 				}
 				return response.Result, nil
 			}
 		}
-		return nil, errors.New("Codex quota metadata exceeded notification limit")
+		return nil, errors.New("codex quota metadata exceeded notification limit")
 	}
 	if _, err := query("initialize", 1, map[string]any{"clientInfo": map[string]string{"name": "makewand_quota", "version": "1"}}); err != nil {
 		return q, err
@@ -174,10 +178,23 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 		return q, err
 	}
 	after, err := cliReadIdentityMetadata(authPath)
-	if err != nil || !bytes.Equal(auth, after) || !quotaMatches(q, readQuotaIdentity("codex", q.CredentialRoot)) {
-		return identity, errors.New("Codex login changed during quota read")
+	afterInfo, infoErr := cliInspectIdentityMetadata(authPath)
+	if err != nil || infoErr != nil || !quotaAuthVersionEqual(authInfo, afterInfo) ||
+		!bytes.Equal(auth, after) || !quotaMatches(q, readQuotaIdentity("codex", q.CredentialRoot)) {
+		return identity, errors.New("codex login changed during quota read")
 	}
 	return parseCodexQuotaRPC(raw, q, time.Now())
+}
+
+// Restored bytes alone cannot detect an A -> B -> A login switch while the
+// server is reading credentials. Include file identity and version metadata.
+func quotaAuthVersionEqual(before, after os.FileInfo) bool {
+	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return false
+	}
+	dev, ino, changed, versioned := quotaIdentityFileVersion(before)
+	nextDev, nextIno, nextChanged, nextVersioned := quotaIdentityFileVersion(after)
+	return versioned == nextVersioned && (!versioned || (dev == nextDev && ino == nextIno && changed.Equal(nextChanged)))
 }
 
 func parseCodexQuotaRPC(raw []byte, identity ProviderQuota, observed time.Time) (ProviderQuota, error) {

@@ -1662,8 +1662,8 @@ def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = Non
     """One real `agy -p` echo through the shared runtime, ledger and deadline.
 
     `agy --version` cannot tell whether a re-login fixed an authentication
-    failure, a region block ended or a quota reset, so `makewand probe` runs this
-    whenever such a failure is live (the re-login hint tells users to probe).
+    failure or a region block ended, so `makewand probe` runs this when such a
+    failure is live. Known quota refusals do not trigger generated echo probes.
     Its verdicts carry "source": "probe".
     """
     from makewand.providers.agy import classify_agy_failure, _agy_user_facing
@@ -1677,8 +1677,9 @@ def _probe_agy_for_real(*, repo_trust: str = "trusted", cwd: Optional[str] = Non
     combined = f"{out}\n{err}"
     limited, reason, resets = parse_agy_quota(combined)
     if limited:
-        return {"status": "limited", "reason": reason, "resets_at": resets, "updated_at": now,
-                "mode": mode, "source": "probe", "verified": True}
+        from makewand.model_quota import refusal
+        entry = dict(refusal("agy", reason, resets, AGY_PROBE_MODEL), mode=mode, source="probe", verified=True)
+        return dict(entry, quota_limits=[entry])
     failure = classify_agy_failure(combined)
     if failure:
         status, fail_reason, ttl = failure
@@ -1753,17 +1754,21 @@ def get_or_update_status(force_probe: bool = False, *, repo_trust="trusted", cwd
         cache = load_status_cache()
         for model in get_all_supported_providers():
             previous = cache.get(model)
+            if model == "agy":
+                from makewand.model_quota import projected_status
+                previous = projected_status(model, previous, AGY_PROBE_MODEL)
             probed = (probe_model(model) if repo_trust == "trusted" and cwd is None
                       else probe_model(model, repo_trust=repo_trust, cwd=cwd))
             if (model == "agy" and probed.get("status") == "healthy" and probed.get("verified") is False
-                    and _is_live_definite_failure(previous)):
-                # The installed CLI may have been fixed (re-login, region, quota
-                # reset): only a real call can retire the live failure, whether a
-                # dispatch or an earlier real probe recorded it.
+                    and _is_live_definite_failure(previous) and previous.get("status") != "limited"):
+                # A real echo may verify login/region recovery. A known quota
+                # refusal is retained without spending another model to probe it.
                 probed = _probe_agy_for_real(repo_trust=repo_trust, cwd=cwd)
             cache[model] = _merge_probe_result(model, previous, probed)
         save_status_cache(cache)
-        return cache
+        # The writer merges independent model/account observations under lock.
+        # Return that merged view, not our pre-merge probe snapshot.
+        return load_status_cache()
     finally:
         if lock_f is not None:
             try:

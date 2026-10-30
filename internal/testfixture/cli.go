@@ -151,8 +151,13 @@ func run(spec Spec, args []string) int {
 		}
 	}
 	switch spec.Mode {
-	case "codex-quota":
+	case "codex-quota", "codex-quota-aba":
 		if len(args) == 1 && args[0] == "--help" {
+			if spec.Mode == "codex-quota-aba" {
+				if err := os.WriteFile(spec.StateFile, []byte(`{"tokens":{"account_id":"temporary-other-account"}}`), 0o600); err != nil {
+					return 94
+				}
+			}
 			fmt.Fprintln(os.Stdout, "Commands:\n  app-server  Read-only metadata fixture")
 			return 0
 		}

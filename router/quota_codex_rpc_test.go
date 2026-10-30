@@ -56,6 +56,26 @@ func TestCodexQuotaRPCRefusesChangedLogin(t *testing.T) {
 	}
 }
 
+func TestCodexQuotaRPCRefusesRestoredLoginAfterABASwitch(t *testing.T) {
+	q := rpcQuotaIdentity(t)
+	path := filepath.Join(q.CredentialRoot, "auth.json")
+	auth, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	bin := testfixture.WriteCLI(t, "codex", testfixture.Spec{Mode: "codex-quota-aba",
+		Stdout: rpcQuotaResponse(99, 300, time.Now().Add(time.Hour)), StateFile: path, FirstError: string(auth)})
+	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+	result, err := readCodexQuotaRPC(context.Background(), q)
+	if err == nil || result.HasData {
+		t.Fatal("restored login bytes accepted another account's possible quota")
+	}
+}
+
 func TestCodexQuotaRPCDoesNotExecInUntrustedContext(t *testing.T) {
 	q := rpcQuotaIdentity(t)
 	marker := filepath.Join(t.TempDir(), "must-not-launch")

@@ -9,7 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-- 额度拒绝按当前账号和模型隔离，旧 AGY Google 原生模型限流不再误拦仍可用的 Opus/Sonnet；重置后无新证据时显示未知。Codex 增加不生成内容的官方只读额度查询，保留实际窗口时长与未知桶范围；路由和 Python CLI 启动共用额度保护规则。
+- 额度拒绝按当前账号和模型隔离，旧 AGY Google 原生模型限流不再误拦仍可用的 Opus/Sonnet；已知 AGY 限流不再触发额外模型探活，重置后无新证据时显示未知。Codex 增加不生成内容的官方只读额度查询，保留实际窗口时长与未知桶范围；路由和 Python CLI 启动共用额度保护规则。
 - 缺少官方额度时不再用本地调用数推算百分比；确认未启动传输的额度拒绝不消耗模型调用预算，真实启动、失败、超时和 UNKNOWN 仍计数。请求模型、解析模型与 CLI 实际观察模型分开记录；Muse 使用各模型实际声明的推理档位。
 - UNKNOWN CLI 失败只保留已知提供者自身独立 stderr 的脱敏末尾，完整分类后再截取，日志超限保留最新记录；`observe` 增加请求上限和 UNKNOWN/超时后续调用的授权核对提示。
 - 识别 Muse 实际的订阅额度 429 报错，并保留句末标点前 ISO 重置时间的时区；Python 与 Go 共用一致的 CLI 消息目录和回归语料。

@@ -94,6 +94,18 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertIsNotNone(model_quota.quota_reason("agy", "claude-opus-5-5-high", quota=False, info=data))
         self.assertIsNone(model_quota.quota_reason("agy", "claude-sonnet-5-5-high", quota=False, info=data))
 
+    def test_version_probe_preserves_other_models_refusal_without_spending_a_model(self):
+        health.record_engine_limit("agy", "fixture argon refusal", self.reset, model="gemini-4-argon-high")
+        with patch("makewand.config.get_all_supported_providers", return_value=["agy"]), \
+             patch("makewand.health.probe_model", return_value={"status": "healthy", "verified": False,
+                   "reason": "fixture version only", "updated_at": datetime.now().isoformat()}), \
+             patch("makewand.health._probe_agy_for_real") as generated_probe:
+            data = health.get_or_update_status(force_probe=True)["agy"]
+        generated_probe.assert_not_called()
+        self.assertIsNotNone(model_quota.quota_reason("agy", "gemini-4-argon-high", quota=False, info=data))
+        self.assertIsNone(model_quota.quota_reason("agy", "claude-opus-5-5-high", quota=False, info=data))
+        self.assertIsNone(model_quota.quota_reason("agy", "claude-sonnet-5-5-high", quota=False, info=data))
+
     def test_route_keeps_agy_opus_while_native_gemini_is_blocked(self):
         from makewand.route_select import Policy, select
         from makewand.outcome_ledger import OutcomeLedger

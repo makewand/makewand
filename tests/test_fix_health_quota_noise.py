@@ -324,7 +324,11 @@ class TestDispatchWriteBack(unittest.TestCase):
              patch.object(module, "run_subprocess", return_value=(1, out, err, None)):
             result = getattr(module, f"execute_{engine}_task")("review this", cwd=self._tmp.name, readonly=True,
                                                                stream=stream)
-        return result, health.load_status_cache().get(engine, {}).get("status"), relay
+        from makewand.model_quota import projected_status
+        from makewand.discovery import get_provider_model_tier
+        info = projected_status(engine, health.load_status_cache().get(engine, {}),
+                                get_provider_model_tier(engine)["model"])
+        return result, info.get("status"), relay
 
     def test_real_grok_quota_messages_mark_limited_and_relay_to_the_api(self):
         for _, message in REAL_MESSAGES["grok"][:3]:

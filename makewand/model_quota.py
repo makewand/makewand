@@ -116,7 +116,8 @@ def projected_status(provider, info, model=None, identity=None):
         matches.append(row)
     result = dict(info)
     if matches:
-        chosen = max(matches, key=lambda row: row["updated_at"])
+        from makewand.health import _written_at
+        chosen = max(matches, key=_written_at)
         result.update({key: value for key, value in chosen.items() if key != "quota_limits"})
     elif info.get("quota_scope"):
         result.update(status="unknown", verified=False, resets_at=None,
@@ -127,6 +128,8 @@ def projected_status(provider, info, model=None, identity=None):
 
 def refusal(provider, reason, reset, model=None):
     from datetime import datetime
+    if provider == "agy" and reason == "Google AI 配额暂时耗尽" and model is None:
+        model = "gemini"
     scope = dict(selected_scope(provider), model=canonical_model(provider, model))
     return {"status": "limited", "reason": reason, "resets_at": reset,
             "updated_at": datetime.now().isoformat(), "source": "dispatch",
