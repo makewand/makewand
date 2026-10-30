@@ -135,7 +135,7 @@ def execute_grok_task(
             cmd.extend(["--reasoning-effort", target_effort])
 
         from makewand.model_quota import before_cli_launch
-        quota_refusal = before_cli_launch('grok', target_model)
+        quota_refusal = before_cli_launch('grok', target_model, relay=relay, cwd=cwd)
         if quota_refusal is not None:
             return quota_refusal
 

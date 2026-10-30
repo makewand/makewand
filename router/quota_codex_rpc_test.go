@@ -68,11 +68,28 @@ func TestCodexQuotaRPCRefusesRestoredLoginAfterABASwitch(t *testing.T) {
 		t.Fatal(err)
 	}
 	bin := testfixture.WriteCLI(t, "codex", testfixture.Spec{Mode: "codex-quota-aba",
-		Stdout: rpcQuotaResponse(99, 300, time.Now().Add(time.Hour)), StateFile: path, FirstError: string(auth)})
+		Stdout: rpcQuotaResponse(99, 300, time.Now().Add(time.Hour)), StateFile: path, FirstError: string(auth), RestoreMtime: old.UnixNano()})
 	t.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
 	result, err := readCodexQuotaRPC(context.Background(), q)
 	if err == nil || result.HasData {
 		t.Fatal("restored login bytes accepted another account's possible quota")
+	}
+}
+
+func TestQuotaAuthVersionRequiresVerifiedGeneration(t *testing.T) {
+	q := rpcQuotaIdentity(t)
+	path := filepath.Join(q.CredentialRoot, "auth.json")
+	stamp, err := readQuotaAuthVersion(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !quotaAuthVersionEqual(stamp, stamp) {
+		t.Fatal("stable verified generation was rejected")
+	}
+	unknown := stamp
+	unknown.known = false
+	if quotaAuthVersionEqual(stamp, unknown) || quotaAuthVersionEqual(unknown, unknown) {
+		t.Fatal("unavailable generation was accepted as equal")
 	}
 }
 

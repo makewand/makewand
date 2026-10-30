@@ -26,15 +26,16 @@ const executableMarker = "MAKEWAND_OWNED_TEST_FIXTURE_V1\x00"
 // Spec selects fixed local behavior; it never starts a shell, network client or
 // real model. Paths refer only to the parent's owned fixture directory.
 type Spec struct {
-	Mode       string
-	Stdout     string
-	Stderr     string
-	ExitCode   int
-	Sleep      time.Duration
-	Sentinel   string
-	StateFile  string
-	FirstError string
-	LogDir     string
+	Mode         string
+	Stdout       string
+	Stderr       string
+	ExitCode     int
+	Sleep        time.Duration
+	Sentinel     string
+	StateFile    string
+	FirstError   string
+	LogDir       string
+	RestoreMtime int64
 }
 
 // WriteCLI creates a native executable and its controlled sidecar. It works
@@ -193,6 +194,12 @@ func run(spec Spec, args []string) int {
 				result = json.RawMessage(spec.Stdout)
 				if spec.StateFile != "" && os.WriteFile(spec.StateFile, []byte(spec.FirstError), 0o600) != nil {
 					return 94
+				}
+				if spec.RestoreMtime != 0 {
+					at := time.Unix(0, spec.RestoreMtime)
+					if os.Chtimes(spec.StateFile, at, at) != nil {
+						return 94
+					}
 				}
 			default:
 				return 97 // A quota test must never start a model or tool request.

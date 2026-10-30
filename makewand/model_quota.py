@@ -204,8 +204,8 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     return None
 
 
-def before_cli_launch(provider, model):
-    """Record a trusted resolution and refuse known quota before any transport."""
+def before_cli_launch(provider, model, *, relay=None, cwd=None):
+    """Record the CLI resolution; enforce quota or use an explicitly allowed relay."""
     from makewand.execution_runtime import current_context
     context = current_context()
     evidence = context.get("_evidence")
@@ -219,6 +219,8 @@ def before_cli_launch(provider, model):
                                             max_model_calls=context.get("_max_model_calls"))
     reason = quota_reason(provider, model)
     if reason:
+        if relay is not None and relay.available:
+            return relay(f"[Makewand -> {provider}] {reason}；按已允许的 API 接力策略执行", cwd=cwd)
         return refuse_before_launch(reason)
     return None
 

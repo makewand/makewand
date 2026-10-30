@@ -250,7 +250,7 @@ def execute_agy_task(
                 cmd.extend(["--effort", target_effort])
 
         from makewand.model_quota import before_cli_launch
-        quota_refusal = before_cli_launch('agy', target_model)
+        quota_refusal = before_cli_launch('agy', target_model, relay=relay, cwd=cwd)
         if quota_refusal is not None:
             return quota_refusal
 

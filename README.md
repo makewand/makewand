@@ -224,6 +224,8 @@ Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / �
 
 ### 调用与资源预算
 
+`--max-model-calls` 按 Makewand 派发任务计数。官方 CLI 在一次派发内可能进行多轮内部模型调用，内部轮次及供应商报告的调用数需另行核对；它们也不换算为订阅剩余额度。需要内部轮次上限时，还需使用对应 CLI 支持的限制。
+
 ```bash
 makewand run "修复边界用例" --max-model-calls 3 --call-budget-file /tmp/task-budget.json
 makewand run "修复局部边界" --workflow single --risk low --total-timeout 180 --max-model-calls 2

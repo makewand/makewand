@@ -165,6 +165,54 @@ class ModelQuotaScopeTests(unittest.TestCase):
                 self.assertIsNone(quota["percentage"])
                 self.assertNotEqual(calculate_dynamic_pacing(provider, info)["pacing_state"], PACING_LIMITED)
 
+    def test_cached_model_limit_keeps_explicitly_allowed_api_relay(self):
+        from makewand.providers import agy, claude, codex, grok, muse
+        cases = [(agy, "agy", "gemini-4-argon-high"), (claude, "claude", "claude-opus-5-5"),
+                 (codex, "codex", "gpt-6.1-sol"), (grok, "grok", "grok-4.7"),
+                 (muse, "muse", "muse-spark-1.2")]
+        for module, provider, model in cases:
+            with self.subTest(provider=provider):
+                health.record_engine_limit(provider, "fixture cached model refusal", self.reset, model=model)
+                with patch.dict(os.environ, MAKEWAND_API_POLICY="allow_paid"), \
+                     patch("makewand.config.has_subscription_configured", return_value=True), \
+                     patch("makewand.config.has_api_configured", return_value=True), \
+                     patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
+                     patch("makewand.providers.api_client.call_api_chat", return_value=(True, "fixture API answer", None)) as api, \
+                     patch.object(module, "run_subprocess") as cli:
+                    result = getattr(module, "execute_" + provider + "_task")(
+                        "fixture", cwd=str(self.root), model=model, readonly=True)
+                self.assertTrue(result[0], result)
+                self.assertEqual(result[1], "fixture API answer")
+                api.assert_called_once()
+                cli.assert_not_called()
+
+    def test_model_limit_never_enables_paid_api_under_subscription_only(self):
+        from makewand.providers.grok import execute_grok_task
+        health.record_engine_limit("grok", "fixture cached model refusal", self.reset, model="grok-4.7")
+        with patch.dict(os.environ, MAKEWAND_API_POLICY="subscription_only"), \
+             patch("makewand.config.has_subscription_configured", return_value=True), \
+             patch("makewand.config.has_api_configured", return_value=True), \
+             patch("makewand.providers.api_client.call_api_chat") as api, \
+             patch("makewand.providers.grok.run_subprocess") as cli:
+            result = execute_grok_task("fixture", cwd=str(self.root), model="grok-4.7", readonly=True)
+        self.assertFalse(result[0])
+        api.assert_not_called()
+        cli.assert_not_called()
+
+    def test_api_relay_after_model_refusal_still_spends_one_dispatch(self):
+        from makewand.execution_runtime import mark_provider_invocation
+        class Relay:
+            available = True
+            def __call__(self, notice, *, cwd):
+                mark_provider_invocation()
+                return True, "fixture API answer", None
+        result, attempt = self.execute_fixture(
+            lambda request: model_quota.before_cli_launch("agy", request.model, relay=Relay(), cwd=str(self.root)),
+            limited=True, api_policy="allow_paid")
+        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.output, "fixture API answer")
+        self.assertEqual(attempt["status"], "completed")
+
     def quota(self, model, used, minutes=300):
         return dict(self.identity, windows=[{"model": model, "used_percent": used,
                                             "window_minutes": minutes, "pool_ref": self.identity["pool_ref"],
@@ -222,7 +270,7 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertEqual(result.status, "FAILED")
         self.assertNotEqual(attempt["status"], "released")
 
-    def execute_fixture(self, callback, limited=False):
+    def execute_fixture(self, callback, limited=False, api_policy="subscription_only"):
         from makewand.execution_contract import ExecutionRequest
         from makewand.execution_runtime import execute
         budget = self.root / "budget.json"
@@ -231,11 +279,12 @@ class ModelQuotaScopeTests(unittest.TestCase):
         env = {"MAKEWAND_CALL_BUDGET_FILE": str(budget), "MAKEWAND_MAX_MODEL_CALLS": "3",
                "MAKEWAND_EXECUTION_EVIDENCE_DIR": str(self.root / "evidence"),
                "MAKEWAND_EXECUTION_EVENTS_FILE": str(self.root / "events.jsonl"),
-               "MAKEWAND_TASK_ID": "offline-quota-refusal", "MAKEWAND_LAYERED_BUDGET": "0"}
+               "MAKEWAND_TASK_ID": "offline-quota-refusal", "MAKEWAND_LAYERED_BUDGET": "0",
+               "MAKEWAND_API_POLICY": api_policy}
         with patch.dict(os.environ, env), patch("makewand.layered_budget.default_path", return_value=budget):
             request = ExecutionRequest(task_id=env["MAKEWAND_TASK_ID"], stage="review", engine="agy",
                                        model="gemini-4-argon-high", cwd=str(self.root), readonly=True,
-                                       timeout_ms=10000, budget_file=str(budget), max_model_calls=3)
+                                       timeout_ms=10000, budget_file=str(budget), max_model_calls=3, api_policy=api_policy)
             result = execute(request, lambda timeout: callback(request))
         attempt = json.loads(budget.read_text())["attempts"][0]
         return result, attempt

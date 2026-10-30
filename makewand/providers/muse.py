@@ -280,7 +280,7 @@ def execute_muse_task(
             cmd.append(prompt)
 
         from makewand.model_quota import before_cli_launch
-        quota_refusal = before_cli_launch('muse', target_model)
+        quota_refusal = before_cli_launch('muse', target_model, relay=relay, cwd=cwd)
         if quota_refusal is not None:
             return quota_refusal
 

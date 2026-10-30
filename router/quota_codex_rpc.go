@@ -81,7 +81,7 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 	// Compare the opaque credential image after the read as well as the plain
 	// account binding. No token field is decoded, logged, hashed or persisted.
 	authPath := filepath.Join(q.CredentialRoot, "auth.json")
-	authInfo, err := cliInspectIdentityMetadata(authPath)
+	authInfo, err := readQuotaAuthVersion(authPath)
 	if err != nil {
 		return q, err
 	}
@@ -178,7 +178,7 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 		return q, err
 	}
 	after, err := cliReadIdentityMetadata(authPath)
-	afterInfo, infoErr := cliInspectIdentityMetadata(authPath)
+	afterInfo, infoErr := readQuotaAuthVersion(authPath)
 	if err != nil || infoErr != nil || !quotaAuthVersionEqual(authInfo, afterInfo) ||
 		!bytes.Equal(auth, after) || !quotaMatches(q, readQuotaIdentity("codex", q.CredentialRoot)) {
 		return identity, errors.New("codex login changed during quota read")
@@ -188,13 +188,37 @@ func readCodexQuotaRPC(ctx context.Context, identity ProviderQuota) (ProviderQuo
 
 // Restored bytes alone cannot detect an A -> B -> A login switch while the
 // server is reading credentials. Include file identity and version metadata.
-func quotaAuthVersionEqual(before, after os.FileInfo) bool {
-	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+type quotaAuthVersion struct {
+	info       os.FileInfo
+	generation [4]uint64
+	known      bool
+}
+
+func readQuotaAuthVersion(path string) (quotaAuthVersion, error) {
+	// A leaf alias can switch A -> B -> A while its target A stays unchanged.
+	// Passive observations still support credential aliases; active RPC needs
+	// a regular credential file whose generation can actually be pinned.
+	leaf, err := os.Lstat(path)
+	if err != nil || !leaf.Mode().IsRegular() {
+		return quotaAuthVersion{}, errors.New("codex credential path generation unavailable")
+	}
+	info, err := cliInspectIdentityMetadata(path)
+	if err != nil {
+		return quotaAuthVersion{}, err
+	}
+	generation, known := quotaAuthGeneration(path, info)
+	if !known {
+		return quotaAuthVersion{}, errors.New("codex credential file generation unavailable")
+	}
+	return quotaAuthVersion{info: info, generation: generation, known: true}, nil
+}
+
+func quotaAuthVersionEqual(before, after quotaAuthVersion) bool {
+	if !before.known || !after.known || !os.SameFile(before.info, after.info) ||
+		before.info.Size() != after.info.Size() || !before.info.ModTime().Equal(after.info.ModTime()) {
 		return false
 	}
-	dev, ino, changed, versioned := quotaIdentityFileVersion(before)
-	nextDev, nextIno, nextChanged, nextVersioned := quotaIdentityFileVersion(after)
-	return versioned == nextVersioned && (!versioned || (dev == nextDev && ino == nextIno && changed.Equal(nextChanged)))
+	return before.generation == after.generation
 }
 
 func parseCodexQuotaRPC(raw []byte, identity ProviderQuota, observed time.Time) (ProviderQuota, error) {
