@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 FAST_FAMILIES = ["haiku", "luna", "flash", "mini", "nano", "reserve"]
 FAST_KEYWORDS = ["fast", "fastest", "speed", "rapid", "lightweight", "affordable", "easier", "quick", "turbo", "efficient"]
 
-DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "pro"]
+DEEP_FAMILIES = ["opus", "fable", "mythos", "astra", "ultra", "pro", "wonder"]
 # "frontier" is marketing prose ("SpaceXAI's latest frontier model"), not a model
 # family: it may favour a model for deep work but must not push it out of the
 # standard tier the way a deep family name does.
@@ -1281,6 +1281,19 @@ def discover_model_efforts() -> Dict[str, Dict[str, List[str]]]:
     return found
 
 
+def _merge_model_label(entries_by_id: Dict[str, str], label: str) -> None:
+    """Keep one entry per bare model ID, preferring a labeled/described string over a bare ID."""
+    if not isinstance(label, str) or not label.strip():
+        return
+    clean = label.strip()
+    mid = clean.split()[0]
+    if not _valid_model_id(mid):
+        return
+    existing = entries_by_id.get(mid)
+    if existing is None or (" (" not in existing and " (" in clean):
+        entries_by_id[mid] = clean
+
+
 def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
     if refresh:
         # Explicit path only. The lookup below still uses the short implicit
@@ -1306,7 +1319,7 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
             if json_files:
                 cat_data = json.loads(json_files[0].read_text(encoding="utf-8"))
                 cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", [])
-                catalog_found = []
+                catalog_by_id: Dict[str, str] = {}
                 for m in cfg_models:
                     if not isinstance(m, dict):
                         continue
@@ -1315,9 +1328,9 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
                     if not _valid_model_id(mid):
                         continue
                     lbl = f"{mid} ({mname})" if isinstance(mname, str) and mname.strip() else mid
-                    catalog_found.append(lbl)
-                if catalog_found:
-                    models["claude"]["available"] = catalog_found
+                    _merge_model_label(catalog_by_id, lbl)
+                if catalog_by_id:
+                    models["claude"]["available"] = list(catalog_by_id.values())
                     models["claude"]["source"] = "detected"
     except Exception:
         pass
@@ -1329,16 +1342,19 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
             data = json.loads(raw)
             # Only merge with the current list when that list itself was detected;
             # never mix the builtin reference list into "detected" results.
-            found = set(models["claude"]["available"]) if models["claude"]["source"] == "detected" else set()
-            for m in re.findall(r'"model":\s*"([^"]+)"', raw):
-                if _valid_model_id(m):
-                    found.add(m.strip())
+            found_by_id: Dict[str, str] = {}
+            if models["claude"]["source"] == "detected":
+                for item in models["claude"]["available"]:
+                    _merge_model_label(found_by_id, item)
             for m in data.get("additionalModelOptionsCache", []):
                 val = m.get("value")
                 lbl = m.get("label")
                 if _valid_model_id(val) and val.startswith("claude-"):
-                    found.add(f"{val} ({lbl})" if lbl else str(val))
-            detected = sorted([m for m in found if m.startswith("claude-")], reverse=True)
+                    _merge_model_label(found_by_id, f"{val} ({lbl})" if lbl else str(val))
+            for m in re.findall(r'"model":\s*"([^"]+)"', raw):
+                if _valid_model_id(m) and m.strip().startswith("claude-"):
+                    _merge_model_label(found_by_id, m.strip())
+            detected = sorted([m for m in found_by_id.values() if m.startswith("claude-")], reverse=True)
             if detected:
                 models["claude"]["available"] = detected
                 models["claude"]["source"] = "detected"
@@ -1371,7 +1387,7 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
         else:
             codex_bases.append(Path.home() / ".codex")
 
-        found = set()
+        found_by_id: Dict[str, str] = {}
         configured_model = None
 
         for base in codex_bases:
@@ -1380,19 +1396,18 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
 
             # 1. Read models_cache.json (official model catalog from OpenAI)
             cache_file = base / "models_cache.json"
+            cache_has_visible = False
             if cache_file.exists():
                 try:
                     cdata = json.loads(cache_file.read_text(encoding="utf-8"))
                     for m in cdata.get("models", []):
-                        if not isinstance(m, dict):
+                        if not isinstance(m, dict) or m.get("visibility") == "hide":
                             continue
                         slug = m.get("slug") or m.get("id")
                         desc = m.get("description", "")
                         if _valid_model_id(slug):
-                            if desc:
-                                found.add(f"{slug} ({desc})")
-                            else:
-                                found.add(slug)
+                            cache_has_visible = True
+                            _merge_model_label(found_by_id, f"{slug} ({desc})" if desc else slug)
                 except Exception:
                     pass
 
@@ -1401,15 +1416,16 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
             if codex_toml.exists():
                 try:
                     raw = codex_toml.read_text(encoding="utf-8")
-                    for m in re.findall(r'\[tui\.model_availability_nux\]\s*([\s\S]*?)(?=\n\[|$)', raw):
-                        for line in m.splitlines():
-                            if "=" in line:
-                                name = line.split("=")[0].strip().strip('"')
-                                if _valid_model_id(name):
-                                    found.add(name)
+                    if not cache_has_visible:
+                        for m in re.findall(r'\[tui\.model_availability_nux\]\s*([\s\S]*?)(?=\n\[|$)', raw):
+                            for line in m.splitlines():
+                                if "=" in line:
+                                    name = line.split("=")[0].strip().strip('"')
+                                    if _valid_model_id(name):
+                                        _merge_model_label(found_by_id, name)
                     for m in re.findall(r'model\s*=\s*"([^"]+)"', raw):
                         if _valid_model_id(m):
-                            found.add(m.strip())
+                            _merge_model_label(found_by_id, m.strip())
                     if not configured_model:
                         cfg_m = re.search(r'^\s*model\s*=\s*"([^"]+)"', raw, re.MULTILINE)
                         if cfg_m and _valid_model_id(cfg_m.group(1)):
@@ -1417,9 +1433,9 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        if found:
+        if found_by_id:
             models["codex"]["available"] = sorted(
-                list(found),
+                list(found_by_id.values()),
                 key=lambda x: (parse_semver(x.split()[0]), x),
                 reverse=True
             )
@@ -1427,8 +1443,8 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
         if configured_model:
             models["codex"]["current_default"] = configured_model
             models["codex"]["default_source"] = "detected"
-        elif found:
-            ranked_std = rank_models_for_tier(list(found), "standard")
+        elif found_by_id:
+            ranked_std = rank_models_for_tier(list(found_by_id.values()), "standard")
             if ranked_std:
                 models["codex"]["current_default"] = ranked_std[0][1]
                 models["codex"]["default_source"] = "detected"
@@ -1441,7 +1457,7 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
         if muse_res.models:
             muse_available = []
             for mid, desc in muse_res.models:
-                lbl = f"{mid} ({desc})" if desc else mid
+                lbl = f"{mid} ({desc})" if desc and desc.strip() != mid else mid
                 muse_available.append(lbl)
             models["muse"]["available"] = sorted(
                 muse_available,
@@ -1620,6 +1636,7 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
     elif provider == "codex":
         discovered_models = []
+        codex_efforts: Dict[str, List[str]] = {}
         configured_default = None
         configured_effort = None
 
@@ -1637,11 +1654,14 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
                 try:
                     cdata = json.loads(cache_file.read_text(encoding="utf-8"))
                     for m in cdata.get("models", []):
-                        if not isinstance(m, dict):
+                        if not isinstance(m, dict) or m.get("visibility") == "hide":
                             continue
                         slug = m.get("slug") or m.get("id")
                         if _valid_model_id(slug):
                             discovered_models.append((slug, m.get("description", "")))
+                            effs = _effort_names(m.get("supported_reasoning_levels") or [])
+                            if effs:
+                                codex_efforts[slug] = effs
                 except Exception:
                     pass
             cfg_file = base / "config.toml"
@@ -1662,12 +1682,15 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
         # If user explicitly configured a model in config.toml and requested standard tier, honor it
         if tier == "standard" and configured_default:
-            return _tier_resolution(configured_default, effort, is_dynamic=True)
+            eff_src = "detected" if (configured_effort or codex_efforts.get(configured_default)) else "builtin"
+            return _tier_resolution(configured_default, effort, is_dynamic=True, effort_source=eff_src)
 
         if discovered_models:
             ranked = rank_models_for_tier(discovered_models, tier)
             if ranked:
-                return _tier_resolution(ranked[0][1], effort, is_dynamic=True)
+                top_id = ranked[0][1]
+                eff_src = "detected" if (codex_efforts.get(top_id) or (tier == "standard" and configured_effort)) else "builtin"
+                return _tier_resolution(top_id, effort, is_dynamic=True, effort_source=eff_src)
 
         fallback_models = {
             "fast": "gpt-6-luna",
@@ -1678,12 +1701,15 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
 
     elif provider == "grok":
         discovered_grok = _discover_local_grok_models()
+        grok_efforts = _grok_effort_map()
 
         effort = "high" if tier == "deep" else ("low" if tier == "fast" else "medium")
         if discovered_grok:
             ranked = rank_models_for_tier(discovered_grok, tier)
             if ranked:
-                return _tier_resolution(ranked[0][1], effort, is_dynamic=True)
+                top_id = ranked[0][1]
+                eff_src = "detected" if grok_efforts.get(top_id) else "builtin"
+                return _tier_resolution(top_id, effort, is_dynamic=True, effort_source=eff_src)
 
         # Without a catalog only the CLI's default model is known to exist. Its
         # speed variant grok-4.7-build-fast costs twice as much, so it is never
@@ -1695,23 +1721,25 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
         discovered_muse = muse_res.models
         configured_default = muse_res.configured_default
         configured_effort = muse_res.configured_effort
+        muse_efforts = getattr(muse_res, "efforts", {}) or {}
 
         effort = configured_effort if (tier == "standard" and configured_effort) else ("max" if tier == "deep" else ("low" if tier == "fast" else "high"))
 
         # If user explicitly configured a model in settings.json and requested standard tier, honor it
         if tier == "standard" and configured_default:
-            return _tier_resolution(configured_default, effort, is_dynamic=True,
-                                    effort_source="detected" if configured_effort else "builtin")
+            eff_src = "detected" if (configured_effort or muse_efforts.get(configured_default)) else "builtin"
+            return _tier_resolution(configured_default, effort, is_dynamic=True, effort_source=eff_src)
 
         if discovered_muse:
             ranked = rank_models_for_tier(discovered_muse, tier)
             if ranked:
-                return _tier_resolution(ranked[0][1], effort, is_dynamic=True,
-                                        effort_source="detected" if configured_effort else "builtin")
+                top_id = ranked[0][1]
+                eff_src = "detected" if (configured_effort or muse_efforts.get(top_id)) else "builtin"
+                return _tier_resolution(top_id, effort, is_dynamic=True, effort_source=eff_src)
 
         if configured_default:
-            return _tier_resolution(configured_default, effort, is_dynamic=True,
-                                    effort_source="detected" if configured_effort else "builtin")
+            eff_src = "detected" if (configured_effort or muse_efforts.get(configured_default)) else "builtin"
+            return _tier_resolution(configured_default, effort, is_dynamic=True, effort_source=eff_src)
 
         # Static fallback when no dynamic catalog is detected
         fallback_models = {

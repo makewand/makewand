@@ -297,6 +297,52 @@ class DiscoveryProvenanceTests(unittest.TestCase):
             _, kwargs = mock_run.call_args
             self.assertEqual(kwargs.get("cwd"), tempfile.gettempdir())
 
+    def test_discover_available_models_deduplicates_bare_ids_and_skips_hidden_codex(self):
+        self.write(".claude/cache/model-catalog/catalog.json", {"catalog": {"config": {"models": [
+            {"id": "claude-opus-5-5", "name": "Opus 5.5"},
+            {"id": "claude-sonnet-5-5", "name": "Sonnet 5.5"},
+        ]}}})
+        self.write(".claude.json", {
+            "model": "claude-opus-5-5",
+            "additionalModelOptionsCache": [
+                {"value": "claude-opus-5-5", "label": "Opus"},
+                {"value": "claude-fable-5-1[1m]", "label": "Fable"},
+            ],
+        })
+        self.write(".codex/models_cache.json", {"models": [
+            {"slug": "gpt-6.1-sol", "description": "Latest workhorse model.", "visibility": "list"},
+            {"slug": "gpt-6-astra", "description": "Frontier model.", "visibility": "list"},
+            {"slug": "gpt-9.9-reserve", "description": "Hidden fast model.", "visibility": "hide"},
+        ]})
+        (self.root / ".codex" / "config.toml").write_text(
+            'model = "gpt-6.1-sol"\n[tui.model_availability_nux]\n"gpt-5.5" = true\n"gpt-6-astra" = true\n',
+            encoding="utf-8",
+        )
+        self.write(".local/share/muse/model-catalog/cat.json", {"rows": [
+            {"model_id": "muse-wonder-1.0", "display_label": "muse-wonder-1.0", "description": None,
+             "visibility": "visible", "reasoning_effort_variants": [{"tier": "low"}, {"tier": "max"}]},
+            {"model_id": "muse-spark-1.3", "display_label": "muse-spark-1.3", "description": None,
+             "visibility": "visible", "reasoning_effort_variants": [{"tier": "low"}, {"tier": "max"}]},
+        ]})
+        models = discover_available_models()
+        self.assertEqual(
+            models["claude"]["available"],
+            ["claude-sonnet-5-5 (Sonnet 5.5)", "claude-opus-5-5 (Opus 5.5)", "claude-fable-5-1[1m] (Fable)"],
+        )
+        claude_ids = [c["model"] for c in models["claude"]["candidates"]]
+        self.assertEqual(len(claude_ids), len(set(claude_ids)))
+        self.assertEqual(
+            models["codex"]["available"],
+            ["gpt-6.1-sol (Latest workhorse model.)", "gpt-6-astra (Frontier model.)"],
+        )
+        codex_ids = [c["model"] for c in models["codex"]["candidates"]]
+        self.assertEqual(codex_ids, ["gpt-6.1-sol", "gpt-6-astra"])
+        self.assertEqual(get_provider_model_tier("codex", "fast")["model"], "gpt-6.1-sol")
+        self.assertEqual(models["muse"]["available"], ["muse-spark-1.3", "muse-wonder-1.0"])
+        self.assertEqual(get_provider_model_tier("muse", "deep")["model"], "muse-wonder-1.0")
+        self.assertEqual(get_provider_model_tier("muse", "deep")["effort_source"], "detected")
+        self.assertEqual(get_provider_model_tier("muse", "fast")["model"], "muse-spark-1.3")
+
 
 if __name__ == "__main__":
     unittest.main()
