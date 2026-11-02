@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -169,4 +170,79 @@ func TestMixedLayeredGoPythonProcessesShareHardLimit(t *testing.T) {
 	t.Setenv("MAKEWAND_PROJECT_DAILY_CALLS", "100")
 	t.Setenv("MAKEWAND_PROJECT_ROOT", t.TempDir())
 	TestMixedGoPythonProcessesShareHardLimit(t)
+}
+
+func TestTaskCounterKeepsWhatItWasGiven(t *testing.T) {
+	layeredFixture(t)
+	data := map[string]any{}
+	if err := initializeScopes(data); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err := scopeKeys(data, Config{TaskID: "plain"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scopeKeys(data, Config{TaskID: "batch", MaxCalls: 300}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scopeKeys(data, Config{TaskID: "batch", MaxCalls: 1}, now); err != nil {
+		t.Fatal(err)
+	}
+	tasks := data["scopes"].(map[string]any)["tasks"].(map[string]any)
+	check := func(task string, maximum, initial int64, source string) {
+		t.Helper()
+		c := tasks[task].(map[string]any)
+		got, _ := jsonInteger(c["maximum"])
+		first, _ := jsonInteger(c["initial_maximum"])
+		if int64(got) != maximum || int64(first) != initial || c["maximum_source"] != source {
+			t.Fatalf("%s: %v", task, c)
+		}
+	}
+	check("plain", 200, 200, "default")
+	check("batch", 1, 300, "stated")
+}
+
+func TestProjectDailyLimitFollowsTheRepository(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	t.Setenv("MAKEWAND_PROJECT_DAILY_CALLS", "2")
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	metadata := filepath.Join(repository, ".git", "worktrees", "linked")
+	nested := filepath.Join(repository, "nested")
+	worktree := filepath.Join(root, "linked")
+	shadow := filepath.Join(root, "shadow")
+	other := filepath.Join(root, "other")
+	for _, directory := range []string{metadata, nested, worktree, filepath.Join(shadow, ".git"), filepath.Join(other, ".git")} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(metadata, "commondir"), []byte("../..\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+metadata+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(task, directory, workingDir string) error {
+		t.Chdir(directory)
+		ctx := ContextWithConfig(context.Background(), Config{LedgerPath: path, MaxCalls: 3, TaskID: task})
+		attempt, err := Reserve(ctx, Metadata{Engine: "fake", WorkingDir: workingDir})
+		if err == nil {
+			t.Cleanup(func() { _ = attempt.Complete(Outcome{Status: Passed, Known: true}) })
+		}
+		return err
+	}
+	if err := reserve("first", nested, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := reserve("second", worktree, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := reserve("third", repository, shadow); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("a shadow clone escaped the repository's limit: %v", err)
+	}
+	if err := reserve("fourth", other, ""); err != nil {
+		t.Fatalf("another repository shared the exhausted limit: %v", err)
+	}
 }

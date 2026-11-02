@@ -1,8 +1,6 @@
 package execution
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -218,25 +216,15 @@ func DefaultBudgetPath() (string, error) {
 	}
 	return filepath.Join(root, "call-budget.json"), nil
 }
+
+// projectRef is the host capacity gate's identity of the process directory,
+// which -C sets: MAKEWAND_PROJECT_ROOT, else the Git repository holding it, so
+// its worktrees and subdirectories share one daily limit. Not a call's working
+// directory: the private shadow clones of a run keep counting against the
+// repository it started from (layered_budget.project_ref computes the same).
 func projectRef() (string, error) {
-	root := os.Getenv("MAKEWAND_PROJECT_ROOT")
-	if root == "" {
-		var err error
-		root, err = os.Getwd()
-		if err != nil {
-			return "", err
-		}
-	}
-	root, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", err
-	}
-	hash := sha256.Sum256([]byte(root))
-	return hex.EncodeToString(hash[:])[:32], nil
+	project, _, err := capacityProject("")
+	return project, err
 }
 func scopeKeys(data map[string]any, cfg Config, now time.Time) ([]any, error) {
 	s := data["scopes"].(map[string]any)
@@ -297,6 +285,15 @@ func scopeKeys(data map[string]any, cfg Config, now time.Time) ([]any, error) {
 		c, exists := counters[key].(map[string]any)
 		if !exists {
 			c = map[string]any{"maximum": json.Number(strconv.Itoa(limits[i])), "used": json.Number("0")}
+			if i == 0 {
+				// A later, smaller limit lowers maximum; these keep what the task was given.
+				source := "default"
+				if cfg.MaxCalls > 0 {
+					source = "stated"
+				}
+				c["initial_maximum"] = json.Number(strconv.Itoa(t))
+				c["maximum_source"] = source
+			}
 			counters[key] = c
 		}
 		limit, _ := jsonInteger(c["maximum"])

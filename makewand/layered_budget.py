@@ -12,7 +12,6 @@ seconds ahead of real time, so a ledger written while the clock was ahead cannot
 stall lease cleanup. Capacity holds are dated from that clock, and one created
 ahead of it is re-dated to it, keeping its duration.
 """
-import hashlib
 import math
 import os
 import sys
@@ -103,10 +102,13 @@ def positive(value):
 
 
 def project_ref():
-    # Canonical invocation directory; callers can supply a canonical project
-    # root to group worktrees. Never derive identity from provider homes.
-    root = str(Path(os.environ.get("MAKEWAND_PROJECT_ROOT") or os.getcwd()).resolve())
-    return hashlib.sha256(root.encode()).hexdigest()[:32]
+    # The host capacity gate's identity of the process directory, which -C sets:
+    # MAKEWAND_PROJECT_ROOT, else the Git repository holding it, so its worktrees
+    # and subdirectories share one daily limit. Not a call's working directory: the
+    # private shadow clones of a run keep counting against the repository it started
+    # from. Never derive identity from provider homes.
+    from makewand import shared_capacity
+    return shared_capacity.project()[0]
 
 
 def default_path():
@@ -180,11 +182,17 @@ def scopes(data, task, maximum):
     task = task or os.environ.get("MAKEWAND_TASK_ID") or "legacy-task"
     project = project_ref()
     keys = [("tasks", task), ("projects", project + ":" + day), ("machine", day)]
-    limits = [positive(maximum if maximum is not None else os.environ.get("MAKEWAND_MAX_MODEL_CALLS", DEFAULT_PROJECT)),
+    stated = maximum if maximum is not None else os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    limits = [positive(stated if stated is not None else DEFAULT_PROJECT),
               positive(os.environ.get("MAKEWAND_PROJECT_DAILY_CALLS", DEFAULT_PROJECT)),
               positive(os.environ.get("MAKEWAND_MACHINE_DAILY_CALLS", DEFAULT_MACHINE))]
     for (group, key), limit in zip(keys, limits):
-        counter = s[group].setdefault(key, {"maximum": limit, "used": 0})
+        counter = s[group].get(key)
+        if counter is None:
+            counter = s[group][key] = {"maximum": limit, "used": 0}
+            if group == "tasks":
+                # A later, smaller limit lowers maximum; these keep what the task was given.
+                counter.update(initial_maximum=limit, maximum_source="stated" if stated is not None else "default")
         # Tightening only changes this scope, never the machine or another task.
         counter["maximum"] = min(counter["maximum"], limit)
         counter["last_used"] = s["clock"]
