@@ -380,6 +380,19 @@ class CLIWorkflowTests(unittest.TestCase):
                     self.assertEqual(os.environ["MAKEWAND_MAX_MODEL_CALLS"], "3")
             self.assertEqual(*paths)  # independent entries share the machine ledger
 
+    def test_only_a_limit_the_command_line_filled_in_is_marked_as_default(self):
+        for arguments, marked in ((["run", "task", "--request-id", "named-1"], "1"),
+                                  (["run", "task", "--request-id", "named-2", "--max-model-calls", "3"], None)):
+            with self.subTest(arguments=arguments), patch.dict(os.environ, {"MAKEWAND_MAX_MODEL_CALLS_DEFAULTED": "1"}), \
+                    patch.object(cli, "run_pipeline", return_value=True):
+                if marked:
+                    os.environ.pop("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED")
+                for key in ("MAKEWAND_MAX_MODEL_CALLS", "MAKEWAND_TASK_ID", "MAKEWAND_REQUEST_ID", "MAKEWAND_CALL_BUDGET_FILE"):
+                    os.environ.pop(key, None)
+                self.assertEqual(self.run_cli(arguments), 0)
+                self.assertEqual(os.environ["MAKEWAND_MAX_MODEL_CALLS"], "3")
+                self.assertEqual(os.environ.get("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED"), marked)
+
     def test_incompatible_choices_and_nonfinite_deadlines_are_usage_errors(self):
         for arguments in (["run", "task", "--workflow", "single"],
                           ["race", "task", "--workflow", "pipeline"],

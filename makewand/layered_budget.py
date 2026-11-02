@@ -183,6 +183,7 @@ def scopes(data, task, maximum):
     project = project_ref()
     keys = [("tasks", task), ("projects", project + ":" + day), ("machine", day)]
     stated = maximum if maximum is not None else os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    source = "stated" if stated is not None and not os.environ.get("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED") else "default"
     limits = [positive(stated if stated is not None else DEFAULT_PROJECT),
               positive(os.environ.get("MAKEWAND_PROJECT_DAILY_CALLS", DEFAULT_PROJECT)),
               positive(os.environ.get("MAKEWAND_MACHINE_DAILY_CALLS", DEFAULT_MACHINE))]
@@ -192,7 +193,7 @@ def scopes(data, task, maximum):
             counter = s[group][key] = {"maximum": limit, "used": 0}
             if group == "tasks":
                 # A later, smaller limit lowers maximum; these keep what the task was given.
-                counter.update(initial_maximum=limit, maximum_source="stated" if stated is not None else "default")
+                counter.update(initial_maximum=limit, maximum_source=source)
         # Tightening only changes this scope, never the machine or another task.
         counter["maximum"] = min(counter["maximum"], limit)
         counter["last_used"] = s["clock"]

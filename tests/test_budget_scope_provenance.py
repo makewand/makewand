@@ -25,12 +25,18 @@ def _linked_repository(root):
     repository = root / "repository"
     metadata = repository / ".git" / "worktrees" / "linked"
     metadata.mkdir(parents=True)
+    (repository / ".git" / "HEAD").write_text("ref: refs/heads/master\n")
     (metadata / "commondir").write_text("../..\n")
     (repository / "nested" / "directory").mkdir(parents=True)
     worktree = root / "linked"
     worktree.mkdir()
     (worktree / ".git").write_text(f"gitdir: {metadata}\n")
     return repository, worktree
+
+
+def _git_directory(directory):
+    (directory / ".git").mkdir(parents=True)
+    (directory / ".git" / "HEAD").write_text("ref: refs/heads/master\n")
 
 
 def test_task_without_a_stated_limit_records_the_default(isolated, monkeypatch):
@@ -59,6 +65,15 @@ def test_limit_from_the_environment_counts_as_stated(isolated, monkeypatch):
     assert (counter["maximum"], counter["initial_maximum"], counter["maximum_source"]) == (7, 7, "stated")
 
 
+def test_limit_the_command_line_filled_in_counts_as_default(isolated, monkeypatch):
+    monkeypatch.setenv("MAKEWAND_MAX_MODEL_CALLS", "3")
+    monkeypatch.setenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED", "1")
+    data = _scoped_ledger()
+    layered_budget.scopes(data, "named", 3)
+    counter = data["scopes"]["tasks"]["named"]
+    assert (counter["maximum"], counter["initial_maximum"], counter["maximum_source"]) == (3, 3, "default")
+
+
 def test_only_task_counters_carry_provenance(isolated):
     data = _scoped_ledger()
     keys = layered_budget.scopes(data, "plain", 3)
@@ -74,9 +89,21 @@ def test_repository_directories_and_worktrees_share_one_project(isolated, tmp_pa
         monkeypatch.chdir(directory)
         assert layered_budget.project_ref() == expected
     other = tmp_path / "other"
-    (other / ".git").mkdir(parents=True)
+    _git_directory(other)
     monkeypatch.chdir(other)
     assert layered_budget.project_ref() != expected
+
+
+def test_an_empty_git_directory_above_does_not_join_directories_into_one_project(isolated, tmp_path, monkeypatch):
+    monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
+    (tmp_path / ".git").mkdir()
+    seen = set()
+    for name in ("first", "second"):
+        (tmp_path / name).mkdir()
+        monkeypatch.chdir(tmp_path / name)
+        seen.add(layered_budget.project_ref())
+    assert seen == {shared_capacity.project(tmp_path / "first")[0], shared_capacity.project(tmp_path / "second")[0]}
+    assert len(seen) == 2
 
 
 def test_project_root_override_still_groups_directories(isolated, tmp_path, monkeypatch):
@@ -115,7 +142,7 @@ def test_a_shadow_clone_counts_against_the_repository_a_run_started_from(isolate
     monkeypatch.setenv("MAKEWAND_POOL_CONCURRENCY", "100")
     repository, _ = _linked_repository(tmp_path)
     for name in ("shadow-coder", "shadow-reviewer"):
-        (tmp_path / name / ".git").mkdir(parents=True)
+        _git_directory(tmp_path / name)
     monkeypatch.chdir(repository)
     budget.reserve("codex", "fast", task_id="coder", working_directory=tmp_path / "shadow-coder")
     with pytest.raises(budget.BudgetError, match="exhausted"):
@@ -128,6 +155,6 @@ def test_a_daily_limit_is_not_lowered_for_another_repository(isolated, tmp_path,
     monkeypatch.setenv("MAKEWAND_ACCOUNT_CONCURRENCY", "100")
     monkeypatch.setenv("MAKEWAND_POOL_CONCURRENCY", "100")
     for name in ("first", "second"):
-        (tmp_path / name / ".git").mkdir(parents=True)
+        _git_directory(tmp_path / name)
         monkeypatch.chdir(tmp_path / name)
         budget.reserve("codex", "fast", task_id=name)

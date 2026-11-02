@@ -200,9 +200,12 @@ func capacityProject(workingDir string) (string, string, error) {
 	if !explicit {
 		for parent := root; ; parent = filepath.Dir(parent) {
 			marker := filepath.Join(parent, ".git")
+			// A directory named .git without HEAD is not a repository.
 			if capacityDirectory(marker) {
-				root = parent
-				break
+				if _, err := readCapacityText(filepath.Join(marker, "HEAD")); err == nil {
+					root = parent
+					break
+				}
 			}
 			if raw, err := readCapacityText(marker); err == nil && strings.HasPrefix(strings.TrimSpace(raw), "gitdir: ") {
 				dir := strings.TrimSpace(raw)[8:]

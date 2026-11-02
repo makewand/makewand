@@ -82,9 +82,12 @@ def project(working_directory=None):
         for parent in (root, *root.parents):
             marker = parent / ".git"
             try:
+                # A directory named .git without HEAD is not a repository.
                 if marker.is_dir():
-                    root = parent
-                    break
+                    if (marker / "HEAD").is_file():
+                        root = parent
+                        break
+                    continue
                 if marker.is_file():
                     raw = ledger_registry._read_bounded(marker).strip()
                     if raw.startswith("gitdir: "):

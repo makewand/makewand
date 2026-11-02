@@ -200,6 +200,33 @@ func TestTaskCounterKeepsWhatItWasGiven(t *testing.T) {
 	}
 	check("plain", 200, 200, "default")
 	check("batch", 1, 300, "stated")
+	t.Setenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED", "1")
+	if _, err := scopeKeys(data, Config{TaskID: "named", MaxCalls: 3}, now); err != nil {
+		t.Fatal(err)
+	}
+	check("named", 3, 3, "default")
+}
+
+func TestEmptyGitDirectoryIsNotARepository(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	first, second := filepath.Join(root, "first"), filepath.Join(root, "second")
+	for _, directory := range []string{filepath.Join(root, ".git"), first, second} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstID, _, err := capacityProject(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, _, err := capacityProject(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID {
+		t.Fatal("an empty .git directory joined unrelated directories into one project")
+	}
 }
 
 func TestProjectDailyLimitFollowsTheRepository(t *testing.T) {
@@ -215,6 +242,11 @@ func TestProjectDailyLimitFollowsTheRepository(t *testing.T) {
 	other := filepath.Join(root, "other")
 	for _, directory := range []string{metadata, nested, worktree, filepath.Join(shadow, ".git"), filepath.Join(other, ".git")} {
 		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range []string{repository, shadow, other} {
+		if err := os.WriteFile(filepath.Join(directory, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}

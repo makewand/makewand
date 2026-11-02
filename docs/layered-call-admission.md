@@ -23,7 +23,10 @@ These are initial conservative local policies, not vendor quota predictions.
 holding the directory the command runs in (`-C` sets it), so linked worktrees and
 subdirectories share one daily limit, and the private shadow clones of a run count
 against the repository it started from. The repository is found without running
-Git, and a directory outside any repository is its own project.
+Git, and a directory outside any repository is its own project; a directory named
+`.git` without `HEAD` does not count as a repository. Calls counted on the day of an
+upgrade from directory keys stay under those keys, so the repository's limit counts
+from zero until local midnight, and an outcome for such a call needs its request ID.
 
 The three scope maps are stored separately **inside one transaction file**.
 A sidecar OS lock plus durable atomic replacement commits admission together.

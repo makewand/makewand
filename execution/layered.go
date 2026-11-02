@@ -288,7 +288,7 @@ func scopeKeys(data map[string]any, cfg Config, now time.Time) ([]any, error) {
 			if i == 0 {
 				// A later, smaller limit lowers maximum; these keep what the task was given.
 				source := "default"
-				if cfg.MaxCalls > 0 {
+				if cfg.MaxCalls > 0 && os.Getenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED") == "" {
 					source = "stated"
 				}
 				c["initial_maximum"] = json.Number(strconv.Itoa(t))
