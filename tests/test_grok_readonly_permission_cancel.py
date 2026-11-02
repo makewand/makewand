@@ -4,6 +4,7 @@ try:
 except ImportError:
     from tests import _isolation
 
+import fnmatch
 import json
 import unittest
 from unittest.mock import patch
@@ -97,13 +98,36 @@ class GrokReadonlyReplyTests(unittest.TestCase):
         allow, deny = _values(command, "--allow"), _values(command, "--deny")
         for rule in ("Bash(cat *)", "Bash(sha256sum)", "Bash(sha256sum *)", "Bash(git diff)", "Bash(git rev-parse)"):
             self.assertIn(rule, allow)
-        for rule in ("Bash(rg *--pre*)", "Bash(sort *--co*)", "Bash(rg *--hostname-bin*)", "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git * --ext-diff*)", "Bash(git difftool*)", "Bash(git branch *--delete*)"):
+        for rule in ("Bash(rg *--pre*)", "Bash(sort *--co*)", "Bash(rg *--hostname-bin*)", "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git * --ext*)", "Bash(git difftool*)", "Bash(git branch *--d*)", "Bash(git branch *--t*)",
+                     "Bash(sort *-[a-zA-Z]o*)", "Bash(uniq * [a-zA-Z0-9_./~]*)", "Bash(git log[a-zA-Z0-9_.-]*)", "Bash(sha256sum[a-zA-Z0-9_.-]*)"):
             self.assertIn(rule, deny)
         for name in ("sed", "find", "awk", "python", "xargs", "tee", "bash", "sh", "file"):
             self.assertFalse([rule for rule in allow if rule in (f"Bash({name})", f"Bash({name} *)")], name)
         # A rule without a trailing space is a bare prefix: "tr" would also approve truncate.
         for name in ("tr", "ps", "ls", "cat", "df", "du", "cut", "nl"):
             self.assertNotIn(f"Bash({name})", allow)
+
+
+class GrokReadonlyRuleMatchingTests(unittest.TestCase):
+    """fnmatch has the *, ? and [...] globs of Grok's rule matching."""
+
+    def _denied(self, command):
+        return any(fnmatch.fnmatchcase(command, rule[5:-1]) for rule in grok._READONLY_DENY_RULES)
+
+    def test_commands_that_run_programs_or_write_are_denied(self):
+        for command in ("git logattack", "sha256sum-evil x", "sorted", "sort -uo out", "sort -ro out", "sort -o out",
+                        "sort --output=out", "sort --compress-p=x big", "uniq in out", "uniq -c in out",
+                        "git branch new", "git branch new HEAD", "git branch --track new HEAD", "git branch -t new HEAD",
+                        "git branch --del old", "git branch -vd old", "git branch -a -D old", "git branch --no-track new", "git branch --set-up=origin/x",
+                        "git log --outp=x", "git diff --ext-d", "git log --textc", "rg --pre=x y", "rg --hostname-bin=x y"):
+            self.assertTrue(self._denied(command), command)
+
+    def test_ordinary_read_commands_are_not_denied(self):
+        for command in ("git log --oneline -5", "git diff HEAD~1 HEAD", "git status --short", "git branch", "git branch -a",
+                        "git branch -v --contains HEAD", "git branch --list", "git branch --format=%(refname)", "git branch --merged", "git show HEAD:README.md", "git rev-parse HEAD",
+                        "sort", "sort -u", "sort -k1,1 -n file.txt", "sort -r report.txt", "uniq", "uniq -c",
+                        "sha256sum", "sha256sum a.txt", "rg -n pattern src", "grep -- -o file"):
+            self.assertFalse(self._denied(command), command)
 
 
 if __name__ == "__main__":

@@ -41,25 +41,30 @@ def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
 # programs or write (sed, find, awk, python, xargs, tee) stays out. The sandbox
 # remains the read-only boundary. A rule without a trailing space is a bare prefix,
 # so only names that no other program starts with get the argument-free form.
-# GNU long options may be abbreviated, so a deny rule names the shortest unique form.
+# A bare rule's deny keeps it from approving a longer name (git logattack runs git-logattack).
+# GNU and Git long options may be abbreviated, so a deny rule names a short unique form.
 # A textconv or external diff driver set in Git config has no flag to match: Grok
 # documents that it prompts despite these rules, which cancels the turn as above.
-_READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
-    "ls", "cat", "date", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg",
-    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "nl", "diff", "cmp", "comm",
-    "basename", "dirname", "realpath", "readlink", "echo", "printf", "test", "seq", "du", "df", "which",
-)) + tuple(f"Bash({name})" for name in (
+_READONLY_BARE_COMMANDS = (
     "pwd", "sort", "uniq", "sha256sum", "sha512sum", "sha1sum", "md5sum",
     "git status", "git branch", "git log", "git diff", "git ls-files", "git show", "git rev-parse",
     "git blame", "git describe", "git merge-base", "git shortlog", "git check-ignore", "git check-attr",
     "git cat-file", "git ls-tree", "git for-each-ref", "git rev-list", "git name-rev", "git count-objects",
-))
-_READONLY_DENY_RULES = (
-    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(rg *--hostname-bin*)", "Bash(sort *-o*)", "Bash(sort *--co*)",
-    "Bash(git * --ext-diff*)", "Bash(git * --output*)", "Bash(git * --textconv*)", "Bash(git * --filters*)",
-    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch *-[dDmMcCfu]*)", "Bash(git branch *--delete*)", "Bash(git branch *--move*)",
-    "Bash(git branch *--copy*)", "Bash(git branch *--force*)", "Bash(git branch *--set-upstream*)",
-    "Bash(git branch *--unset-upstream*)", "Bash(git branch *--edit-description*)",
+)
+_READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
+    "ls", "cat", "date", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg",
+    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "nl", "diff", "cmp", "comm",
+    "basename", "dirname", "realpath", "readlink", "echo", "printf", "test", "seq", "du", "df", "which",
+)) + tuple(f"Bash({name})" for name in _READONLY_BARE_COMMANDS)
+_READONLY_DENY_RULES = tuple(f"Bash({name}[a-zA-Z0-9_.-]*)" for name in _READONLY_BARE_COMMANDS) + (
+    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(rg *--hostname-bin*)", "Bash(sort *--co*)",
+    "Bash(sort *-o*)", "Bash(sort *-[a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z][a-zA-Z]o*)",
+    "Bash(uniq * [a-zA-Z0-9_./~]*)",
+    "Bash(git * --ext*)", "Bash(git * --ou*)", "Bash(git * --te*)", "Bash(git * --fil*)",
+    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch -[dDmMcCfut]*)", "Bash(git branch * -[dDmMcCfut]*)",
+    "Bash(git branch -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch * -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch *--d*)", "Bash(git branch *--mo*)",
+    "Bash(git branch *--cop*)", "Bash(git branch *--forc*)", "Bash(git branch *--t*)", "Bash(git branch *--no-t*)",
+    "Bash(git branch *--se*)", "Bash(git branch *--u*)", "Bash(git branch *--e*)", "Bash(git branch *--cr*)",
 )
 _READONLY_RULES = (
     "This run is unattended. A shell command that needs approval cancels the whole run and loses your "
