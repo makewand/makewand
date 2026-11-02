@@ -96,9 +96,12 @@ def project(working_directory=None):
                             common = ledger_registry._read_bounded(directory / "commondir").strip()
                         except FileNotFoundError:
                             # A separate Git directory or a submodule, not a linked worktree.
-                            root = parent
-                            break
-                        root = (directory / common).resolve().parent
+                            if not directory.is_dir():
+                                raise
+                            common = "."
+                        # A Git directory not named .git has no parent that means anything.
+                        common_directory = (directory / common).resolve()
+                        root = common_directory.parent if common_directory.name == ".git" else common_directory
                         break
             except (OSError, ValueError):
                 continue

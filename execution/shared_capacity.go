@@ -215,8 +215,7 @@ func capacityProject(workingDir string) (string, string, error) {
 				common, err := readCapacityText(filepath.Join(dir, "commondir"))
 				if errors.Is(err, os.ErrNotExist) {
 					// A separate Git directory or a submodule, not a linked worktree.
-					root = parent
-					break
+					common, err = ".", nil
 				}
 				if err == nil {
 					common = strings.TrimSpace(common)
@@ -224,7 +223,11 @@ func capacityProject(workingDir string) (string, string, error) {
 						common = filepath.Join(dir, common)
 					}
 					if resolved, err := filepath.EvalSymlinks(common); err == nil {
-						root = filepath.Dir(resolved)
+						// A Git directory not named .git has no parent that means anything.
+						root = resolved
+						if filepath.Base(resolved) == ".git" {
+							root = filepath.Dir(resolved)
+						}
 						break
 					}
 				}

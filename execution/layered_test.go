@@ -237,6 +237,67 @@ func TestGitFileWithoutCommonDirIsItsOwnRepository(t *testing.T) {
 	}
 }
 
+func TestWorktreesOfASeparateGitDirectoryShareAProjectOfTheirOwn(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	ids := map[string]string{}
+	for _, name := range []string{"first", "second"} {
+		directory := filepath.Join(root, "meta", name+".git")
+		linked := filepath.Join(directory, "worktrees", "linked")
+		if err := os.MkdirAll(linked, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(linked, "commondir"), []byte("../..\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for tree, target := range map[string]string{"main": directory, "linked": linked} {
+			path := filepath.Join(root, name, tree)
+			if err := os.MkdirAll(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+target+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			id, _, err := capacityProject(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids[name+"/"+tree] = id
+		}
+	}
+	if ids["first/main"] != ids["first/linked"] || ids["second/main"] != ids["second/linked"] || ids["first/main"] == ids["second/main"] {
+		t.Fatalf("project keys: %v", ids)
+	}
+}
+
+func TestGitFilePointingAtNothingIsPassedOver(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	repository := filepath.Join(t.TempDir(), "repository")
+	pruned := filepath.Join(repository, "pruned")
+	for _, directory := range []string{filepath.Join(repository, ".git"), pruned} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repository, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pruned, ".git"), []byte("gitdir: "+filepath.Join(repository, "gone")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prunedID, _, err := capacityProject(pruned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryID, _, err := capacityProject(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prunedID != repositoryID {
+		t.Fatal("a stale Git file gave its directory a project of its own")
+	}
+}
+
 func TestEmptyGitDirectoryIsNotARepository(t *testing.T) {
 	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
 	root := t.TempDir()

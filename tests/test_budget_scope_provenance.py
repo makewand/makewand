@@ -108,6 +108,32 @@ def test_a_git_file_without_commondir_is_its_own_repository(isolated, tmp_path, 
     assert expected != shared_capacity.project(parent)[0]
 
 
+def test_worktrees_of_a_separate_git_directory_share_a_project_of_their_own(isolated, tmp_path, monkeypatch):
+    monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
+    ids = {}
+    for name in ("first", "second"):
+        directory = tmp_path / "meta" / f"{name}.git"
+        linked = directory / "worktrees" / "linked"
+        linked.mkdir(parents=True)
+        (linked / "commondir").write_text("../..\n")
+        for tree, target in (("main", directory), ("linked", linked)):
+            (tmp_path / name / tree).mkdir(parents=True)
+            (tmp_path / name / tree / ".git").write_text(f"gitdir: {target}\n")
+            ids[name, tree] = shared_capacity.project(tmp_path / name / tree)[0]
+    assert ids["first", "main"] == ids["first", "linked"]
+    assert ids["second", "main"] == ids["second", "linked"]
+    assert ids["first", "main"] != ids["second", "main"]
+
+
+def test_a_git_file_pointing_at_nothing_is_passed_over(isolated, tmp_path, monkeypatch):
+    monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
+    _git_directory(tmp_path / "repository")
+    pruned = tmp_path / "repository" / "pruned"
+    pruned.mkdir()
+    (pruned / ".git").write_text(f"gitdir: {tmp_path / 'gone'}\n")
+    assert shared_capacity.project(pruned)[0] == shared_capacity.project(tmp_path / "repository")[0]
+
+
 def test_an_empty_git_directory_above_does_not_join_directories_into_one_project(isolated, tmp_path, monkeypatch):
     monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
     (tmp_path / ".git").mkdir()
