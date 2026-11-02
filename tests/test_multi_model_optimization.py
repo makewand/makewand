@@ -339,7 +339,7 @@ class TestGrokProviderIntegration(unittest.TestCase):
         self.assertIn("--permission-mode", cmd_args)
         self.assertEqual(cmd_args[cmd_args.index("--permission-mode") + 1], "plan")
         self.assertIn("--output-format", cmd_args)
-        self.assertEqual(cmd_args[cmd_args.index("--output-format") + 1], "plain")
+        self.assertEqual(cmd_args[cmd_args.index("--output-format") + 1], "json")
 
         # 2. Deep tier: grok-4.7, effort high, writable -> always-approve and bypassPermissions
         ok, out, err = execute_grok_task("write complex module", cwd=ws, tier="deep", readonly=False)

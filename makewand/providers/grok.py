@@ -2,10 +2,12 @@
 Grok Build CLI provider adapter (xAI subscription / Grok Build interactive coding agent).
 """
 
+import json
 import os
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
+from makewand.execution_contract import ExecutionResult
 from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 
 
@@ -31,6 +33,73 @@ def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
 
     return False, "", None
 
+# Grok Build asks before any shell command outside its built-in read-only list.
+# Nobody can answer a headless run: the turn ends with stopReason "cancelled" and
+# exit code 0. An allow rule only counts when every segment of a pipeline matches
+# one, so the built-in commands need rules too, and those rules skip the built-in
+# list's own exclusions: the deny rules restore them. Anything that can run other
+# programs or write (sed, find, awk, python, xargs, tee) stays out. The sandbox
+# remains the read-only boundary. A rule without a trailing space is a bare prefix,
+# so only names that no other program starts with get the argument-free form.
+# A bare rule's deny keeps it from approving a longer name (git logattack runs git-logattack).
+# GNU and Git long options may be abbreviated, so a deny rule names a short unique form.
+# A textconv or external diff driver set in Git config has no flag to match: Grok
+# documents that it prompts despite these rules, which cancels the turn as above.
+_READONLY_BARE_COMMANDS = (
+    "pwd", "sort", "uniq", "sha256sum", "sha512sum", "sha1sum", "md5sum",
+    "git status", "git branch", "git log", "git diff", "git ls-files", "git show", "git rev-parse",
+    "git blame", "git describe", "git merge-base", "git shortlog", "git check-ignore", "git check-attr",
+    "git cat-file", "git ls-tree", "git for-each-ref", "git rev-list", "git name-rev", "git count-objects",
+)
+_READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
+    "ls", "cat", "date", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg",
+    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "nl", "diff", "cmp", "comm",
+    "basename", "dirname", "realpath", "readlink", "echo", "printf", "test", "seq", "du", "df", "which",
+)) + tuple(f"Bash({name})" for name in _READONLY_BARE_COMMANDS)
+_READONLY_DENY_RULES = tuple(f"Bash({name}[a-zA-Z0-9_.-]*)" for name in _READONLY_BARE_COMMANDS) + (
+    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(rg *--hostname-bin*)", "Bash(sort *--co*)",
+    "Bash(sort *-o*)", "Bash(sort *-[a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z][a-zA-Z]o*)",
+    "Bash(uniq * [a-zA-Z0-9_./~]*)",
+    "Bash(git * --ext*)", "Bash(git * --ou*)", "Bash(git * --te*)", "Bash(git * --fil*)",
+    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch * [a-zA-Z0-9_]*)", "Bash(git branch -[dDmMcCfut]*)", "Bash(git branch * -[dDmMcCfut]*)",
+    "Bash(git branch -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch * -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch *--d*)", "Bash(git branch *--mo*)",
+    "Bash(git branch *--cop*)", "Bash(git branch *--forc*)", "Bash(git branch *--t*)", "Bash(git branch *--no-t*)",
+    "Bash(git branch *--se*)", "Bash(git branch *--u*)", "Bash(git branch *--e*)", "Bash(git branch *--cr*)",
+)
+_READONLY_RULES = (
+    "This run is unattended. A shell command that needs approval cancels the whole run and loses your "
+    "answer. Use read_file, grep and list_dir to read files. In the shell use only git read commands, "
+    "ls, cat, head, tail, wc, sort, uniq, tr, cut, grep, rg, the sha*sum and md5sum commands, stat, "
+    "nl, diff, cmp, comm, basename, dirname, realpath, readlink, echo, printf, test, seq, du, df and "
+    "which, joined only by pipes, && or ;. Do not use sed, find, awk, python, xargs or tee, or subshells, "
+    "command substitution, redirection or background jobs."
+)
+# Exit code 0 with one of these is not a finished answer.
+_INCOMPLETE_STOP_REASONS = frozenset(("cancelled", "refusal", "max_tokens", "max_turn_requests"))
+
+
+def _read_json_reply(output):
+    """(text, stopReason) of Grok's JSON object; other output is returned as it is."""
+    try:
+        reply = json.loads(output)
+    except (TypeError, ValueError):
+        return output, None
+    if not isinstance(reply, dict):
+        return output, None
+    text, stop = reply.get("text"), reply.get("stopReason")
+    return text if isinstance(text, str) else output, stop if isinstance(stop, str) else None
+
+
+def _read_json_error(output):
+    """The message of Grok's JSON error object, or None for any other output."""
+    try:
+        reply = json.loads(output)
+    except (TypeError, ValueError):
+        return None
+    message = reply.get("message") if isinstance(reply, dict) else None
+    return message if isinstance(message, str) else None
+
+
 def execute_grok_task(
     prompt: str,
     cwd: Optional[str] = None,
@@ -46,7 +115,7 @@ def execute_grok_task(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Grok Build CLI (xAI).
-    If readonly=True, enforces --permission-mode plan.
+    If readonly=True, enforces --permission-mode plan and reports a turn that did not finish.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
@@ -108,18 +177,25 @@ def execute_grok_task(
     p_file = None
     p_dir = None
     try:
+        # Streaming prints as it arrives, so only a captured reply can carry the stop reason.
+        json_reply = readonly and not stream
+        output_format = "json" if json_reply else "plain"
         if len(prompt.encode("utf-8")) > 32 * 1024:
             import tempfile
             p_dir = tempfile.mkdtemp(prefix="makewand-grok-")
             p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(prompt)
-            cmd = ["grok", "--prompt-file", str(p_file), "--output-format", "plain"]
+            cmd = ["grok", "--prompt-file", str(p_file), "--output-format", output_format]
         else:
-            cmd = ["grok", "-p", prompt, "--output-format", "plain"]
+            cmd = ["grok", "-p", prompt, "--output-format", output_format]
 
         if readonly:
-            cmd.extend(["--permission-mode", "plan", "--max-turns", "25"])
+            cmd.extend(["--permission-mode", "plan", "--max-turns", "25", "--rules", _READONLY_RULES])
+            for rule in _READONLY_ALLOW_RULES:
+                cmd.extend(["--allow", rule])
+            for rule in _READONLY_DENY_RULES:
+                cmd.extend(["--deny", rule])
         else:
             cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions"])
 
@@ -187,15 +263,27 @@ def execute_grok_task(
     # Grok Build's own lines are stderr, or the merged stream when the runner
     # merged stderr into stdout.
     apart = stderr_captured_apart(err, stream)
+    own_lines = err
+    # In JSON mode the error object on stdout is Grok's own line, not the model's answer.
+    message = _read_json_error(out) if json_reply and code != 0 else None
+    if message is not None:
+        out, own_lines = message, f"{message}\n{err}"
     combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
-        return True, out, None
+        if not json_reply:
+            return True, out, None
+        text, stop = _read_json_reply(out)
+        if stop in _INCOMPLETE_STOP_REASONS:
+            return ExecutionResult(
+                False, text, f"Grok 未完成本轮（stopReason={stop}）；cancelled 通常是命令需要审批而无人应答",
+                status="FAILED", engine="grok", readonly=readonly, outcome_known=True, error_kind="incomplete_turn")
+        return True, text, None
 
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("grok", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_grok_quota(out, err if apart else None)
+    is_limited, reason, resets = parse_grok_quota(out, own_lines if apart else None)
     if is_limited:
         record_engine_limit("grok", reason, resets, model=target_model)
         if relay.available:
