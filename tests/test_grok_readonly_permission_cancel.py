@@ -118,13 +118,13 @@ class GrokReadonlyRuleMatchingTests(unittest.TestCase):
         for command in ("git logattack", "sha256sum-evil x", "sorted", "sort -uo out", "sort -ro out", "sort -o out",
                         "sort --output=out", "sort --compress-p=x big", "uniq in out", "uniq -c in out",
                         "git branch new", "git branch new HEAD", "git branch --track new HEAD", "git branch -t new HEAD",
-                        "git branch --del old", "git branch -vd old", "git branch -a -D old", "git branch --no-track new", "git branch --set-up=origin/x",
+                        "git branch -q new", "git branch --contains HEAD", "git branch --del old", "git branch -vd old", "git branch -a -D old", "git branch --no-track new", "git branch --set-up=origin/x",
                         "git log --outp=x", "git diff --ext-d", "git log --textc", "rg --pre=x y", "rg --hostname-bin=x y"):
             self.assertTrue(self._denied(command), command)
 
     def test_ordinary_read_commands_are_not_denied(self):
         for command in ("git log --oneline -5", "git diff HEAD~1 HEAD", "git status --short", "git branch", "git branch -a",
-                        "git branch -v --contains HEAD", "git branch --list", "git branch --format=%(refname)", "git branch --merged", "git show HEAD:README.md", "git rev-parse HEAD",
+                        "git branch -vv", "git branch --list", "git branch --format=%(refname)", "git branch --merged", "git show HEAD:README.md", "git rev-parse HEAD",
                         "sort", "sort -u", "sort -k1,1 -n file.txt", "sort -r report.txt", "uniq", "uniq -c",
                         "sha256sum", "sha256sum a.txt", "rg -n pattern src", "grep -- -o file"):
             self.assertFalse(self._denied(command), command)

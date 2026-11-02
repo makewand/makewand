@@ -61,7 +61,7 @@ _READONLY_DENY_RULES = tuple(f"Bash({name}[a-zA-Z0-9_.-]*)" for name in _READONL
     "Bash(sort *-o*)", "Bash(sort *-[a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z]o*)", "Bash(sort *-[a-zA-Z][a-zA-Z][a-zA-Z]o*)",
     "Bash(uniq * [a-zA-Z0-9_./~]*)",
     "Bash(git * --ext*)", "Bash(git * --ou*)", "Bash(git * --te*)", "Bash(git * --fil*)",
-    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch -[dDmMcCfut]*)", "Bash(git branch * -[dDmMcCfut]*)",
+    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch * [a-zA-Z0-9_]*)", "Bash(git branch -[dDmMcCfut]*)", "Bash(git branch * -[dDmMcCfut]*)",
     "Bash(git branch -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch * -[a-zA-Z][dDmMcCfut]*)", "Bash(git branch *--d*)", "Bash(git branch *--mo*)",
     "Bash(git branch *--cop*)", "Bash(git branch *--forc*)", "Bash(git branch *--t*)", "Bash(git branch *--no-t*)",
     "Bash(git branch *--se*)", "Bash(git branch *--u*)", "Bash(git branch *--e*)", "Bash(git branch *--cr*)",
