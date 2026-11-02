@@ -2,10 +2,12 @@
 Grok Build CLI provider adapter (xAI subscription / Grok Build interactive coding agent).
 """
 
+import json
 import os
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
+from makewand.execution_contract import ExecutionResult
 from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 
 
@@ -31,6 +33,65 @@ def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
 
     return False, "", None
 
+# Grok Build asks before any shell command outside its built-in read-only list.
+# Nobody can answer a headless run: the turn ends with stopReason "cancelled" and
+# exit code 0. An allow rule only counts when every segment of a pipeline matches
+# one, so the built-in commands need rules too, and those rules skip the built-in
+# list's own exclusions: the deny rules restore them. Anything that can run other
+# programs or write (sed, find, awk, python, xargs, tee) stays out. The sandbox
+# remains the read-only boundary. A rule without a trailing space is a bare prefix,
+# so only names that no other program starts with get the argument-free form.
+_READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
+    "ls", "cat", "date", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg",
+    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "file", "nl", "diff", "cmp", "comm",
+    "basename", "dirname", "realpath", "readlink", "echo", "printf", "test", "seq", "du", "df", "which",
+)) + tuple(f"Bash({name})" for name in (
+    "pwd", "sort", "uniq", "sha256sum", "sha512sum", "sha1sum", "md5sum",
+    "git status", "git branch", "git log", "git diff", "git ls-files", "git show", "git rev-parse",
+    "git blame", "git describe", "git merge-base", "git shortlog", "git check-ignore", "git check-attr",
+    "git cat-file", "git ls-tree", "git for-each-ref", "git rev-list", "git name-rev", "git count-objects",
+))
+_READONLY_DENY_RULES = (
+    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(sort *-o*)", "Bash(sort *--output*)", "Bash(sort *--compress-program*)",
+    "Bash(git * --ext-diff*)", "Bash(git * --output*)", "Bash(git * --textconv*)", "Bash(git * --filters*)",
+    "Bash(git branch *-[dDmMcCfu]*)", "Bash(git branch *--delete*)", "Bash(git branch *--move*)",
+    "Bash(git branch *--copy*)", "Bash(git branch *--force*)", "Bash(git branch *--set-upstream*)",
+    "Bash(git branch *--unset-upstream*)", "Bash(git branch *--edit-description*)",
+)
+_READONLY_RULES = (
+    "This run is unattended. A shell command that needs approval cancels the whole run and loses your "
+    "answer. Use read_file, grep and list_dir to read files. In the shell use only git read commands, "
+    "ls, cat, head, tail, wc, sort, uniq, tr, cut, grep, rg, the sha*sum and md5sum commands, stat, file, "
+    "nl, diff, cmp, comm, basename, dirname, realpath, readlink, echo, printf, test, seq, du, df and "
+    "which, joined only by pipes, && or ;. Do not use sed, find, awk, python, xargs or tee, or subshells, "
+    "command substitution, redirection or background jobs."
+)
+# Exit code 0 with one of these is not a finished answer.
+_INCOMPLETE_STOP_REASONS = frozenset(("cancelled", "refusal", "max_tokens", "max_turn_requests"))
+
+
+def _read_json_reply(output):
+    """(text, stopReason) of Grok's JSON object; other output is returned as it is."""
+    try:
+        reply = json.loads(output)
+    except (TypeError, ValueError):
+        return output, None
+    if not isinstance(reply, dict) or not isinstance(reply.get("text"), str):
+        return output, None
+    stop = reply.get("stopReason")
+    return reply["text"], stop if isinstance(stop, str) else None
+
+
+def _read_json_error(output):
+    """The message of Grok's JSON error object, so limit detection sees it as a line."""
+    try:
+        reply = json.loads(output)
+    except (TypeError, ValueError):
+        return output
+    message = reply.get("message") if isinstance(reply, dict) else None
+    return message if isinstance(message, str) else output
+
+
 def execute_grok_task(
     prompt: str,
     cwd: Optional[str] = None,
@@ -46,7 +107,7 @@ def execute_grok_task(
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     """
     Dispatches task to Grok Build CLI (xAI).
-    If readonly=True, enforces --permission-mode plan.
+    If readonly=True, enforces --permission-mode plan and reports a turn that did not finish.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
     from makewand.health import load_status_cache, save_status_cache, record_engine_limit
@@ -108,18 +169,25 @@ def execute_grok_task(
     p_file = None
     p_dir = None
     try:
+        # Streaming prints as it arrives, so only a captured reply can carry the stop reason.
+        json_reply = readonly and not stream
+        output_format = "json" if json_reply else "plain"
         if len(prompt.encode("utf-8")) > 32 * 1024:
             import tempfile
             p_dir = tempfile.mkdtemp(prefix="makewand-grok-")
             p_file = os.path.join(p_dir, "prompt.txt")
             with open(p_file, "w", encoding="utf-8") as pf:
                 pf.write(prompt)
-            cmd = ["grok", "--prompt-file", str(p_file), "--output-format", "plain"]
+            cmd = ["grok", "--prompt-file", str(p_file), "--output-format", output_format]
         else:
-            cmd = ["grok", "-p", prompt, "--output-format", "plain"]
+            cmd = ["grok", "-p", prompt, "--output-format", output_format]
 
         if readonly:
-            cmd.extend(["--permission-mode", "plan", "--max-turns", "25"])
+            cmd.extend(["--permission-mode", "plan", "--max-turns", "25", "--rules", _READONLY_RULES])
+            for rule in _READONLY_ALLOW_RULES:
+                cmd.extend(["--allow", rule])
+            for rule in _READONLY_DENY_RULES:
+                cmd.extend(["--deny", rule])
         else:
             cmd.extend(["--always-approve", "--permission-mode", "bypassPermissions"])
 
@@ -187,10 +255,19 @@ def execute_grok_task(
     # Grok Build's own lines are stderr, or the merged stream when the runner
     # merged stderr into stdout.
     apart = stderr_captured_apart(err, stream)
+    if json_reply and code != 0:
+        out = _read_json_error(out)
     combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
-        return True, out, None
+        if not json_reply:
+            return True, out, None
+        text, stop = _read_json_reply(out)
+        if stop in _INCOMPLETE_STOP_REASONS:
+            return ExecutionResult(
+                False, text, f"Grok 未完成本轮（stopReason={stop}）；cancelled 通常是命令需要审批而无人应答",
+                status="FAILED", engine="grok", readonly=readonly, outcome_known=True, error_kind="incomplete_turn")
+        return True, text, None
 
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("grok", code, combined, err, ex, readonly)
