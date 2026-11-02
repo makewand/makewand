@@ -53,15 +53,33 @@ class GrokReadonlyReplyTests(unittest.TestCase):
             self.assertEqual(outcome.output, "partial")
 
     def test_output_that_is_not_the_json_object_is_kept(self):
-        for output in ("plain words", "[1, 2]", '{"stopReason": "cancelled"}'):
+        for output in ("plain words", "[1, 2]", '{"stopReason": "end_turn"}'):
             (ok, text, _), _ = self._run((0, output, "", None))
             self.assertEqual((ok, text), (True, output))
+
+    def test_a_cancelled_turn_without_text_still_fails(self):
+        outcome, _ = self._run((0, '{"stopReason": "cancelled"}', "", None))
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.error_kind, "incomplete_turn")
 
     def test_a_json_error_still_reaches_limit_detection(self):
         message = "API error (status 402 Payment Required): limit reached"
         with patch("makewand.providers.grok.parse_grok_quota", return_value=(False, "", None)) as parse:
             self._run((1, json.dumps({"type": "error", "message": message}), "", None))
         self.assertEqual(parse.call_args[0][0], message)
+
+    def test_a_limit_in_a_json_error_is_recorded_with_stderr_captured_apart(self):
+        message = "You've reached your free Grok Build usage limit"
+        for stderr in ("", "unrelated line"):
+            self.assertEqual(grok.parse_grok_quota(message, stderr)[0], False)
+            with patch("makewand.health.record_engine_limit") as record:
+                self._run((1, json.dumps({"type": "error", "message": message}), stderr, None))
+            record.assert_called_once()
+
+    def test_a_failing_answer_on_stdout_is_not_read_as_a_limit(self):
+        with patch("makewand.health.record_engine_limit") as record:
+            self._run((1, "You've reached your free Grok Build usage limit", "", None))
+        record.assert_not_called()
 
     def test_streaming_stays_plain_text(self):
         (ok, text, _), command = self._run((0, "live words", "", None), stream=True)
@@ -79,9 +97,9 @@ class GrokReadonlyReplyTests(unittest.TestCase):
         allow, deny = _values(command, "--allow"), _values(command, "--deny")
         for rule in ("Bash(cat *)", "Bash(sha256sum)", "Bash(sha256sum *)", "Bash(git diff)", "Bash(git rev-parse)"):
             self.assertIn(rule, allow)
-        for rule in ("Bash(rg *--pre*)", "Bash(sort *--compress-program*)", "Bash(git * --ext-diff*)", "Bash(git difftool*)", "Bash(git branch *--delete*)"):
+        for rule in ("Bash(rg *--pre*)", "Bash(sort *--co*)", "Bash(rg *--hostname-bin*)", "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git * --ext-diff*)", "Bash(git difftool*)", "Bash(git branch *--delete*)"):
             self.assertIn(rule, deny)
-        for name in ("sed", "find", "awk", "python", "xargs", "tee", "bash", "sh"):
+        for name in ("sed", "find", "awk", "python", "xargs", "tee", "bash", "sh", "file"):
             self.assertFalse([rule for rule in allow if rule in (f"Bash({name})", f"Bash({name} *)")], name)
         # A rule without a trailing space is a bare prefix: "tr" would also approve truncate.
         for name in ("tr", "ps", "ls", "cat", "df", "du", "cut", "nl"):

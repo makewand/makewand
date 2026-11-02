@@ -41,9 +41,12 @@ def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
 # programs or write (sed, find, awk, python, xargs, tee) stays out. The sandbox
 # remains the read-only boundary. A rule without a trailing space is a bare prefix,
 # so only names that no other program starts with get the argument-free form.
+# GNU long options may be abbreviated, so a deny rule names the shortest unique form.
+# A textconv or external diff driver set in Git config has no flag to match: Grok
+# documents that it prompts despite these rules, which cancels the turn as above.
 _READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
     "ls", "cat", "date", "ps", "head", "tail", "wc", "sort", "uniq", "tr", "cut", "grep", "rg",
-    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "file", "nl", "diff", "cmp", "comm",
+    "sha256sum", "sha512sum", "sha1sum", "md5sum", "stat", "nl", "diff", "cmp", "comm",
     "basename", "dirname", "realpath", "readlink", "echo", "printf", "test", "seq", "du", "df", "which",
 )) + tuple(f"Bash({name})" for name in (
     "pwd", "sort", "uniq", "sha256sum", "sha512sum", "sha1sum", "md5sum",
@@ -52,16 +55,16 @@ _READONLY_ALLOW_RULES = tuple(f"Bash({name} *)" for name in (
     "git cat-file", "git ls-tree", "git for-each-ref", "git rev-list", "git name-rev", "git count-objects",
 ))
 _READONLY_DENY_RULES = (
-    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(sort *-o*)", "Bash(sort *--output*)", "Bash(sort *--compress-program*)",
+    "Bash(git difftool*)", "Bash(rg *--pre*)", "Bash(rg *--hostname-bin*)", "Bash(sort *-o*)", "Bash(sort *--co*)",
     "Bash(git * --ext-diff*)", "Bash(git * --output*)", "Bash(git * --textconv*)", "Bash(git * --filters*)",
-    "Bash(git branch *-[dDmMcCfu]*)", "Bash(git branch *--delete*)", "Bash(git branch *--move*)",
+    "Bash(git branch [a-zA-Z0-9_]*)", "Bash(git branch *-[dDmMcCfu]*)", "Bash(git branch *--delete*)", "Bash(git branch *--move*)",
     "Bash(git branch *--copy*)", "Bash(git branch *--force*)", "Bash(git branch *--set-upstream*)",
     "Bash(git branch *--unset-upstream*)", "Bash(git branch *--edit-description*)",
 )
 _READONLY_RULES = (
     "This run is unattended. A shell command that needs approval cancels the whole run and loses your "
     "answer. Use read_file, grep and list_dir to read files. In the shell use only git read commands, "
-    "ls, cat, head, tail, wc, sort, uniq, tr, cut, grep, rg, the sha*sum and md5sum commands, stat, file, "
+    "ls, cat, head, tail, wc, sort, uniq, tr, cut, grep, rg, the sha*sum and md5sum commands, stat, "
     "nl, diff, cmp, comm, basename, dirname, realpath, readlink, echo, printf, test, seq, du, df and "
     "which, joined only by pipes, && or ;. Do not use sed, find, awk, python, xargs or tee, or subshells, "
     "command substitution, redirection or background jobs."
@@ -76,20 +79,20 @@ def _read_json_reply(output):
         reply = json.loads(output)
     except (TypeError, ValueError):
         return output, None
-    if not isinstance(reply, dict) or not isinstance(reply.get("text"), str):
+    if not isinstance(reply, dict):
         return output, None
-    stop = reply.get("stopReason")
-    return reply["text"], stop if isinstance(stop, str) else None
+    text, stop = reply.get("text"), reply.get("stopReason")
+    return text if isinstance(text, str) else output, stop if isinstance(stop, str) else None
 
 
 def _read_json_error(output):
-    """The message of Grok's JSON error object, so limit detection sees it as a line."""
+    """The message of Grok's JSON error object, or None for any other output."""
     try:
         reply = json.loads(output)
     except (TypeError, ValueError):
-        return output
+        return None
     message = reply.get("message") if isinstance(reply, dict) else None
-    return message if isinstance(message, str) else output
+    return message if isinstance(message, str) else None
 
 
 def execute_grok_task(
@@ -255,8 +258,11 @@ def execute_grok_task(
     # Grok Build's own lines are stderr, or the merged stream when the runner
     # merged stderr into stdout.
     apart = stderr_captured_apart(err, stream)
-    if json_reply and code != 0:
-        out = _read_json_error(out)
+    own_lines = err
+    # In JSON mode the error object on stdout is Grok's own line, not the model's answer.
+    message = _read_json_error(out) if json_reply and code != 0 else None
+    if message is not None:
+        out, own_lines = message, f"{message}\n{err}"
     combined = f"{out}\n{err}" if apart else out
 
     if code == 0:
@@ -272,7 +278,7 @@ def execute_grok_task(
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("grok", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_grok_quota(out, err if apart else None)
+    is_limited, reason, resets = parse_grok_quota(out, own_lines if apart else None)
     if is_limited:
         record_engine_limit("grok", reason, resets, model=target_model)
         if relay.available:
