@@ -9,16 +9,32 @@ entry points must use the same path. No dollar budget substitutes for these coun
 `--max-model-calls` / `MAKEWAND_MAX_MODEL_CALLS` limits one `MAKEWAND_TASK_ID`.
 The dispatcher generates an ID and passes it through daemon workers, retries,
 repairs and reviews. Independent entry points generate independent IDs.
+A CLI call that names a request and states no limit gets a total of 3. Entry
+points that state no limit and share one task for a whole process, such as
+`serve`, get 200; a CLI call with neither a request ID, a limit nor a ledger
+is not accounted here at all.
+A task counter records the limit it was created with (`initial_maximum`) and
+whether a caller stated it (`maximum_source`: `stated` or `default`). A later,
+smaller limit lowers `maximum` only, so what the task was given stays visible.
 `MAKEWAND_PROJECT_DAILY_CALLS` (default 200) and
 `MAKEWAND_MACHINE_DAILY_CALLS` (default 1000) configure separate daily limits.
 These are initial conservative local policies, not vendor quota predictions.
-`MAKEWAND_PROJECT_ROOT` groups canonical directories/worktrees into one project;
-otherwise the canonical invocation directory is the project identity.
+`MAKEWAND_PROJECT_ROOT` names the project; otherwise it is the Git repository
+holding the directory the command runs in (`-C` sets it), so linked worktrees and
+subdirectories share one daily limit, and the private shadow clones of a run count
+against the repository it started from. The repository is found without running
+Git, and a directory outside any repository is its own project; a directory named
+`.git` without `HEAD` does not count as a repository. Calls counted on the day of an
+upgrade from directory keys stay under those keys, so the repository's limit counts
+from zero until local midnight, an open hold under an old key does not reserve room
+under the new one, and an outcome for such a call needs its request ID. Upgrade the
+Python and Go entries together: an older Go binary keeps writing directory keys.
 
 The three scope maps are stored separately **inside one transaction file**.
 A sidecar OS lock plus durable atomic replacement commits admission together.
 Limits can only tighten within the same scope; a task never rewrites a project
-or machine limit. Daily buckets start at local midnight, and a clock that moves
+or machine limit. Raise a daily limit before that scope's first call of the day,
+or give an approved batch its own `MAKEWAND_PROJECT_ROOT`. Daily buckets start at local midnight, and a clock that moves
 back keeps counting into the latest bucket (see
 [Daily buckets and the budget clock](#daily-buckets-and-the-budget-clock)).
 

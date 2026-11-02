@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format is based on
 
 - Grok JSON 错误里的额度或登录消息现在能被识别（此前 stderr 分开捕获时读不到）；没有 `text` 但 `stopReason` 为 cancelled 的回复也记为失败。只读放行规则去掉 `file`，并拒绝 `sort` 缩写的 `--co`、`rg --hostname-bin` 和带名称参数的 `git branch`。
 - Grok 只读任务遇到需要审批的命令时，整轮会被取消且退出码为 0，此前被记为成功；现在读取 JSON 输出的 `stopReason`，这类未完成的结果如实记为失败（`--stream` 仍是纯文本，无法识别）。同时放行常用只读命令（含管道）并拒绝其中能执行程序或写文件的用法，减少这类取消；沙箱仍是只读边界。
+- 没有 `HEAD` 的 `.git` 目录不再算仓库，空目录不会把无关目录并成一个项目。CLI 自动填入的 3 次上限记为 `maximum_source: default`。升级当天已计入旧键的调用不并入新键，次日恢复一致。
+- 项目每日上限改按 Git 仓库计：同一仓库的工作树和子目录共用一个额度（`MAKEWAND_PROJECT_ROOT` 仍可指定项目），批量任务换工作目录不再绕过上限，单仓库当天调用达到 200 次（可用 `MAKEWAND_PROJECT_DAILY_CALLS` 调整）会被拒绝。任务计数器新增 `initial_maximum` 和 `maximum_source`，上限事后被调小也能看出任务当初拿到的上限和它是否由调用方指定。
 - 模型级限流继续遵守已有 API 接力策略，禁止付费时不启动 API，真实接力仍计入派发预算；Codex 额度查询在 Windows 校验文件 ID 和变更时间，拒绝恢复原字节与 mtime 的账号切换；无法验证文件世代时保留未知与被动证据。
 - 额度拒绝按当前账号和模型隔离，旧 AGY Google 原生模型限流不再误拦仍可用的 Opus/Sonnet；已知 AGY 限流不再触发额外模型探活，重置后无新证据时显示未知。Codex 增加不生成内容的官方只读额度查询，保留实际窗口时长与未知桶范围；路由和 Python CLI 启动共用额度保护规则。
 - 缺少官方额度时不再用本地调用数推算百分比，无当前账号/窗口关联的旧百分比文字也按未知处理；确认未启动传输的额度拒绝不消耗模型调用预算，真实启动、失败、超时和 UNKNOWN 仍计数。请求模型、解析模型与 CLI 实际观察模型分开记录；Muse 使用各模型实际声明的推理档位。

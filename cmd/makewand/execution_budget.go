@@ -58,6 +58,14 @@ func configureExecutionBudget(cmd *cobra.Command) error {
 	}
 	if explicitRequest && maximumText == "" {
 		maximumText = "3"
+		// The ledger keeps this apart from a limit somebody chose.
+		if err := os.Setenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED", "1"); err != nil {
+			return err
+		}
+	} else if cmd.Flags().Changed("max-model-calls") || cmd.InheritedFlags().Changed("max-model-calls") {
+		if err := os.Unsetenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED"); err != nil {
+			return err
+		}
 	}
 	maximum := 0
 	if maximumText != "" {

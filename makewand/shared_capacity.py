@@ -82,15 +82,26 @@ def project(working_directory=None):
         for parent in (root, *root.parents):
             marker = parent / ".git"
             try:
+                # A directory named .git without HEAD is not a repository.
                 if marker.is_dir():
-                    root = parent
-                    break
+                    if (marker / "HEAD").is_file():
+                        root = parent
+                        break
+                    continue
                 if marker.is_file():
                     raw = ledger_registry._read_bounded(marker).strip()
                     if raw.startswith("gitdir: "):
                         directory = (parent / raw[8:]).resolve()
-                        common = ledger_registry._read_bounded(directory / "commondir").strip()
-                        root = (directory / common).resolve().parent
+                        try:
+                            common = ledger_registry._read_bounded(directory / "commondir").strip()
+                        except FileNotFoundError:
+                            # A separate Git directory or a submodule, not a linked worktree.
+                            if not directory.is_dir():
+                                raise
+                            common = "."
+                        # A Git directory not named .git has no parent that means anything.
+                        common_directory = (directory / common).resolve()
+                        root = common_directory.parent if common_directory.name == ".git" else common_directory
                         break
             except (OSError, ValueError):
                 continue

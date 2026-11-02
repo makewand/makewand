@@ -112,6 +112,9 @@ func TestNativeStableRequestSharesDefaultCapAcrossCommands(t *testing.T) {
 			t.Fatalf("fourth independent command escaped shared cap: %v", err)
 		}
 	}
+	if os.Getenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED") != "1" {
+		t.Fatal("the filled-in limit was not marked as a default")
+	}
 	if os.Getenv("MAKEWAND_MAX_MODEL_CALLS") != "3" || os.Getenv("MAKEWAND_CALLER") != "codex" {
 		t.Fatal("request metadata was not preserved")
 	}
