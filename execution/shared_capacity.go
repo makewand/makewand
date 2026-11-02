@@ -212,7 +212,13 @@ func capacityProject(workingDir string) (string, string, error) {
 				if !filepath.IsAbs(dir) {
 					dir = filepath.Join(parent, dir)
 				}
-				if common, err := readCapacityText(filepath.Join(dir, "commondir")); err == nil {
+				common, err := readCapacityText(filepath.Join(dir, "commondir"))
+				if errors.Is(err, os.ErrNotExist) {
+					// A separate Git directory or a submodule, not a linked worktree.
+					root = parent
+					break
+				}
+				if err == nil {
 					common = strings.TrimSpace(common)
 					if !filepath.IsAbs(common) {
 						common = filepath.Join(dir, common)

@@ -26,7 +26,9 @@ against the repository it started from. The repository is found without running
 Git, and a directory outside any repository is its own project; a directory named
 `.git` without `HEAD` does not count as a repository. Calls counted on the day of an
 upgrade from directory keys stay under those keys, so the repository's limit counts
-from zero until local midnight, and an outcome for such a call needs its request ID.
+from zero until local midnight, an open hold under an old key does not reserve room
+under the new one, and an outcome for such a call needs its request ID. Upgrade the
+Python and Go entries together: an older Go binary keeps writing directory keys.
 
 The three scope maps are stored separately **inside one transaction file**.
 A sidecar OS lock plus durable atomic replacement commits admission together.

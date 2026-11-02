@@ -92,7 +92,12 @@ def project(working_directory=None):
                     raw = ledger_registry._read_bounded(marker).strip()
                     if raw.startswith("gitdir: "):
                         directory = (parent / raw[8:]).resolve()
-                        common = ledger_registry._read_bounded(directory / "commondir").strip()
+                        try:
+                            common = ledger_registry._read_bounded(directory / "commondir").strip()
+                        except FileNotFoundError:
+                            # A separate Git directory or a submodule, not a linked worktree.
+                            root = parent
+                            break
                         root = (directory / common).resolve().parent
                         break
             except (OSError, ValueError):

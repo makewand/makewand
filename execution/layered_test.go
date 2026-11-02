@@ -207,6 +207,36 @@ func TestTaskCounterKeepsWhatItWasGiven(t *testing.T) {
 	check("named", 3, 3, "default")
 }
 
+func TestGitFileWithoutCommonDirIsItsOwnRepository(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	module := filepath.Join(parent, "module")
+	gitDirectory := filepath.Join(parent, ".git", "modules", "module")
+	for _, directory := range []string{filepath.Join(module, "nested"), gitDirectory} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(parent, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, ".git"), []byte("gitdir: "+gitDirectory+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, directory := range []string{parent, module, filepath.Join(module, "nested")} {
+		id, _, err := capacityProject(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[directory] = id
+	}
+	if ids[module] != ids[filepath.Join(module, "nested")] || ids[module] == ids[parent] {
+		t.Fatalf("project keys: %v", ids)
+	}
+}
+
 func TestEmptyGitDirectoryIsNotARepository(t *testing.T) {
 	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
 	root := t.TempDir()

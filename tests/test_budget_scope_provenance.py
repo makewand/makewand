@@ -94,6 +94,20 @@ def test_repository_directories_and_worktrees_share_one_project(isolated, tmp_pa
     assert layered_budget.project_ref() != expected
 
 
+def test_a_git_file_without_commondir_is_its_own_repository(isolated, tmp_path, monkeypatch):
+    monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
+    parent = tmp_path / "parent"
+    _git_directory(parent)
+    submodule = parent / "module"
+    (submodule / "nested").mkdir(parents=True)
+    git_directory = parent / ".git" / "modules" / "module"
+    git_directory.mkdir(parents=True)
+    (submodule / ".git").write_text(f"gitdir: {git_directory}\n")
+    expected = shared_capacity.project(submodule)[0]
+    assert shared_capacity.project(submodule / "nested")[0] == expected
+    assert expected != shared_capacity.project(parent)[0]
+
+
 def test_an_empty_git_directory_above_does_not_join_directories_into_one_project(isolated, tmp_path, monkeypatch):
     monkeypatch.delenv("MAKEWAND_PROJECT_ROOT")
     (tmp_path / ".git").mkdir()
