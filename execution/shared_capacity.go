@@ -200,22 +200,34 @@ func capacityProject(workingDir string) (string, string, error) {
 	if !explicit {
 		for parent := root; ; parent = filepath.Dir(parent) {
 			marker := filepath.Join(parent, ".git")
+			// A directory named .git without HEAD is not a repository.
 			if capacityDirectory(marker) {
-				root = parent
-				break
+				if _, err := readCapacityText(filepath.Join(marker, "HEAD")); err == nil {
+					root = parent
+					break
+				}
 			}
 			if raw, err := readCapacityText(marker); err == nil && strings.HasPrefix(strings.TrimSpace(raw), "gitdir: ") {
 				dir := strings.TrimSpace(raw)[8:]
 				if !filepath.IsAbs(dir) {
 					dir = filepath.Join(parent, dir)
 				}
-				if common, err := readCapacityText(filepath.Join(dir, "commondir")); err == nil {
+				common, err := readCapacityText(filepath.Join(dir, "commondir"))
+				if errors.Is(err, os.ErrNotExist) {
+					// A separate Git directory or a submodule, not a linked worktree.
+					common, err = ".", nil
+				}
+				if err == nil {
 					common = strings.TrimSpace(common)
 					if !filepath.IsAbs(common) {
 						common = filepath.Join(dir, common)
 					}
 					if resolved, err := filepath.EvalSymlinks(common); err == nil {
-						root = filepath.Dir(resolved)
+						// A Git directory not named .git has no parent that means anything.
+						root = resolved
+						if filepath.Base(resolved) == ".git" {
+							root = filepath.Dir(resolved)
+						}
 						break
 					}
 				}

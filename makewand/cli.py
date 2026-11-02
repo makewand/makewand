@@ -1892,6 +1892,10 @@ def _main():
         dispatch_subcommands = PROMPT_COMMANDS | {"review", "ensemble", "chat", None}
         if (explicit_request or (request_id is not None and args.subcommand in dispatch_subcommands)) and args.max_model_calls is None and inherited_maximum is None:
             args.max_model_calls = 3
+            # The ledger keeps this apart from a limit somebody chose.
+            os.environ["MAKEWAND_MAX_MODEL_CALLS_DEFAULTED"] = "1"
+        elif args.max_model_calls is not None:
+            os.environ.pop("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED", None)
         inherited_limit = int(inherited_maximum) if inherited_maximum is not None else None
         if inherited_limit is not None and inherited_limit <= 0:
             raise ValueError("MAKEWAND_MAX_MODEL_CALLS must be positive")

@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -169,4 +170,202 @@ func TestMixedLayeredGoPythonProcessesShareHardLimit(t *testing.T) {
 	t.Setenv("MAKEWAND_PROJECT_DAILY_CALLS", "100")
 	t.Setenv("MAKEWAND_PROJECT_ROOT", t.TempDir())
 	TestMixedGoPythonProcessesShareHardLimit(t)
+}
+
+func TestTaskCounterKeepsWhatItWasGiven(t *testing.T) {
+	layeredFixture(t)
+	data := map[string]any{}
+	if err := initializeScopes(data); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if _, err := scopeKeys(data, Config{TaskID: "plain"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scopeKeys(data, Config{TaskID: "batch", MaxCalls: 300}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := scopeKeys(data, Config{TaskID: "batch", MaxCalls: 1}, now); err != nil {
+		t.Fatal(err)
+	}
+	tasks := data["scopes"].(map[string]any)["tasks"].(map[string]any)
+	check := func(task string, maximum, initial int64, source string) {
+		t.Helper()
+		c := tasks[task].(map[string]any)
+		got, _ := jsonInteger(c["maximum"])
+		first, _ := jsonInteger(c["initial_maximum"])
+		if int64(got) != maximum || int64(first) != initial || c["maximum_source"] != source {
+			t.Fatalf("%s: %v", task, c)
+		}
+	}
+	check("plain", 200, 200, "default")
+	check("batch", 1, 300, "stated")
+	t.Setenv("MAKEWAND_MAX_MODEL_CALLS_DEFAULTED", "1")
+	if _, err := scopeKeys(data, Config{TaskID: "named", MaxCalls: 3}, now); err != nil {
+		t.Fatal(err)
+	}
+	check("named", 3, 3, "default")
+}
+
+func TestGitFileWithoutCommonDirIsItsOwnRepository(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	module := filepath.Join(parent, "module")
+	gitDirectory := filepath.Join(parent, ".git", "modules", "module")
+	for _, directory := range []string{filepath.Join(module, "nested"), gitDirectory} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(parent, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(module, ".git"), []byte("gitdir: "+gitDirectory+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, directory := range []string{parent, module, filepath.Join(module, "nested")} {
+		id, _, err := capacityProject(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[directory] = id
+	}
+	if ids[module] != ids[filepath.Join(module, "nested")] || ids[module] == ids[parent] {
+		t.Fatalf("project keys: %v", ids)
+	}
+}
+
+func TestWorktreesOfASeparateGitDirectoryShareAProjectOfTheirOwn(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	ids := map[string]string{}
+	for _, name := range []string{"first", "second"} {
+		directory := filepath.Join(root, "meta", name+".git")
+		linked := filepath.Join(directory, "worktrees", "linked")
+		if err := os.MkdirAll(linked, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(linked, "commondir"), []byte("../..\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		for tree, target := range map[string]string{"main": directory, "linked": linked} {
+			path := filepath.Join(root, name, tree)
+			if err := os.MkdirAll(path, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, ".git"), []byte("gitdir: "+target+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			id, _, err := capacityProject(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids[name+"/"+tree] = id
+		}
+	}
+	if ids["first/main"] != ids["first/linked"] || ids["second/main"] != ids["second/linked"] || ids["first/main"] == ids["second/main"] {
+		t.Fatalf("project keys: %v", ids)
+	}
+}
+
+func TestGitFilePointingAtNothingIsPassedOver(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	repository := filepath.Join(t.TempDir(), "repository")
+	pruned := filepath.Join(repository, "pruned")
+	for _, directory := range []string{filepath.Join(repository, ".git"), pruned} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repository, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pruned, ".git"), []byte("gitdir: "+filepath.Join(repository, "gone")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prunedID, _, err := capacityProject(pruned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryID, _, err := capacityProject(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prunedID != repositoryID {
+		t.Fatal("a stale Git file gave its directory a project of its own")
+	}
+}
+
+func TestEmptyGitDirectoryIsNotARepository(t *testing.T) {
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	root := t.TempDir()
+	first, second := filepath.Join(root, "first"), filepath.Join(root, "second")
+	for _, directory := range []string{filepath.Join(root, ".git"), first, second} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstID, _, err := capacityProject(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, _, err := capacityProject(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstID == secondID {
+		t.Fatal("an empty .git directory joined unrelated directories into one project")
+	}
+}
+
+func TestProjectDailyLimitFollowsTheRepository(t *testing.T) {
+	path := layeredFixture(t)
+	t.Setenv("MAKEWAND_PROJECT_ROOT", "")
+	t.Setenv("MAKEWAND_PROJECT_DAILY_CALLS", "2")
+	root := t.TempDir()
+	repository := filepath.Join(root, "repository")
+	metadata := filepath.Join(repository, ".git", "worktrees", "linked")
+	nested := filepath.Join(repository, "nested")
+	worktree := filepath.Join(root, "linked")
+	shadow := filepath.Join(root, "shadow")
+	other := filepath.Join(root, "other")
+	for _, directory := range []string{metadata, nested, worktree, filepath.Join(shadow, ".git"), filepath.Join(other, ".git")} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range []string{repository, shadow, other} {
+		if err := os.WriteFile(filepath.Join(directory, ".git", "HEAD"), []byte("ref: refs/heads/master\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(metadata, "commondir"), []byte("../..\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+metadata+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reserve := func(task, directory, workingDir string) error {
+		t.Chdir(directory)
+		ctx := ContextWithConfig(context.Background(), Config{LedgerPath: path, MaxCalls: 3, TaskID: task})
+		attempt, err := Reserve(ctx, Metadata{Engine: "fake", WorkingDir: workingDir})
+		if err == nil {
+			t.Cleanup(func() { _ = attempt.Complete(Outcome{Status: Passed, Known: true}) })
+		}
+		return err
+	}
+	if err := reserve("first", nested, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := reserve("second", worktree, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := reserve("third", repository, shadow); !errors.Is(err, ErrBudgetExhausted) {
+		t.Fatalf("a shadow clone escaped the repository's limit: %v", err)
+	}
+	if err := reserve("fourth", other, ""); err != nil {
+		t.Fatalf("another repository shared the exhausted limit: %v", err)
+	}
 }

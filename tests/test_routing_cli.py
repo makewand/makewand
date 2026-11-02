@@ -167,9 +167,9 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("cannot validate", result.stderr)
 
     def test_outcome_hint_includes_request_id_and_outcome_auto_links_recent_budget_attempt(self):
-        import hashlib as _hashlib
         import time as _time
-        proj_hash = _hashlib.sha256(str(self.work.resolve()).encode()).hexdigest()[:32]
+        from makewand.shared_capacity import project
+        proj_hash = project(self.work)[0]
         same_proj_scopes = lambda tid: [["tasks", tid], ["projects", f"{proj_hash}:2026-10-27"], ["machine", "2026-10-27"]]
         route_res = self.run_cli("route", "review", "normal", "--simple",
                                  "--request-id", "auto-link-42", "--caller", "claude", quota={})
