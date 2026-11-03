@@ -8,14 +8,14 @@ import errno
 import json
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from makewand import call_budget as budget, orchestrator as orch, sandbox
 from makewand.account_identity import credential_binding
-from makewand.execution_contract import ExecutionRequest
-from makewand.execution_runtime import _context, execute
+from makewand.execution_contract import ExecutionRequest, ExecutionResult
+from makewand.execution_runtime import _context, execute, mark_provider_invocation
 try:
     from test_verified_issues_r2 import isolated
 except ImportError:
@@ -146,9 +146,95 @@ def test_busy_dispatch_does_not_penalize_reliability(isolated):
 
 @pytest.mark.parametrize("success", [False, True])
 def test_actual_dispatch_still_records_reliability(isolated, success):
-    with patch.object(orch, "execute_codex_task", return_value=(success, "output", None if success else "failure")), \
+    provider = launched_provider((success, "output", None if success else "failure"))
+    with patch.object(orch, "execute_codex_task", side_effect=provider), \
             patch("makewand.usage.record_engine_usage") as record:
         result = orch.dispatch_task("codex", "fixture", cwd=str(isolated.parent), timeout=1)
+    record.assert_called_once()
+    assert record.call_args.kwargs["success"] is success
+
+
+def test_budget_refused_dispatch_does_not_record_usage(isolated):
+    with patch.object(budget, "reserve", side_effect=budget.BudgetError("exhausted")), \
+            patch.object(orch, "execute_codex_task") as provider, \
+            patch("makewand.usage.record_engine_usage") as record:
+        result = orch.dispatch_task("codex", "fixture", cwd=str(isolated.parent), timeout=1)
+    assert result.status == "BUDGET_EXHAUSTED"
+    provider.assert_not_called()
+    record.assert_not_called()
+
+
+@pytest.mark.parametrize("refusal", [budget.ConcurrencyBusyError("busy"), budget.BudgetError("exhausted")])
+def test_refused_direct_command_does_not_record_usage(isolated, refusal):
+    from makewand import cli
+    provider = MagicMock(return_value=(True, "output", None))
+    with patch.object(budget, "reserve", side_effect=refusal), \
+            patch("makewand.usage.record_engine_usage") as record:
+        result = cli._execute_direct_task("codex", provider, "fixture", cwd=str(isolated.parent), timeout=1)
+    assert result[0] is False
+    provider.assert_not_called()
+    record.assert_not_called()
+
+
+def test_expired_deadline_direct_command_does_not_record_usage(isolated):
+    from makewand import cli
+    from makewand.execution_runtime import execution_context
+    provider = MagicMock(return_value=(True, "output", None))
+    with execution_context(deadline_unix_ms=1), patch("makewand.usage.record_engine_usage") as record:
+        result = cli._execute_direct_task("codex", provider, "fixture", cwd=str(isolated.parent), timeout=1)
+    assert result.status == "TIMEOUT"
+    provider.assert_not_called()
+    record.assert_not_called()
+
+
+@pytest.mark.parametrize("direct", [True, False])
+@pytest.mark.parametrize("kind", ["quota_preflight", "account_configuration", "plain"])
+def test_failure_before_launch_does_not_record_usage(isolated, kind, direct):
+    from makewand import cli
+    from makewand.account_identity import refuse_credential_launch
+    from makewand.model_quota import refuse_before_launch
+
+    def refuse(*_args, **_kwargs):
+        if kind == "quota_preflight":
+            return refuse_before_launch("limited")
+        if kind == "account_configuration":
+            return refuse_credential_launch("login changed")
+        return False, None, "sandbox unavailable"
+
+    with patch("makewand.usage.record_engine_usage") as record:
+        if direct:
+            result = cli._execute_direct_task("codex", refuse, "fixture", cwd=str(isolated.parent), timeout=1)
+        else:
+            with patch.object(orch, "execute_codex_task", side_effect=refuse):
+                result = orch.dispatch_task("codex", "fixture", cwd=str(isolated.parent), timeout=1)
+    assert result[0] is False
+    record.assert_not_called()
+
+
+def launched_provider(result):
+    def provider(*_args, **_kwargs):
+        mark_provider_invocation()
+        return result
+    return provider
+
+
+@pytest.mark.parametrize("direct", [True, False])
+@pytest.mark.parametrize("value,success", [
+    ((True, "output", None), True),
+    ((False, "output", "failure"), False),
+    # A relay after the CLI ran can hand back a refusal; the CLI still ran.
+    (ExecutionResult(False, None, "login changed", status="INVALID_REQUEST", engine="codex",
+                     error_kind="account_configuration", outcome_known=True), False),
+])
+def test_launched_provider_records_usage(isolated, direct, value, success):
+    from makewand import cli
+    provider = launched_provider(value)
+    with patch("makewand.usage.record_engine_usage") as record:
+        if direct:
+            cli._execute_direct_task("codex", provider, "fixture", cwd=str(isolated.parent), timeout=1)
+        else:
+            with patch.object(orch, "execute_codex_task", side_effect=provider):
+                orch.dispatch_task("codex", "fixture", cwd=str(isolated.parent), timeout=1)
     record.assert_called_once()
     assert record.call_args.kwargs["success"] is success
 

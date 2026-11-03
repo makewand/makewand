@@ -1488,7 +1488,15 @@ def dispatch_task(
         return rejected("INVALID_REQUEST", str(error))
     from makewand.usage import note_dispatch_route, observe_dispatch_route
 
+    launched = False
     def execute(effective_timeout):
+        nonlocal launched
+        try:
+            return run_provider(effective_timeout)
+        finally:
+            launched = execution_runtime.provider_invocation_used()
+
+    def run_provider(effective_timeout):
         from makewand.workflow import provider_outcome
         provider_prompt = prompt
         if engine != "claude" and not readonly and cwd:
@@ -1513,8 +1521,8 @@ def dispatch_task(
     # (health._dispatch_failure_superseded reads it).
     with observe_dispatch_route() as route:
         result = execution_runtime.execute(request, execute)
-    if getattr(result, "error_kind", None) == "concurrency_busy":
-        # Capacity refused admission; no provider dispatch took place.
+    if not launched:
+        # Refused before launch (capacity, budget, quota, sandbox, policy); no provider ran.
         return result
     try:
         from makewand.usage import record_engine_usage

@@ -121,11 +121,19 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
         max_model_calls=int(maximum) if maximum else None,
         workflow=context.get("workflow") or "direct", risk=context.get("risk"),
         prompt=prompt, cwd=kwargs.get("cwd") or os.getcwd())
+    launched = False
     def callback(effective_timeout):
+        nonlocal launched
         from makewand.workflow import provider_outcome
-        return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
+        try:
+            return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
+        finally:
+            launched = execution_runtime.provider_invocation_used()
     with observe_dispatch_route() as route:
         result = remember_result(execution_runtime.execute(request, callback))
+    if not launched:
+        # Refused before launch (capacity, budget, quota, sandbox, policy); no provider ran.
+        return result
     try:
         record_engine_usage(engine, tier=kwargs.get("tier", "standard"), success=result[0], task=prompt,
                             route=route.route)
