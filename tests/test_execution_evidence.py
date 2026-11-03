@@ -107,6 +107,31 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(self.record(result)["windows"][0]["used_percent"], 42)
         self.assertEqual(json.loads((self.root / "budget.json").read_text())["attempts"][0]["outcome_known"], False)
 
+    @unittest.skipIf(os.name == "nt", "the Windows runner does not report output timing")
+    def test_process_output_shows_when_a_timed_out_run_went_quiet(self):
+        def callback(timeout):
+            code, out, err, ex = run_subprocess([sys.executable, "-I", "-c",
+                "import sys, time; print('PRIVATE ANSWER', flush=True); time.sleep(5)"], timeout=1)
+            return model_process_failure("codex", code, out, err, ex)
+        stored = self.record(execute(self.request(), callback))
+        output = stored["process_output"]
+        self.assertEqual(output["stdout_bytes"], len("PRIVATE ANSWER\n"))
+        self.assertEqual(output["stderr_bytes"], 0)
+        self.assertLess(output["first_output_seconds"], output["runtime_seconds"])
+        self.assertGreater(output["silent_seconds"], 0)
+        self.assertGreaterEqual(output["runtime_seconds"], 1)
+        self.assertNotIn("PRIVATE ANSWER", json.dumps(stored))
+
+    @unittest.skipIf(os.name == "nt", "the Windows runner does not report output timing")
+    def test_process_output_marks_a_run_that_never_wrote(self):
+        def callback(timeout):
+            code, out, err, ex = run_subprocess([sys.executable, "-I", "-c", "import time; time.sleep(5)"], timeout=.2)
+            return model_process_failure("codex", code, out, err, ex)
+        output = self.record(execute(self.request(), callback))["process_output"]
+        self.assertEqual((output["stdout_bytes"], output["stderr_bytes"]), (0, 0))
+        self.assertIsNone(output["first_output_seconds"])
+        self.assertEqual(output["silent_seconds"], output["runtime_seconds"])
+
     def test_timeout_without_metadata_stays_unknown(self):
         def callback(timeout):
             code, out, err, ex = run_subprocess([sys.executable, "-I", "-c", "import time; time.sleep(5)"], timeout=.1)
