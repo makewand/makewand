@@ -64,6 +64,12 @@ def mark_provider_invocation():
     claim_provider_invocation()
 
 
+def provider_invocation_used():
+    """Whether the enclosing admission reached an actual provider launch."""
+    invocation = (_context.get() or {}).get("_provider_invocation")
+    return invocation is not None and invocation.used
+
+
 def current_context():
     return dict(_context.get() or {})
 

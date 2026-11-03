@@ -34,6 +34,7 @@ from makewand.orchestrator import (
     run_pipeline,
     classify_prompt_intent,
 )
+from makewand.execution_runtime import mark_provider_invocation
 from makewand.pacing import parse_reset_time_to_seconds_left
 from makewand.providers.base import run_subprocess
 from makewand.providers.claude import parse_claude_quota, execute_claude_task
@@ -234,7 +235,11 @@ class TestAuditV31Fixes(unittest.TestCase):
                 self.assertEqual(readonly_calls[0].kwargs["tier"], "deep")
 
         # Verify dispatch_task records usage
-        with patch("makewand.orchestrator.execute_claude_task", return_value=(True, "ok", None)), \
+        def launched_claude(*_args, **_kwargs):
+            mark_provider_invocation()
+            return True, "ok", None
+
+        with patch("makewand.orchestrator.execute_claude_task", side_effect=launched_claude), \
              patch("makewand.usage.record_engine_usage") as mock_usage:
             dispatch_task("claude", "test prompt", tier="standard")
             # The fake adapter reports no route (cli/api): the ledger then infers it (usage.dispatch_route).

@@ -31,6 +31,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from makewand import cli, git_helper, health, orchestrator as orch, review_contract, review_verdict, usage
+from makewand import execution_runtime
 from makewand.providers import local
 from makewand.providers.claude import execute_claude_task
 
@@ -86,7 +87,8 @@ class UsageRouteTests(unittest.TestCase):
              patch("makewand.health.load_status_cache", return_value=cache), \
              patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.providers.api_client.call_api_chat",
-                   side_effect=lambda **kwargs: calls.append(("api", kwargs["provider"])) or (True, "api answer", None)), \
+                   side_effect=lambda **kwargs: calls.append(("api", kwargs["provider"]))
+                   or execution_runtime.mark_provider_invocation() or (True, "api answer", None)), \
              fake_cli(calls), contextlib.redirect_stderr(io.StringIO()):
             result = orch.dispatch_task("claude", "解释这段代码", cwd=tempfile.gettempdir(), readonly=True)
         return calls, result
