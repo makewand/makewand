@@ -338,11 +338,13 @@ def run_subprocess(
     stderr is a CapturedStderr (see stderr_captured_apart).
     Returns: (returncode, stdout, stderr, exception_or_timeout_msg)
     """
-    def observe(code, out):
+    def observe(code, out, output_timing=None):
         from makewand.execution_runtime import current_context
         evidence = current_context().get("_evidence")
         if evidence is not None:
             evidence["process_exit_code"] = code
+            if output_timing is not None:
+                evidence["process_output"] = output_timing
             if evidence_protocol:
                 from makewand.execution_evidence import protocol
                 protocol(evidence, out)
@@ -364,6 +366,7 @@ def run_subprocess(
     cleaned_group = False
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     total_bytes = 0
+    launched_at = first_output_at = last_output_at = None
     decoders = {name: codecs.getincrementaldecoder("utf-8")(errors="replace") for name in ("stdout", "stderr")} if stream else None
     pending_stderr = []  # an unfinished stderr line, displayed once complete
     display_target = sys.stdout
@@ -448,7 +451,15 @@ def run_subprocess(
         if not stream:  # Preserve the former text-mode universal-newline behavior.
             out = out.replace("\r\n", "\n").replace("\r", "\n")
             err = err.replace("\r\n", "\n").replace("\r", "\n")
-        observe(code, out)
+        # Sizes and timing only, so a run that hit its deadline shows where it went quiet.
+        timing = None
+        if launched_at is not None:
+            now = time.monotonic()
+            timing = dict(stdout_bytes=len(captured["stdout"]), stderr_bytes=len(captured["stderr"]),
+                          runtime_seconds=round(now - launched_at, 3),
+                          first_output_seconds=None if first_output_at is None else round(first_output_at - launched_at, 3),
+                          silent_seconds=round(now - (last_output_at or launched_at), 3))
+        observe(code, out, timing)
         return code, out, CapturedStderr(err, not merge_stderr), error
 
     try:
@@ -481,6 +492,7 @@ def run_subprocess(
             start_new_session=True,
             **popen_kwargs
         )
+        launched_at = time.monotonic()
         provider_process_lease("worker", proc.pid)
         if scope:
             scope.register_proc(proc)
@@ -560,6 +572,9 @@ def run_subprocess(
                     continue
                 available = MAX_OUTPUT_BYTES - total_bytes
                 accepted = chunk[:available]
+                last_output_at = time.monotonic()
+                if first_output_at is None:
+                    first_output_at = last_output_at
                 captured[key.data].extend(accepted)
                 total_bytes += len(accepted)
                 display(accepted, source=key.data)
