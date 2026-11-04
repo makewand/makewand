@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Codex 周额度实时读数到 100% 时，自动启用账号里赠送的额度重置（不调用模型，同一窗口最多用 1 次，记入 `codex-reset-credit-audit.jsonl`）；makewand 自身的保留线、过期缓存和短窗口都不会触发。设 `MAKEWAND_CODEX_RESET_CREDIT=off` 可关闭。
 - 没有提示词要写入 stdin 时，提供方子进程改用 `/dev/null`。此前继承调用方的 stdin：Claude Code 里含 heredoc 的命令 stdin 不会关闭，`codex exec` 会一直等 EOF，跑满时限并占住全机唯一的 Codex 名额。
 - Grok 余额耗尽（`API error (status 402 Payment Required)`，包在多行 JSON 报告里）现在识别为额度限制，不再记成结果未知（退出码 17），Python 与 Go 共用的目录同步更新。
 - 执行证据新增 `process_output`：输出字节数、运行时长、首次输出耗时和最后一次输出后的静默时长（只记大小和时间，不记内容；Windows 暂无）。用于定位跑满时限的调用卡在哪，不改变调用行为，也不会中断静默的进程。

@@ -437,6 +437,7 @@ def activate() -> SimpleNamespace:
             "XDG_RUNTIME_DIR": str(state.runtime_dir),
             "MAKEWAND_CONFIG_DIR": str(state.config_dir),
             "MAKEWAND_USAGE_FILE": str(state.usage_file),
+            "MAKEWAND_CODEX_RESET_CREDIT": "off",  # never talk to a real account from a test
             "MAKEWAND_EXECUTION_EVIDENCE_DIR": str(state.evidence_dir),
             "MAKEWAND_ARTIFACTS_DIR": str(state.artifacts_dir),
             "MAKEWAND_SHADOW_DIR": str(state.shadow_dir),

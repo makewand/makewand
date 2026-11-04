@@ -155,6 +155,26 @@ def _number(value):
         return None
 
 
+def _reset_credit_redeemed_at(provider):
+    """Quota evidence from before a redeemed Codex reset no longer describes the account."""
+    if provider != "codex":
+        return 0
+    from makewand.codex_reset_credit import redeemed_at
+    return redeemed_at(selected_scope(provider)["account_ref"])
+
+
+def limit_cleared_by_reset(provider, info):
+    """Whether this cached refusal predates a redeemed reset of the same account."""
+    from datetime import datetime
+    reset_at = _reset_credit_redeemed_at(provider)
+    if not reset_at or not isinstance(info, dict):
+        return False
+    try:
+        return datetime.fromisoformat(str(info.get("updated_at")).replace("Z", "+00:00")).timestamp() <= reset_at
+    except (ValueError, OverflowError, OSError):
+        return False
+
+
 def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     """The same deterministic quota gate for a route row and a CLI launch.
 
@@ -167,7 +187,8 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     if info is None:
         info = health.load_status_cache().get(provider, {})
     info = projected_status(provider, info, model)
-    if isinstance(info, dict) and info.get("status") == "limited":
+    reset_at = _reset_credit_redeemed_at(provider)
+    if isinstance(info, dict) and info.get("status") == "limited" and not limit_cleared_by_reset(provider, info):
         return "当前账号/模型额度受限：" + str(info.get("reason") or "供应商拒绝")
     if policy is None:
         from makewand.route_select import load_policy
@@ -197,6 +218,9 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
         try:
             at = datetime.fromisoformat(window["observed_at"].replace("Z", "+00:00")).timestamp()
             if not math.isfinite(at) or not -60 <= now - at <= 900:
+                continue
+            # A redeemed reset answers for the weekly window it cleared, nothing else.
+            if at <= reset_at and window.get("window_minutes") == 10080 and not window.get("model"):
                 continue
             reset = window.get("resets_at")
             if reset and datetime.fromisoformat(reset.replace("Z", "+00:00")).timestamp() <= now:
@@ -228,6 +252,10 @@ def before_cli_launch(provider, model, *, relay=None, cwd=None):
             call_budget.note_resolved_model(attempt, model, budget_file=context.get("_budget_file"),
                                             max_model_calls=context.get("_max_model_calls"))
     reason = quota_reason(provider, model)
+    if reason and provider == "codex":
+        from makewand.codex_reset_credit import restore_quota
+        if restore_quota("before_launch"):
+            reason = quota_reason(provider, model)
     if reason:
         if relay is not None and relay.available:
             return relay(f"[Makewand -> {provider}] {reason}；按已允许的 API 接力策略执行", cwd=cwd)
