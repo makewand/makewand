@@ -13,7 +13,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from makewand import codex_reset_credit as credit
 from makewand import model_quota
@@ -278,6 +278,45 @@ class CodexRefusalTests(unittest.TestCase):
     def test_without_a_restore_the_limit_is_recorded(self):
         _result, record = self._run(False)
         record.assert_called_once()
+
+
+class RouteRestoreTests(unittest.TestCase):
+    def _restore(self, marked, reason, restored):
+        from makewand import route_cli
+        ledger = Mock()
+        ledger.active_marks.return_value = {"codex": object()} if marked else {}
+        with patch.object(route_cli, "OutcomeLedger", return_value=ledger), \
+                patch("makewand.model_quota.quota_reason", return_value=reason), \
+                patch("makewand.codex_reset_credit.restore_quota", return_value=restored) as restore:
+            route_cli._restore_codex_reset(None)
+        return restore, ledger
+
+    def test_an_open_codex_is_left_alone(self):
+        restore, ledger = self._restore(False, None, True)
+        restore.assert_not_called()
+        ledger.mark.assert_not_called()
+
+    def test_a_redeemed_reset_clears_the_mark(self):
+        restore, ledger = self._restore(True, None, True)
+        restore.assert_called_once_with("route")
+        self.assertEqual(ledger.mark.call_args[0][0], "codex")
+        self.assertLessEqual(ledger.mark.call_args[0][1], time.time())
+
+    def test_the_mark_stays_without_a_reset(self):
+        _restore, ledger = self._restore(True, None, False)
+        ledger.mark.assert_not_called()
+
+    def test_a_blocked_gate_without_a_mark_also_checks(self):
+        restore, ledger = self._restore(False, "limit", True)
+        restore.assert_called_once_with("route")
+        ledger.mark.assert_not_called()
+
+    def test_a_quota_file_means_a_test_route_and_never_spends(self):
+        from makewand import route_cli
+        with patch.dict(os.environ, {route_cli._QUOTA_FILE_ENV: "/x"}), \
+                patch("makewand.codex_reset_credit.restore_quota") as restore:
+            route_cli._restore_codex_reset(None)
+        restore.assert_not_called()
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX fake executable")

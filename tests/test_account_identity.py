@@ -90,6 +90,18 @@ class AccountQuotaTests(unittest.TestCase):
             self.assertEqual(quota["credential_root"], str(self.second))
             self.assertEqual(first_ref, account_reference("codex"))
 
+    def test_a_redeemed_reset_voids_only_older_weekly_evidence(self):
+        self.login(self.first, "A")
+        self.events([self.event("A", 100, minutes=10080)])
+        self.assertEqual(_get_official_subscription_quota("codex")["percentage"], 0)
+        with patch("makewand.model_quota._reset_credit_redeemed_at", return_value=time.time() + 30):
+            self.assertEqual(_get_official_subscription_quota("codex")["status"], "unknown")
+        with patch("makewand.model_quota._reset_credit_redeemed_at", return_value=time.time() - 3600):
+            self.assertEqual(_get_official_subscription_quota("codex")["percentage"], 0)
+        self.events([self.event("A", 100, minutes=300)])
+        with patch("makewand.model_quota._reset_credit_redeemed_at", return_value=time.time() + 30):
+            self.assertEqual(_get_official_subscription_quota("codex")["percentage"], 0)
+
     def test_account_switch_rejects_cached_and_interleaved_session_evidence(self):
         self.login(self.first, "A")
         self.snapshot()

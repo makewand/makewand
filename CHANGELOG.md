@@ -9,6 +9,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- `route` 在 Codex 被标记或门禁拦住时也会检查赠送重置，启用成功后清除标记；此前 route 跳过 Codex 就不会有派发，重置永远触发不了。重置前的周窗口证据不再算成“额度已用完”。
+- `route` 不再把只有部分模型受限的工具显示成整家受限：Agy 的 Gemini 用完而 Claude、GPT 还在时，显示“部分模型受限”。
 - Codex 周额度实时读数到 100% 时，自动启用账号里赠送的额度重置（不调用模型，同一窗口最多用 1 次，记入 `codex-reset-credit-audit.jsonl`）；makewand 自身的保留线、过期缓存和短窗口都不会触发。设 `MAKEWAND_CODEX_RESET_CREDIT=off` 可关闭。
 - 没有提示词要写入 stdin 时，提供方子进程改用 `/dev/null`。此前继承调用方的 stdin：Claude Code 里含 heredoc 的命令 stdin 不会关闭，`codex exec` 会一直等 EOF，跑满时限并占住全机唯一的 Codex 名额。
 - Grok 余额耗尽（`API error (status 402 Payment Required)`，包在多行 JSON 报告里）现在识别为额度限制，不再记成结果未知（退出码 17），Python 与 Go 共用的目录同步更新。

@@ -1846,6 +1846,11 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
         except (ValueError, TypeError, OverflowError, OSError):
             return None
 
+    reset_credit_at = 0
+    if provider == "codex":
+        from makewand.model_quota import _reset_credit_redeemed_at
+        reset_credit_at = _reset_credit_redeemed_at(provider)
+
     def observed_at(modified, *values):
         # Event timestamps prevent an unrelated log append or file touch from
         # renewing old data; mtime bounds legacy records without timestamps.
@@ -1870,6 +1875,10 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                 reasons.add("window_reset")
                 return
             if now - observed > ttl:
+                reasons.add("stale_observation")
+                return
+            if minutes == 10080 and not model and observed <= reset_credit_at:
+                # This window was cleared by a redeemed reset after the reading.
                 reasons.add("stale_observation")
                 return
             if observed > now + 60:

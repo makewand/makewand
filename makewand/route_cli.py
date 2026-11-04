@@ -197,6 +197,21 @@ def _candidate_payload(item, execution_options) -> dict:
     }
 
 
+def _restore_codex_reset(policy) -> None:
+    """A used-up Codex gets no dispatch once route skips it, so the check also runs here."""
+    from makewand.codex_reset_credit import restore_quota
+    from makewand.model_quota import quota_reason
+    if os.environ.get(_QUOTA_FILE_ENV, "").strip():
+        return
+    try:
+        ledger = OutcomeLedger()
+        marked = "codex" in ledger.active_marks()
+        if (marked or quota_reason("codex", policy=policy)) and restore_quota("route") and marked:
+            ledger.mark("codex", time.time(), "额度已由赠送重置恢复")
+    except (ValueError, OSError):
+        return
+
+
 def cmd_route(args) -> None:
     task_type = args.task_type
     difficulty = args.difficulty
@@ -215,6 +230,7 @@ def cmd_route(args) -> None:
         policy = load_policy()
     except ValueError as error:
         _fail(f"错误：{error}")
+    _restore_codex_reset(policy)
     options = dict(
         risk=risk,
         self_tool=self_tool,
