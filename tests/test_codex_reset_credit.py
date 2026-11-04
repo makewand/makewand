@@ -46,6 +46,7 @@ class _Server:
         pass
 
 
+@unittest.skipUnless(os.name == "posix", "reset credits are POSIX only")
 class RestoreQuotaTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
