@@ -3,6 +3,7 @@ Codex CLI provider adapter (OpenAI subscription / gpt-6-astra).
 """
 
 import os
+import time
 import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
@@ -95,6 +96,8 @@ def execute_codex_task(
         verify_writable_sandbox_or_authorized,
     )
     from makewand.git_helper import find_git_root
+    from makewand.codex_reset_credit import restore_quota
+    from makewand.model_quota import limit_cleared_by_reset
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
         allow_network = False
@@ -124,7 +127,8 @@ def execute_codex_task(
     if cache.get("codex", {}).get("status") == "needs_auth" and relay.available:
         return relay("[Makewand -> Codex] 订阅登录失效，自动降级为 OpenAI API 模式接力执行...", cwd=cwd)
 
-    if cache.get("codex", {}).get("status") == "limited":
+    if (cache.get("codex", {}).get("status") == "limited" and not limit_cleared_by_reset("codex", cache["codex"])
+            and not restore_quota("cached_limit")):
         if relay.available:
             return relay("[Makewand -> Codex] 订阅配额已耗尽，无缝自动降级为 OpenAI API 模式接力执行...", cwd=cwd)
         from makewand.model_quota import refuse_before_launch
@@ -236,6 +240,8 @@ def execute_codex_task(
 
     is_limited, reason, resets = parse_codex_quota(out, err if apart else None, prompt=prompt)
     if is_limited:
+        if restore_quota("provider_refusal"):
+            return False, None, f"Codex CLI 触发额度限制 ({reason})，额度已由赠送重置恢复；本次未完成，可重新派发"
         record_engine_limit("codex", reason, resets, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Codex] 订阅触发限流 ({reason})，无缝切换为 OpenAI API Key 模式接力执行...", cwd=cwd)
