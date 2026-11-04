@@ -281,41 +281,70 @@ class CodexRefusalTests(unittest.TestCase):
 
 
 class RouteRestoreTests(unittest.TestCase):
-    def _restore(self, marked, reason, restored):
+    def setUp(self):
+        from makewand.outcome_ledger import Mark, OutcomeLedger
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.ledger = OutcomeLedger(Path(self.dir.name) / "routing")
+        self.mark = Mark(time.time() + 3600, "used up")
+        self.policy = type("P", (), {"pause_for": lambda self, provider: None})()
+
+    def _restore(self, skipped, *, not_tool=None, marked=True, gate=None, restored=True):
         from makewand import route_cli
-        ledger = Mock()
-        ledger.active_marks.return_value = {"codex": object()} if marked else {}
-        with patch.object(route_cli, "OutcomeLedger", return_value=ledger), \
-                patch("makewand.model_quota.quota_reason", return_value=reason), \
+        from makewand.route_select import _mark_reason
+        if marked:
+            self.ledger.mark("codex", self.mark.until, self.mark.reason)
+        if skipped == "mark":
+            skipped = _mark_reason(self.mark, time.time())
+        result = type("R", (), {"skipped": [("codex", skipped)] if skipped else []})()
+        with patch.object(route_cli, "OutcomeLedger", return_value=self.ledger), \
+                patch("makewand.model_quota.quota_reason", return_value=gate), \
                 patch("makewand.codex_reset_credit.restore_quota", return_value=restored) as restore:
-            route_cli._restore_codex_reset(None)
-        return restore, ledger
+            answer = route_cli._restore_codex_reset(self.policy, result, not_tool)
+        return answer, restore
 
-    def test_an_open_codex_is_left_alone(self):
-        restore, ledger = self._restore(False, None, True)
-        restore.assert_not_called()
-        ledger.mark.assert_not_called()
-
-    def test_a_redeemed_reset_clears_the_mark(self):
-        restore, ledger = self._restore(True, None, True)
+    def test_a_route_that_skipped_codex_for_its_mark_redeems_and_clears_it(self):
+        answer, restore = self._restore("mark")
+        self.assertTrue(answer)
         restore.assert_called_once_with("route")
-        self.assertEqual(ledger.mark.call_args[0][0], "codex")
-        self.assertLessEqual(ledger.mark.call_args[0][1], time.time())
+        self.assertNotIn("codex", self.ledger.active_marks())
+
+    def test_a_route_blocked_by_the_gate_redeems(self):
+        answer, restore = self._restore("部分模型受限（m）：limit", marked=False, gate="limit")
+        self.assertTrue(answer)
+        restore.assert_called_once_with("route")
+
+    def test_nothing_is_spent_when_this_route_would_not_use_codex(self):
+        for skipped, kwargs in ((None, {}), ("mark", {"not_tool": "codex"}), ("other block", {}),
+                                ("other block", {"marked": False, "gate": "limit"})):
+            answer, restore = self._restore(skipped, **kwargs)
+            self.assertFalse(answer, (skipped, kwargs))
+            restore.assert_not_called()
+
+    def test_a_paused_codex_spends_nothing(self):
+        self.policy = type("P", (), {"pause_for": lambda self, provider: type(
+            "Pause", (), {"until": time.time() + 60, "text": "soon"})()})()
+        answer, restore = self._restore("mark")
+        self.assertFalse(answer)
+        restore.assert_not_called()
 
     def test_the_mark_stays_without_a_reset(self):
-        _restore, ledger = self._restore(True, None, False)
-        ledger.mark.assert_not_called()
+        answer, _restore = self._restore("mark", restored=False)
+        self.assertFalse(answer)
+        self.assertIn("codex", self.ledger.active_marks())
 
-    def test_a_blocked_gate_without_a_mark_also_checks(self):
-        restore, ledger = self._restore(False, "limit", True)
-        restore.assert_called_once_with("route")
-        ledger.mark.assert_not_called()
+    def test_a_mark_written_meanwhile_survives(self):
+        from makewand.outcome_ledger import Mark
+        self.ledger.mark("codex", self.mark.until + 60, "newer")
+        current = self.ledger.active_marks()["codex"]
+        self.ledger.mark("codex", time.time(), "cleared", only_if=Mark(self.mark.until, self.mark.reason))
+        self.assertEqual(self.ledger.active_marks()["codex"], current)
 
     def test_a_quota_file_means_a_test_route_and_never_spends(self):
         from makewand import route_cli
-        with patch.dict(os.environ, {route_cli._QUOTA_FILE_ENV: "/x"}), \
-                patch("makewand.codex_reset_credit.restore_quota") as restore:
-            route_cli._restore_codex_reset(None)
+        with patch.dict(os.environ, {route_cli._QUOTA_FILE_ENV: "/x"}):
+            answer, restore = self._restore("mark")
+        self.assertFalse(answer)
         restore.assert_not_called()
 
 

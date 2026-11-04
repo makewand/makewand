@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from makewand.outcome_ledger import OutcomeLedger
-from makewand.route_select import load_policy, select
+from makewand.route_select import _family_reason, _mark_reason, _pause_reason, load_policy, select
 from makewand.routing_catalog import PROVIDER_FAMILIES, TASK_TYPES
 
 __all__ = [
@@ -197,19 +197,29 @@ def _candidate_payload(item, execution_options) -> dict:
     }
 
 
-def _restore_codex_reset(policy) -> None:
-    """A used-up Codex gets no dispatch once route skips it, so the check also runs here."""
+def _restore_codex_reset(policy, result, not_tool) -> bool:
+    """A used-up Codex gets no dispatch once route skips it, so the check also runs here.
+
+    Only for a route that would otherwise have offered Codex; True means select again.
+    """
     from makewand.codex_reset_credit import restore_quota
     from makewand.model_quota import quota_reason
-    if os.environ.get(_QUOTA_FILE_ENV, "").strip():
-        return
+    reason = dict(result.skipped).get("codex")
+    now = time.time()
+    if (not reason or os.environ.get(_QUOTA_FILE_ENV, "").strip()
+            or _family_reason("codex", not_tool) or _pause_reason(policy, "codex", now)):
+        return False
     try:
         ledger = OutcomeLedger()
-        marked = "codex" in ledger.active_marks()
-        if (marked or quota_reason("codex", policy=policy)) and restore_quota("route") and marked:
-            ledger.mark("codex", time.time(), "额度已由赠送重置恢复")
+        mark = ledger.active_marks().get("codex")
+        gate = quota_reason("codex", policy=policy)
+        if not (_mark_reason(mark, now) == reason or (gate and gate in reason)) or not restore_quota("route"):
+            return False
+        if mark is not None:
+            ledger.mark("codex", time.time(), "额度已由赠送重置恢复", only_if=mark)
+        return True
     except (ValueError, OSError):
-        return
+        return False
 
 
 def cmd_route(args) -> None:
@@ -230,7 +240,6 @@ def cmd_route(args) -> None:
         policy = load_policy()
     except ValueError as error:
         _fail(f"错误：{error}")
-    _restore_codex_reset(policy)
     options = dict(
         risk=risk,
         self_tool=self_tool,
@@ -247,6 +256,8 @@ def cmd_route(args) -> None:
     try:
         try:
             result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
+            if _restore_codex_reset(policy, result, not_tool):
+                result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
         except PermissionError:
             if getattr(args, "request_id", None):
                 raise ValueError("cannot verify request routing history; restore readable state before dispatch")

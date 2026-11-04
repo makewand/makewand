@@ -674,8 +674,11 @@ class OutcomeLedger:
             result[provider] = Mark(float(until), reason)
         return result
 
-    def mark(self, provider: str, until_ts: Any, reason: str = "") -> Mark:
-        """写入一条额度标记：锁内读-改-写，临时文件 + os.replace 原子替换。"""
+    def mark(self, provider: str, until_ts: Any, reason: str = "", *, only_if: Optional[Mark] = None) -> Mark:
+        """写入一条额度标记：锁内读-改-写，临时文件 + os.replace 原子替换。
+
+        给了 only_if 时，只有当前标记还是它才写入，别的进程新写的标记不会被覆盖。
+        """
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider must be a non-empty string")
         if not isinstance(reason, str):
@@ -695,6 +698,8 @@ class OutcomeLedger:
             filelock.flock(lock_fd, filelock.LOCK_EX)
             try:
                 marks = self._read_marks()
+                if only_if is not None and marks.get(provider) != only_if:
+                    return marks.get(provider)
                 marks[provider] = Mark(until, reason)
                 payload = json.dumps(
                     {name: {"until": item.until, "reason": item.reason} for name, item in marks.items()},
