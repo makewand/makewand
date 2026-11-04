@@ -297,9 +297,10 @@ class TestCatalogMisses(unittest.TestCase):
         answer = '{\n  "error": {\n    "type": "TerminalQuotaError",\n    "code": 429\n  }\n}\nThat is the shape.\n'
         self.assertEqual(gemini_kinds(answer + "Done.\n"), {})
 
-    def test_json_reports_are_gemini_only(self):
-        self.assertIs(health.cli_catalog_entry("gemini").get("json_reports"), True)
-        for provider in ("claude", "codex", "grok", "muse", "agy"):
+    def test_json_reports_are_gemini_and_grok_only(self):
+        for provider in ("gemini", "grok"):
+            self.assertIs(health.cli_catalog_entry(provider).get("json_reports"), True)
+        for provider in ("claude", "codex", "muse", "agy"):
             self.assertNotIn("json_reports", health.cli_catalog_entry(provider))
         # A pretty JSON body is never joined for another CLI: its indented lines stay skipped.
         self.assertEqual(health.find_cli_messages("agy", ("quota",), "", '{\n  "message": "You have exhausted '

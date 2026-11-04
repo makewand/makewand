@@ -297,5 +297,30 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(stored["source"], "api")
 
 
+class ProviderStdinTests(unittest.TestCase):
+    """`codex exec` reads stdin until EOF; a caller's open stdin must not reach it."""
+
+    @unittest.skipUnless(os.name == "posix", "POSIX stdin handling")
+    def test_a_child_without_input_sees_eof_while_the_callers_stdin_stays_open(self):
+        read_end, write_end = os.pipe()
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        try:
+            code, out, _err, ex = run_subprocess(
+                [sys.executable, "-I", "-c", "import sys; print(repr(sys.stdin.read()))"], timeout=10)
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, read_end, write_end):
+                os.close(fd)
+        self.assertEqual((code, ex), (0, None))
+        self.assertEqual(out.strip(), "''")
+
+    def test_input_text_still_reaches_the_child(self):
+        code, out, _err, ex = run_subprocess(
+            [sys.executable, "-I", "-c", "import sys; print(sys.stdin.read())"], timeout=10, input_text="prompt")
+        self.assertEqual((code, ex), (0, None))
+        self.assertEqual(out.strip(), "prompt")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -151,6 +151,7 @@
         "apart": "lines",
         "merged": "final_report"
       },
+      "json_reports": true,
       "kinds": {
         "quota": [
           "you've reached your free grok build usage limit\\b",
@@ -159,7 +160,8 @@
           "you've hit your spending cap\\b",
           "(?:your account is )?out of credits or over your spending limit\\b",
           "subscription:free-usage-exhausted\\b",
-          "api error \\(status 402\\)",
+          "api error \\(status 402\\b",
+          "internal error: \\{ \"message\": \"api error \\(status 402\\b",
           "payment required \\(402\\)(?:$|:| from\\b)"
         ],
         "quota.marked": [

@@ -6,7 +6,7 @@
   "want (Q: a CLI's own quota or rate refusal, N: task content) and prov label the corpus a case came from (the round-2 verifier, earlier Go and Python tests, engine edge cases); they are not expectations.",
   "expect.<provider>.<modes>.<kind> is the normalized line on which health.py finds a message of that kind, for every kind of the provider's catalog entry; <modes> joins the modes with the same findings by ','. A provider or mode that is absent finds nothing."
  ],
- "catalog_sha256": "dad09c949b14bba0cab77c21027c184f2913fabda238a26c7950f724ff15c0de",
+ "catalog_sha256": "90c99bad7002ab32b4a3c06a4229a05d3764546b32f03b652262a11e6aab3cf9",
  "cases": [
   {"id":"v1-r1-C1","text":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)"}}}},
   {"id":"v1-r1-C2","text":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)"}}}},
