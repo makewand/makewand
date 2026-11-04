@@ -332,6 +332,7 @@ def select(
     # provider → 因模型家族跳过的模型（只跳过这些组合，这家其余模型照常参选）。
     family_models = {}
     quota_models = {}
+    open_models = {}
     available = []
     for index, row in enumerate(rows):
         provider_reason = (
@@ -344,6 +345,8 @@ def select(
         reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
         if quota_reason:
             quota_models.setdefault(row.provider, set()).add(_row_model(row))
+        elif not provider_reason:
+            open_models.setdefault(row.provider, set()).add(_row_model(row))
         model = None if reason else _same_model_family(row, not_tool)
         if reason or model:
             # 完整目录里同一 provider 有多个模型×推理深度组合：跳过原因
@@ -360,7 +363,8 @@ def select(
         (provider, reason or _model_family_reason(family_models[provider], not_tool))
         for provider, reason in skipped
     ]
-    partial = {row.provider for _, row in available} & set(quota_models)
+    # A provider whose other models are only filtered out here (family, tier) is still not out of quota.
+    partial = set(open_models) & set(quota_models)
     skipped = [(provider, "部分模型受限（" + ", ".join(sorted(quota_models[provider])) + "）：" + reason
                 if provider in partial and reason else reason) for provider, reason in skipped]
 

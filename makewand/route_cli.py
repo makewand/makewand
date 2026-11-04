@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from makewand.outcome_ledger import OutcomeLedger
-from makewand.route_select import load_policy, select
+from makewand.route_select import _family_reason, _mark_reason, _pause_reason, load_policy, select
 from makewand.routing_catalog import PROVIDER_FAMILIES, TASK_TYPES
 
 __all__ = [
@@ -197,6 +197,31 @@ def _candidate_payload(item, execution_options) -> dict:
     }
 
 
+def _restore_codex_reset(policy, result, not_tool) -> bool:
+    """A used-up Codex gets no dispatch once route skips it, so the check also runs here.
+
+    Only for a route that would otherwise have offered Codex; True means select again.
+    """
+    from makewand.codex_reset_credit import restore_quota
+    from makewand.model_quota import quota_reason
+    reason = dict(result.skipped).get("codex")
+    now = time.time()
+    if (not reason or os.environ.get(_QUOTA_FILE_ENV, "").strip()
+            or _family_reason("codex", not_tool) or _pause_reason(policy, "codex", now)):
+        return False
+    try:
+        ledger = OutcomeLedger()
+        mark = ledger.active_marks().get("codex")
+        gate = quota_reason("codex", policy=policy)
+        if not (_mark_reason(mark, now) == reason or (gate and gate in reason)) or not restore_quota("route"):
+            return False
+        if mark is not None:
+            ledger.mark("codex", time.time(), "额度已由赠送重置恢复", only_if=mark)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 def cmd_route(args) -> None:
     task_type = args.task_type
     difficulty = args.difficulty
@@ -231,6 +256,8 @@ def cmd_route(args) -> None:
     try:
         try:
             result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
+            if _restore_codex_reset(policy, result, not_tool):
+                result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
         except PermissionError:
             if getattr(args, "request_id", None):
                 raise ValueError("cannot verify request routing history; restore readable state before dispatch")

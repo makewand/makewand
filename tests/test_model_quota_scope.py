@@ -181,6 +181,17 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertFalse(any(row.provider == "agy" and "gemini-4-argon" in row.model for row in result.candidates))
         self.assertTrue(any(provider == "agy" and "部分模型受限" in reason for provider, reason in result.skipped))
 
+    def test_route_calls_agy_partly_limited_when_its_other_models_are_only_filtered_out(self):
+        from makewand.route_select import Policy, select
+        from makewand.outcome_ledger import OutcomeLedger
+        health.record_engine_limit("agy", "fixture native refusal", self.reset, model="gemini-4-argon-high")
+        result = select("review", "hard", risk="high", self_tool="claude", not_tool="claude",
+                        full=True, policy=Policy(), quota_reader=lambda: {},
+                        status_reader=health.load_status_cache, ledger=OutcomeLedger(self.root / "outcomes.jsonl"),
+                        discovered={"agy": {"gemini-4-argon-high": ["high"], "claude-opus-5-5-high": ["high"]}})
+        self.assertFalse(any(row.provider == "agy" for row in result.candidates))
+        self.assertTrue(any(provider == "agy" and "部分模型受限" in reason for provider, reason in result.skipped))
+
     def test_concurrent_model_refusals_preserve_each_observation(self):
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda i: health.record_engine_limit("agy", "fixture " + str(i), self.reset,
