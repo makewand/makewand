@@ -77,6 +77,25 @@ class GrokReadonlyReplyTests(unittest.TestCase):
                 self._run((1, json.dumps({"type": "error", "message": message}), stderr, None))
             record.assert_called_once()
 
+    def test_an_exhausted_balance_is_a_limit_not_an_unknown_outcome(self):
+        # What grok 1.0.50 prints when the balance is gone (exit 1).
+        report = ('Internal error: {\n  "message": "API error (status 402 Payment Required): '
+                  'Grok Build usage balance exhausted",\n  "http_status": 402\n}')
+        for stdout in ("", json.dumps({"type": "error", "message": report})):
+            with patch("makewand.health.record_engine_limit") as record:
+                outcome, _ = self._run((1, stdout, f"Error: {report}\n", None))
+            record.assert_called_once()
+            self.assertFalse(outcome[0])
+
+    def test_a_402_without_the_report_wrapper_is_a_limit(self):
+        self.assertTrue(grok.parse_grok_quota("", "API error (status 402 Payment Required): limit reached\n")[0])
+
+    def test_other_status_codes_and_answer_text_are_not_a_402_limit(self):
+        for stderr in ('Internal error: {\n  "message": "API error (status 500): boom"\n}\n',
+                       'API error (status 4020): boom\n'):
+            self.assertFalse(grok.parse_grok_quota("", stderr)[0], stderr)
+        self.assertFalse(grok.parse_grok_quota("API error (status 402 Payment Required): explained", "")[0])
+
     def test_a_failing_answer_on_stdout_is_not_read_as_a_limit(self):
         with patch("makewand.health.record_engine_limit") as record:
             self._run((1, "You've reached your free Grok Build usage limit", "", None))

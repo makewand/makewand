@@ -483,7 +483,8 @@ def run_subprocess(
         proc = subprocess.Popen(
             cmd,
             shell=isinstance(cmd, str),
-            stdin=subprocess.PIPE if input_text is not None else None,
+            # An inherited stdin that never closes makes `codex exec` wait for EOF until the deadline.
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             text=False,
