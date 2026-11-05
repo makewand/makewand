@@ -339,7 +339,7 @@ class GitHubHardeningTests(unittest.TestCase):
         script = _read(ROOT / "scripts" / "github_hardening.sh")
         contexts = json.loads(re.search(r'"contexts": (\[[^\]]*\])', script)[1])
         reported = _reported_check_names()
-        self.assertTrue({"verify", "Analyze (go)", "native-windows / verify"} <= reported, reported)
+        self.assertTrue({"verify", "Analyze (go)"} <= reported, reported)
         self.assertIn("verify", contexts, "CI verify must stay required")
         for context in contexts:
             with self.subTest(context=context):
@@ -396,8 +396,8 @@ class DeploySiteWorkflowTests(unittest.TestCase):
 
 
 class NativeWindowsWorkflowTests(unittest.TestCase):
-    def test_release_and_architecture_use_the_same_local_gate(self):
-        for path in (RELEASE, WORKFLOWS / "architecture.yml"):
+    def test_release_and_the_weekly_run_use_the_same_local_gate(self):
+        for path in (RELEASE, WORKFLOWS / "windows-weekly.yml"):
             with self.subTest(workflow=path.name):
                 caller = _job_blocks(_read(path))["native-windows"]
                 self.assertIn("    uses: ./.github/workflows/native-windows.yml", caller)

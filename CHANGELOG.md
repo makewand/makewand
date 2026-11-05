@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Windows 门禁改为每周、手动和发版时运行，不再跑在每个 PR 和 master 推送上。
 - `route` 在 Codex 被标记或门禁拦住时也会检查赠送重置，启用成功后清除标记；此前 route 跳过 Codex 就不会有派发，重置永远触发不了。重置前的周窗口证据不再算成“额度已用完”。
 - `route` 不再把只有部分模型受限的工具显示成整家受限：Agy 的 Gemini 用完而 Claude、GPT 还在时，显示“部分模型受限”。
 - Codex 周额度实时读数到 100% 时，自动启用账号里赠送的额度重置（不调用模型，同一窗口最多用 1 次，记入 `codex-reset-credit-audit.jsonl`）；makewand 自身的保留线、过期缓存和短窗口都不会触发。设 `MAKEWAND_CODEX_RESET_CREDIT=off` 可关闭。
