@@ -136,7 +136,7 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
         return result
     try:
         record_engine_usage(engine, tier=kwargs.get("tier", "standard"), success=result[0], task=prompt,
-                            route=route.route)
+                            route=route.route, model=kwargs.get("model"))
     except Exception:
         pass
     return result
@@ -1695,6 +1695,7 @@ def _main():
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
     p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
     p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
+    p_mark.add_argument("--model", dest="mark_model", default=None, help="只标记这一个模型，同一工具的其他模型照常参选")
 
     p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
     p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")

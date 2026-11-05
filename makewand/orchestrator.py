@@ -1526,7 +1526,7 @@ def dispatch_task(
         return result
     try:
         from makewand.usage import record_engine_usage
-        record_engine_usage(engine, tier=tier, success=result[0], task=prompt, route=route.route)
+        record_engine_usage(engine, tier=tier, success=result[0], task=prompt, route=route.route, model=model)
     except Exception:
         pass
     return result

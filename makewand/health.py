@@ -931,19 +931,32 @@ def _observed_longer_than(updated_at: str, seconds: float) -> bool:
             return False
 
 
-def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "") -> bool:
+# How long a refusal that names no reset time holds. The next step applies only
+# when the same pool refuses again (model_quota.hold_after_refusal).
+UNKNOWN_RESET_HOLDS = (2 * 3600, 6 * 3600, 24 * 3600)
+
+
+def unknown_reset_hold(hold_seconds: Any) -> int:
+    """The stored hold when it is one of the known steps, otherwise the shortest."""
+    if type(hold_seconds) is int and hold_seconds in UNKNOWN_RESET_HOLDS:
+        return hold_seconds
+    return UNKNOWN_RESET_HOLDS[0]
+
+
+def is_reset_time_passed(resets_at: Optional[str], updated_at: str = "", hold_seconds: Any = None) -> bool:
     """True once a cached limit's reset moment has passed.
 
     resets_at is parsed by parse_reset_datetime (the parser pacing uses too),
     anchored on updated_at. A missing, placeholder or unparseable reset falls
-    back to two hours after the observation so a limit can never stick forever.
+    back to a bounded hold after the observation so a limit can never stick forever.
     """
+    hold = unknown_reset_hold(hold_seconds)
     if not resets_at or resets_at == "待重置":
-        return bool(updated_at) and _observed_longer_than(updated_at, 2 * 3600)
+        return bool(updated_at) and _observed_longer_than(updated_at, hold)
     reset = parse_reset_datetime(resets_at, observed_at=updated_at or None)
     if reset is not None:
         return datetime.now().astimezone() >= reset
-    return bool(updated_at) and _observed_longer_than(updated_at, 2 * 3600)
+    return bool(updated_at) and _observed_longer_than(updated_at, hold)
 
 
 _RELATIVE_RESET_RE = re.compile(
@@ -1019,7 +1032,7 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                 if deadline is not None:
                     resets_at = deadline.isoformat()
                     info["resets_at"] = resets_at
-            if is_reset_time_passed(resets_at, updated_at):
+            if is_reset_time_passed(resets_at, updated_at, info.get("hold_seconds")):
                 info["status"] = "unknown"
                 info["verified"] = False
                 info["expired_from"] = "limited"
@@ -1250,8 +1263,11 @@ def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = Non
     if resets_at == "需登录授权" or "登录" in str(reason or ""):
         record_engine_failure(model_name, "needs_auth", f"{reason} · {get_reauth_hint(model_name)}")
         return
-    from makewand.model_quota import refusal
+    from makewand.model_quota import hold_after_refusal, refusal
     entry = refusal(model_name, reason, resets_at, model)
+    hold = hold_after_refusal(model_name, entry)
+    if hold != UNKNOWN_RESET_HOLDS[0]:
+        entry["hold_seconds"] = hold
     status_entry = {model_name: dict(entry, quota_limits=[entry])}
     save_status_cache(status_entry)
 
@@ -1621,7 +1637,7 @@ def _is_live_definite_failure(info: Any) -> bool:
     if not isinstance(info, dict):
         return False
     if info.get("status") == "limited":
-        return not is_reset_time_passed(info.get("resets_at"), info.get("updated_at") or "")
+        return not is_reset_time_passed(info.get("resets_at"), info.get("updated_at") or "", info.get("hold_seconds"))
     return (info.get("source") in _DEFINITE_FAILURE_SOURCES and info.get("status") in STATUS_TTL_SECONDS
             and not failure_verdict_expired(info))
 

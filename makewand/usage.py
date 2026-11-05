@@ -203,12 +203,25 @@ def get_dispatch_records(engine: Optional[str] = None, max_age_days: float = 7.0
             if name is None or record.get("engine") == name]
 
 
+def successes_since(engine: str, since: datetime) -> List[str]:
+    """Models named by this engine's successful dispatches after `since`, an aware time."""
+    models = []
+    for record in _load_raw_usage_records():
+        if record.get("engine") != engine or record.get("success") is not True:
+            continue
+        model = record.get("model")
+        if isinstance(model, str) and datetime.fromisoformat(record["timestamp"]).astimezone() > since:
+            models.append(model)
+    return models
+
+
 def record_engine_usage(
     engine: str,
     tier: str = "standard",
     success: bool = True,
     task: str = "",
     route: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> None:
     """
     Atomically records an invocation event of an engine into the rolling usage window.
@@ -225,6 +238,8 @@ def record_engine_usage(
         "success": success,
         "task": (task[:100] if task else "")
     }
+    if isinstance(model, str) and model:
+        record["model"] = model
     if route not in USAGE_ROUTES:
         route = dispatch_route(engine_name)
     if route:

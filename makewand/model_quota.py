@@ -121,7 +121,7 @@ def projected_status(provider, info, model=None, identity=None):
         if scope.get("model") and not model_matches(scope["model"], canonical_model(provider, model)):
             continue
         age = status_age_seconds(row)
-        if age is None or is_reset_time_passed(row.get("resets_at"), row.get("updated_at", "")):
+        if age is None or is_reset_time_passed(row.get("resets_at"), row.get("updated_at", ""), row.get("hold_seconds")):
             continue
         matches.append(row)
     result = dict(info)
@@ -144,6 +144,56 @@ def refusal(provider, reason, reset, model=None):
     return {"status": "limited", "reason": reason, "resets_at": reset,
             "updated_at": datetime.now().isoformat(), "source": "dispatch",
             "quota_scope": scope}
+
+
+def _names_no_reset(row):
+    return row.get("resets_at") in (None, "", "待重置")
+
+
+def hold_after_refusal(provider, entry):
+    """How long this refusal holds when it names no reset time.
+
+    A pool that refuses again right after its hold ended gets the next longer
+    hold, so callers stop spending calls on a known-empty pool. A real success
+    on that model, or a quiet day after the hold ended, starts over.
+    """
+    from datetime import datetime
+    from makewand import health, usage
+    holds = health.UNKNOWN_RESET_HOLDS
+    if not _names_no_reset(entry):
+        return holds[0]
+    info = health.load_status_cache().get(provider)
+    rows = info.get("quota_limits") if isinstance(info, dict) else None
+    scope = entry["quota_scope"]
+    key = (scope.get("account_ref"), scope.get("credential_root"), scope.get("model"))
+    previous = next((row for row in reversed(rows if isinstance(rows, list) else [])
+                     if isinstance(row, dict) and isinstance(row.get("quota_scope"), dict)
+                     and (row["quota_scope"].get("account_ref"), row["quota_scope"].get("credential_root"),
+                          row["quota_scope"].get("model")) == key), None)
+    observed = health._written_at(previous) if previous is not None else None
+    if observed is None or not _names_no_reset(previous):
+        return holds[0]
+    last = health.unknown_reset_hold(previous.get("hold_seconds"))
+    elapsed = (datetime.now().astimezone() - observed).total_seconds()
+    if elapsed < last:
+        # A call that started before the hold, not a new try after it.
+        return last
+    if elapsed > last + 24 * 3600 or any(
+            model_matches(scope.get("model"), canonical_model(provider, model))
+            for model in usage.successes_since(provider, observed)):
+        return holds[0]
+    return holds[min(holds.index(last) + 1, len(holds) - 1)]
+
+
+def _hold_note(info):
+    """When a repeatedly refused pool comes back, since the provider did not say."""
+    from datetime import timedelta
+    from makewand import health
+    hold = health.unknown_reset_hold(info.get("hold_seconds"))
+    observed = health._written_at(info)
+    if hold == health.UNKNOWN_RESET_HOLDS[0] or observed is None or not _names_no_reset(info):
+        return ""
+    return f"（连续被拒，约 {(observed + timedelta(seconds=hold)).strftime('%m-%d %H:%M')} 前不再派发）"
 
 
 def _number(value):
@@ -189,7 +239,7 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     info = projected_status(provider, info, model)
     reset_at = _reset_credit_redeemed_at(provider)
     if isinstance(info, dict) and info.get("status") == "limited" and not limit_cleared_by_reset(provider, info):
-        return "当前账号/模型额度受限：" + str(info.get("reason") or "供应商拒绝")
+        return "当前账号/模型额度受限：" + str(info.get("reason") or "供应商拒绝") + _hold_note(info)
     if policy is None:
         from makewand.route_select import load_policy
         policy = load_policy()

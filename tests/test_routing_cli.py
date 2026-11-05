@@ -21,7 +21,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "bin" / "makewand"
 WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
-FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
+FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>（只限某个模型时加 --model <模型>）；"
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
           " --model <模型> --effort <推理深度>"
           " --request-id <请求ID> --caller <发起工具>"
@@ -656,6 +656,27 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertEqual(caught.exception.args[0], expected)
 
     # ---------- mark ----------
+
+    def test_mark_on_one_model_leaves_its_siblings_routable(self):
+        before = self.route_json("review", "hard", "--risk", "high", quota={})["candidates"]
+        models = sorted({item["model"] for item in before if item["provider"] == "agy"})
+        self.assertGreater(len(models), 1)
+        result = self.run_cli("mark", "agy", "6h", "--model", models[0], "--reason", "周额度", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"agy 的 {models[0]}", result.stdout)
+        marks = json.loads((self.routing_dir / "marks.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(marks), [f"agy:{models[0]}"])
+        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        left = {item["model"] for item in payload["candidates"] if item["provider"] == "agy"}
+        self.assertEqual(left, set(models[1:]))
+        reasons = {item["provider"]: item["reason"] for item in payload["skipped"]}
+        self.assertIn(f"部分模型受限（{models[0]}）", reasons["agy"])
+
+    def test_mark_rejects_a_blank_or_ambiguous_model(self):
+        for model in ("", " ", "a:b"):
+            result = self.run_cli("mark", "muse", "6h", "--model", model, quota={})
+            self.assertNotEqual(result.returncode, 0, model)
+        self.assertFalse((self.routing_dir / "marks.json").exists())
 
     def test_mark_writes_and_route_skips(self):
         result = self.run_cli("mark", "codex", "6h", "--reason", "额度用完", quota={})

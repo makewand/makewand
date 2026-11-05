@@ -345,7 +345,7 @@ def cmd_route(args) -> None:
     if outcome_req_args:
         outcome_hint += " " + " ".join(outcome_req_args)
     lines.append(
-        "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
+        "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>（只限某个模型时加 --model <模型>）；"
         + outcome_hint
     )
     print("\n".join(lines))
@@ -510,8 +510,11 @@ def cmd_mark(args) -> None:
         provider = _validate_provider(args.provider)
         seconds = parse_duration(args.duration)
         reason = getattr(args, "reason", None) or ""
+        model = getattr(args, "mark_model", None)
+        if model is not None and (not model.strip() or ":" in model):
+            raise ValueError(f"invalid model {model!r}")
         until = time.time() + seconds
-        OutcomeLedger().mark(provider, until, reason)
+        OutcomeLedger().mark(f"{provider}:{model.strip()}" if model else provider, until, reason)
         when = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
     except ValueError as error:
         _fail(f"错误：{error}")
@@ -519,7 +522,8 @@ def cmd_mark(args) -> None:
         _fail(f"错误：{_MAX_DURATION_HINT}")
     except OSError as error:
         _fail(f"错误：写入额度标记失败：{error}")
-    print(f"已记录：{provider} 约 {when} 前不再派活")
+    subject = f"{provider} 的 {model.strip()}" if model else provider
+    print(f"已记录：{subject} 约 {when} 前不再派活")
 
 
 def cmd_outcome(args) -> None:
