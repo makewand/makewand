@@ -5,7 +5,7 @@ Makewand configuration and environment constants.
 import os
 import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 # Cache directories
 CONFIG_DIR = Path(os.environ.get("MAKEWAND_CONFIG_DIR", Path.home() / ".config" / "makewand")).expanduser().resolve()

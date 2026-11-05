@@ -81,7 +81,7 @@ check_tokens README.md 1
 if ! head -n 1 README.md | grep -qF "v$VERSION"; then
     fail "README.md: title line must name v$VERSION"
 fi
-for f in site/index.html site/docs.html site/main.js; do
+for f in site/index.html; do
     [ -e "$f" ] && check_tokens "$f"
 done
 

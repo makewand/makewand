@@ -4,7 +4,7 @@ set -euo pipefail
 
 command -v git >/dev/null || { echo "Git is required." >&2; exit 1; }
 command -v python3 >/dev/null || { echo "Python 3.9+ is required." >&2; exit 1; }
-command -v go >/dev/null || { echo "Source installation requires the Go toolchain specified in go.mod; prebuilt releases require Python 3.9+." >&2; exit 1; }
+command -v go >/dev/null || { echo "Source installation requires the Go toolchain specified in go.mod." >&2; exit 1; }
 INSTALL_DIR="${MAKEWAND_INSTALL_ROOT:-$HOME/.local/share/makewand}"
 SOURCE_DIR="${MAKEWAND_SOURCE_DIR:-}"
 FETCH_DIR=""

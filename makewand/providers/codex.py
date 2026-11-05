@@ -3,7 +3,6 @@ Codex CLI provider adapter (OpenAI subscription / gpt-6-astra).
 """
 
 import os
-import time
 import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
@@ -89,7 +88,7 @@ def execute_codex_task(
     If readonly=True, enforces read-only sandbox mode, preventing any file modifications.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, save_status_cache, record_engine_limit
+    from makewand.health import load_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
         SandboxConfigError, ProviderStartupError,

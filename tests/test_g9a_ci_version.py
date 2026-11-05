@@ -19,8 +19,6 @@ VERSION_SURFACE = [
     "makewand/__init__.py",
     "README.md",
     "site/index.html",
-    "site/docs.html",
-    "site/main.js",
     "internal/buildinfo/buildinfo.go",
     "scripts/install.sh",
     "scripts/install_source.py",
@@ -89,7 +87,6 @@ class CheckVersionTests(unittest.TestCase):
         cases = {
             "README.md": lambda s: s.replace("v" + version, stale, 1),
             "site/index.html": lambda s: s.replace("v" + version, stale, 1),
-            "site/main.js": lambda s: s.replace("v" + version, stale, 1),
             "makewand/__init__.py": lambda s: s.replace("(v" + version + ")", "(" + stale + ")", 1),
             "CHANGELOG.md": lambda s: s.replace(f"## [{version}]", "## [0.0.1]"),
             "internal/buildinfo/buildinfo.go": lambda s: s.replace('Version = "dev"', f'Version = "{version}"', 1),

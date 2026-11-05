@@ -1,13 +1,13 @@
 """
-Makewand - Unified Multi-Model AI Subscription Orchestrator (v3.3.0)
+Makewand - dispatch to the coding CLIs signed in on this machine (v4.0.0)
 ---------------------------------------------------------------------
-Orchestrates mainstream local AI subscriptions (Antigravity, Claude Code,
-Codex CLI, Grok Build, Muse Code, Aider), cloud APIs (DeepSeek, Qwen, GLM, Kimi),
-and local models with explicit billing policy, dynamic tool topology, intelligent
-quota adaptation, cross-model red-team verification, and automated repair loops.
+Sends tasks and independent reviews to local subscriptions (Antigravity, Claude
+Code, Codex CLI, Grok Build, Muse Code, Aider), with sandboxing, call budgets,
+quota awareness and a record of accepted results. Cloud APIs and local models
+are available under an explicit billing policy.
 """
 
-__version__ = "3.3.0"
+__version__ = "4.0.0"
 __author__ = "Makewand Authors"
 
 # Release bundles stamp both engines from the same tag. Source checkouts use

@@ -176,7 +176,7 @@ def execute_muse_task(
     If readonly=True, omits --yolo bypass flag.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, save_status_cache, record_engine_limit
+    from makewand.health import load_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
         SandboxConfigError, ProviderStartupError,

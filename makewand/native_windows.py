@@ -6,14 +6,11 @@ is in progress. Leaf reads additionally deny shared writes. No junction, other
 reparse point, alternate stream, DOS device name or ambiguous name is accepted.
 """
 import contextlib
-import base64
 import ctypes
 import hashlib
 import ntpath
 import os
 import re
-import stat
-import uuid
 from pathlib import Path
 
 

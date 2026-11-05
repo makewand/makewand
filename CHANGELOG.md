@@ -9,6 +9,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-05
+
+破坏性版本：Go 的 TUI、server、引擎和 Python 流水线移除，见下。不再发布预编译包；用源码安装。
+
+- `status` 在额度读数超过 10 分钟时自己刷新，此前 15 分钟没人跑 `route` 就显示额度未知。
+- 官网改成一页说明。`SECURITY.md` 和命令行帮助改成只描述现在的功能。
+- 删除没有调用方的 `collision.py`、`protected_files.py` 和未使用的 import。
 - 主线移除 Python 流水线：`run`、`race`、`merge`、`ensemble`、`plan`、`aci`、`mcp`、`daemon`、`sessions` 和候选命令（`candidates`、`inspect`、`apply`、`discard`），以及 `benchmarks/`，保留在 tag `archive/pre-trim-20261105`。`makewand "<任务>"` 不再把任意文字当成任务启动流水线，无子命令时只显示帮助。`--daemon`、`--no-daemon`、`--allow-collision`、`--protect`、`--workflow`、`--judge-reserve-seconds` 随之移除。保留 `review`（只审当前改动）、直接派发、`route`/`mark`/`outcome`、`budget`、`status`、`sandbox`、`search`、`repomap`。
 - Windows 门禁改为每周、手动和发版时运行，不再跑在每个 PR 和 master 推送上。
 - `route` 和 `status` 在 Codex、Claude 周额度按目前速度会在重置前到线时给出预计时间。

@@ -7,7 +7,6 @@ actionable optimization proposals for Makewand.
 
 import os
 import re
-import sys
 import json
 import time
 import uuid
@@ -18,14 +17,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, Iterable
 from makewand.config import (
     CONFIG_DIR,
-    ensure_config_dir,
-    c,
-    COLOR_BOLD,
-    COLOR_CYAN,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_RED,
-    COLOR_RESET
+    ensure_config_dir
 )
 
 # ---------------------------------------------------------------------------

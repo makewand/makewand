@@ -16,20 +16,9 @@ Scope, stated honestly:
 - "unknown" (never probed) and stale verdicts are neutral, not exhausted.
 """
 
-import os
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 
-from makewand.config import (
-    c,
-    COLOR_BOLD,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_RED,
-    COLOR_CYAN,
-    COLOR_PURPLE,
-    COLOR_RESET,
-)
 from makewand.health import (load_status_cache, calculate_provider_quota, get_reauth_hint, STATUS_STALE_SECONDS,
                              parse_reset_datetime)
 from makewand.discovery import get_provider_model_tier

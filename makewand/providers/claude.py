@@ -61,7 +61,7 @@ def execute_claude_task(
     under a non-bypass permission mode, so every other tool is denied without prompting.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, save_status_cache
+    from makewand.health import load_status_cache
     from makewand.sandbox import (
         is_bwrap_available,
         SandboxConfigError, ProviderStartupError,
