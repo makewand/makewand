@@ -161,15 +161,5 @@ class SizeTests(unittest.TestCase):
         self.assertIn("超过复审上限 100 字节", out.getvalue())
 
 
-class JsonTextTests(unittest.TestCase):
-    def test_manifests_use_the_one_escaping_helper(self):
-        self.assertIs(orch._json_text, git_helper._json_text)
-        self.assertNotIn("ensure_ascii=True", inspect.getsource(orch))
-        self.assertNotIn("ensure_ascii=True", inspect.getsource(review_verdict))
-        self.assertIn("_json_text(manifest)", inspect.getsource(review_verdict._save_unverified_artifacts))
-        manifest = {"patches": {"sub\udce9": "unverified.submodule-0.patch"}}
-        self.assertEqual(json.loads(git_helper._json_text(manifest)), manifest)
-
-
 if __name__ == "__main__":
     unittest.main()

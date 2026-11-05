@@ -660,13 +660,3 @@ def generate_repo_map(cwd: str, max_lines: int = 80, max_files: int = 40, use_pa
     return "\n".join(output_lines)
 
 
-def format_repo_map_for_prompt(cwd: str, max_lines: int = 80) -> str:
-    """
-    Formats the repository symbol map as a prompt injection block.
-    Returns empty string if no symbols are found.
-    """
-    repo_map = generate_repo_map(cwd, max_lines=max_lines)
-    if not repo_map:
-        return ""
-    return f"\n【代码库全局架构拓扑感知 (Repo-Map)】\n{repo_map}\n"
-

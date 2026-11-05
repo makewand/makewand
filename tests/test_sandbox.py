@@ -7,7 +7,7 @@ import sys
 import unittest
 import tempfile
 from pathlib import Path
-from makewand.sandbox import is_bwrap_available, wrap_bwrap, run_in_sandbox, sandbox_lifecycle
+from makewand.sandbox import is_bwrap_available, wrap_bwrap, run_in_sandbox
 
 class TestSandbox(unittest.TestCase):
     def test_bwrap_availability(self):
@@ -234,21 +234,6 @@ class TestSandbox(unittest.TestCase):
             if os.path.exists("/proc/kallsyms"):
                 self.assertIn("--ro-bind /dev/null /proc/kallsyms", joined)
 
-    def test_posix_sandbox_rlimits(self):
-        if os.name == "posix":
-            import subprocess
-            code = (
-                "import os, sys, resource\n"
-                "from makewand.sandbox import apply_posix_sandbox_rlimits\n"
-                "apply_posix_sandbox_rlimits()\n"
-                "fsize_soft, _ = resource.getrlimit(resource.RLIMIT_FSIZE)\n"
-                "assert fsize_soft == 1024 * 1024 * 1024, f'unexpected fsize: {fsize_soft}'\n"
-                "as_soft, _ = resource.getrlimit(resource.RLIMIT_AS)\n"
-                "assert as_soft == 16 * 1024 * 1024 * 1024, f'unexpected as: {as_soft}'\n"
-            )
-            res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-            self.assertEqual(res.returncode, 0, f"rlimits test failed: {res.stderr}")
-
     def test_sandbox_codex_uncreated_override_masked_with_dev_null(self):
         """Regression test for P0/P1-S2: AGENTS.override.md and uncreated files must not trigger /dev/null mount,
         must not leave touch traces on host, and must be cleaned up if created during sandbox execution."""
@@ -342,71 +327,6 @@ class TestSandbox(unittest.TestCase):
                 ro_bind_pairs2 = [(cmd2[i + 1], cmd2[i + 2]) for i in ro_bind_indices2 if i + 2 < len(cmd2)]
                 self.assertIn((override_path, override_path), ro_bind_pairs2)
 
-    def test_sandbox_lifecycle_context_manager(self):
-        from unittest.mock import patch
-        from makewand.sandbox import sandbox_lifecycle
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_home = Path(tmpdir) / "home"
-            fake_codex = fake_home / ".codex"
-            fake_codex.mkdir(parents=True)
-            override_path = str(fake_codex / "AGENTS.override.md")
-
-            with patch.dict(os.environ, {"HOME": str(fake_home)}):
-                os.environ.pop("CODEX_HOME", None)
-                with sandbox_lifecycle(is_provider=True, provider_name="codex"):
-                    # Simulate an uncreated file created during execution
-                    Path(override_path).write_text("injected_by_malicious_model")
-                    self.assertTrue(os.path.exists(override_path))
-                # Must be cleaned up upon exiting sandbox_lifecycle
-                self.assertFalse(os.path.exists(override_path))
-
-    def test_apply_posix_sandbox_rlimits_tightens_and_never_widens(self):
-        from unittest.mock import patch
-        from makewand.sandbox import apply_posix_sandbox_rlimits
-        import resource
-
-        # Case 1: nproc_limit < cur_soft -> tightens down
-        with patch.dict(os.environ, {"MAKEWAND_SANDBOX_RLIMIT_NPROC": "500"}):
-            with patch("resource.getrlimit", return_value=(1000, 2000)):
-                with patch("resource.setrlimit") as mock_setrlimit:
-                    apply_posix_sandbox_rlimits()
-                    mock_setrlimit.assert_any_call(resource.RLIMIT_NPROC, (500, 2000))
-
-        # Case 2: nproc_limit > cur_soft -> does NOT widen
-        with patch.dict(os.environ, {"MAKEWAND_SANDBOX_RLIMIT_NPROC": "5000"}):
-            with patch("resource.getrlimit", return_value=(1000, 2000)):
-                with patch("resource.setrlimit") as mock_setrlimit:
-                    apply_posix_sandbox_rlimits()
-                    mock_setrlimit.assert_any_call(resource.RLIMIT_NPROC, (1000, 2000))
-
-    def test_collect_uncreated_sensitive_files_scope_isolation(self):
-        from makewand.sandbox import _collect_uncreated_sensitive_files
-        # When is_provider=False, must return empty list (never tracks ~/.codex or other provider files)
-        tracked_non_provider = _collect_uncreated_sensitive_files(is_provider=False)
-        self.assertEqual(tracked_non_provider, [])
-
-        tracked_cmd_non_provider = _collect_uncreated_sensitive_files(is_provider=False, cmd=["python3", "-m", "unittest"])
-        self.assertEqual(tracked_cmd_non_provider, [])
-
-        # When is_provider=False, even if provider_name is given, must return empty list
-        self.assertEqual(_collect_uncreated_sensitive_files(is_provider=False, provider_name="codex"), [])
-        self.assertEqual(_collect_uncreated_sensitive_files(is_provider=False, provider_name="claude"), [])
-
-        # When is_provider=True, only the active provider is tracked
-        tracked_claude = _collect_uncreated_sensitive_files(is_provider=True, provider_name="claude")
-        for p in tracked_claude:
-            self.assertIn(".claude", p)
-            self.assertNotIn(".codex", p)
-
-        tracked_codex = _collect_uncreated_sensitive_files(is_provider=True, provider_name="codex")
-        for p in tracked_codex:
-            self.assertIn(".codex", p)
-            self.assertNotIn(".claude", p)
-
-        tracked_cmd_claude = _collect_uncreated_sensitive_files(is_provider=True, cmd=["claude", "-p", "hello"])
-        for p in tracked_cmd_claude:
-            self.assertIn(".claude", p)
-            self.assertNotIn(".codex", p)
 
     def test_sandbox_codex_readonly_mode_state_root_mounted_ro(self):
         """Regression test for [P1] codex-ro-erofs + H3: in readonly=True mode the
@@ -510,69 +430,6 @@ conn.close()
                 self.assertEqual(len(private_sources), 1)
                 self.assertIn("provider-homes", private_sources[0])
 
-    def test_sandbox_cleanup_does_not_delete_preexisting_files(self):
-        """Regression test for [P1] commits-review-1: files that existed before sandbox execution must never be deleted."""
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_home = Path(tmpdir) / "home"
-            fake_codex = fake_home / ".codex"
-            fake_codex.mkdir(parents=True)
-            memories_dir = fake_codex / "memories"
-            memories_dir.mkdir()
-            user_note = memories_dir / "user_memory.json"
-            user_note.write_text('{"user": "data"}', encoding="utf-8")
-
-            with patch.dict(os.environ, {"HOME": str(fake_home)}):
-                os.environ.pop("CODEX_HOME", None)
-                with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=False):
-                    pass
-                # Memories directory and user memory must remain completely intact
-                self.assertTrue(memories_dir.exists())
-                self.assertTrue(user_note.exists())
-                self.assertEqual(user_note.read_text(encoding="utf-8"), '{"user": "data"}')
-
-    def test_sandbox_cleanup_does_not_delete_concurrent_host_files_in_readonly(self):
-        """Regression test for [P1] commits-review-1: files created by concurrent host sessions
-        during readonly tasks must never be deleted on sandbox exit."""
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_home = Path(tmpdir) / "home"
-            fake_codex = fake_home / ".codex"
-            fake_codex.mkdir(parents=True)
-            memories_dir = fake_codex / "memories"
-
-            with patch.dict(os.environ, {"HOME": str(fake_home)}):
-                os.environ.pop("CODEX_HOME", None)
-                with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=True):
-                    # Simulate host user creating memories directory concurrently outside sandbox
-                    memories_dir.mkdir()
-                    (memories_dir / "note.txt").write_text("host note", encoding="utf-8")
-                # On exiting readonly sandbox, host files must NOT be deleted
-                self.assertTrue(memories_dir.exists())
-                self.assertTrue((memories_dir / "note.txt").exists())
-
-    def test_sandbox_signal_termination_executes_cleanup(self):
-        """Regression test for [P1] commits-review-1: SIGTERM triggers finally cleanup."""
-        import signal
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_home = Path(tmpdir) / "home"
-            fake_codex = fake_home / ".codex"
-            fake_codex.mkdir(parents=True)
-            override_path = fake_codex / "AGENTS.override.md"
-
-            with patch.dict(os.environ, {"HOME": str(fake_home)}):
-                os.environ.pop("CODEX_HOME", None)
-                try:
-                    with sandbox_lifecycle(is_provider=True, provider_name="codex", readonly=False):
-                        override_path.write_text("malicious override", encoding="utf-8")
-                        self.assertTrue(override_path.exists())
-                        # Simulate SIGTERM signal delivery to the process
-                        os.kill(os.getpid(), signal.SIGTERM)
-                except KeyboardInterrupt:
-                    pass
-                # Must be cleaned up in finally block despite SIGTERM
-                self.assertFalse(override_path.exists())
 
     def test_sandbox_codex_home_remaps_readonly_state(self):
         """Regression test for [P1] commits-review-1: CODEX_HOME remaps readonly_state properly."""

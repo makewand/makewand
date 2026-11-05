@@ -14,15 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from makewand.repomap import (
-    _extract_python_symbols,
-    _extract_go_symbols,
-    _extract_ts_js_symbols,
-    _extract_rust_symbols,
-    extract_file_symbols,
-    generate_repo_map,
-    format_repo_map_for_prompt,
-)
+from makewand.repomap import _extract_python_symbols, _extract_go_symbols, _extract_ts_js_symbols, _extract_rust_symbols, extract_file_symbols, generate_repo_map
 from makewand.cli import cmd_repomap
 
 
@@ -186,18 +178,6 @@ fn test_internal_helper() {}
             self.assertLessEqual(len(lines), 16)
             self.assertTrue(lines[-1].endswith("(more symbols truncated)"))
 
-    def test_format_repo_map_for_prompt(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            # Empty workspace returns empty string
-            self.assertEqual(format_repo_map_for_prompt(str(root)), "")
-
-            # Workspace with code returns formatted prompt block
-            (root / "main.py").write_text("def greet(): pass\n")
-            formatted = format_repo_map_for_prompt(str(root))
-            self.assertIn("【代码库全局架构拓扑感知 (Repo-Map)】", formatted)
-            self.assertIn("main.py:", formatted)
-            self.assertIn("def greet()", formatted)
 
     def test_cmd_repomap_cli(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -540,6 +520,5 @@ int calculateChecksum(const char* buffer, size_t length_of_data) {
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

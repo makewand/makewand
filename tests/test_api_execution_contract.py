@@ -148,17 +148,6 @@ class APIExecutionTests(unittest.TestCase):
         self.assertEqual(self.attempts()[0]["result_status"], "UNKNOWN")
         self.assertFalse(self.attempts()[0]["outcome_known"])
 
-    @patch("urllib.request.urlopen")
-    def test_extra_retry_releases_consumed_stage_hold(self, transport):
-        coder = call_budget.reserve_capacity(1, "api-fixture", purpose="coder")
-        judge = call_budget.reserve_capacity(1, "api-fixture", purpose="judge")
-        transport.side_effect = [refusal(), response()]
-        with execution_context(lease_id=coder):
-            result = execute(self.request(), lambda remaining: call_api_chat("codex", "test", timeout=remaining, backoff_factor=0))
-        self.assertEqual(result.status, "PASSED", result.error)
-        ledger = json.loads(self.ledger.read_text())
-        self.assertEqual(len(ledger["attempts"]), 2)
-        self.assertEqual(ledger["holds"][judge]["remaining"], 1)
 
     @patch("urllib.request.urlopen")
     def test_truncated_stream_cannot_apply_partial_code(self, transport):

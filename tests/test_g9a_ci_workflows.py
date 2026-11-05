@@ -231,54 +231,5 @@ class GitHubHardeningTests(unittest.TestCase):
                 self.assertIn(context, reported)
 
 
-@unittest.skipUnless(shutil.which("bash"), "bash required")
-class DeploySiteWorkflowTests(unittest.TestCase):
-    """eng-1021-8: the deploy checked only makewand.org and makewand.com."""
-
-    HOSTS = {"makewand.org", "www.makewand.org", "makewand.com", "www.makewand.com", "makewand.pages.dev"}
-
-    def check(self, stale=()):
-        script = _step_run(_read(DEPLOY), "Check the served installer")
-        with tempfile.TemporaryDirectory() as tmp:
-            work = Path(tmp)
-            (work / "site").mkdir()
-            shutil.copy2(ROOT / "site" / "install.sh", work / "site" / "install.sh")
-            tools = work / "tools"
-            tools.mkdir()
-            log = work / "requests.log"
-            # `curl [options] URL -o FILE`: a stale host serves other bytes.
-            (tools / "curl").write_text(
-                "#!/bin/sh\n"
-                'url=; out=\n'
-                'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
-                f'echo "$url" >> "{log}"\n'
-                'host="${url#https://}"; host="${host%%/*}"\n'
-                f'case " {" ".join(stale)} " in *" $host "*) echo stale > "$out" ;; *) cp site/install.sh "$out" ;; esac\n',
-                encoding="utf-8")
-            (tools / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            for tool in tools.iterdir():
-                tool.chmod(0o755)
-            env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
-            # Actions runs a `run:` script that names no shell as `bash -e {0}`.
-            result = subprocess.run(["bash", "-e", "-c", script], cwd=work, env=env, capture_output=True, text=True)
-            requested = [line.split("/")[2] for line in log.read_text(encoding="utf-8").splitlines()]
-        return result, requested
-
-    def test_every_served_hostname_is_checked(self):
-        # One stalled host must not outlast the shared deadline: every request is bounded.
-        self.assertIn("--max-time", _step_run(_read(DEPLOY), "Check the served installer"))
-        result, requested = self.check()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(sorted(requested), sorted(self.HOSTS))
-
-    def test_one_stale_hostname_fails_the_deploy_within_one_deadline(self):
-        result, requested = self.check(stale=("www.makewand.com",))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("www.makewand.com", result.stdout.split("::error::", 1)[1])
-        self.assertEqual(set(requested), self.HOSTS)
-        self.assertEqual(requested.count("www.makewand.com"), 18, "retried until the shared deadline")
-        self.assertEqual(requested.count("makewand.org"), 1, "a current host is not fetched again")
-
-
 if __name__ == "__main__":
     unittest.main()

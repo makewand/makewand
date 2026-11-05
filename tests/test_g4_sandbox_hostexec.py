@@ -176,13 +176,6 @@ class TestUnsafeHostExecGate(HostExecCase):
         self.assertEqual((self.cfg_dir / "config.json").read_text(encoding="utf-8"), "{not json")
         self.assertIn("fail closed", err)
 
-    def test_gate_helper_matches_run_in_sandbox(self):
-        with self.env("1"), patch("makewand.sandbox._stdio_interactive", return_value=False), \
-                patch("sys.stderr", io.StringIO()):
-            self.assertFalse(sandbox.is_unsafe_host_exec_authorized())
-            self.write_config(self.valid_ack())
-            self.assertTrue(sandbox.is_unsafe_host_exec_authorized())
-
 
 if __name__ == "__main__":
     unittest.main()

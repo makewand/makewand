@@ -84,8 +84,6 @@ fi
 for f in site/index.html site/docs.html site/main.js; do
     [ -e "$f" ] && check_tokens "$f"
 done
-check_tokens makewand/interactive.py
-[ -e tests/test_interactive.py ] && check_tokens tests/test_interactive.py
 
 # Go: builds without ldflags must identify as "dev", never as a stale release.
 BUILDINFO="internal/buildinfo/buildinfo.go"

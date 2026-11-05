@@ -27,7 +27,6 @@ from unittest.mock import patch, MagicMock
 
 from makewand.health import is_reset_time_passed, save_status_cache, load_status_cache
 from makewand.usage import record_engine_usage, get_burn_rate_penalty, _calc_weighted_counts, _calc_continuous_penalty
-from makewand.orchestrator import detect_task_tier, select_optimal_engine_pair, run_pipeline
 
 class TestAdaptiveGovernance(unittest.TestCase):
     def setUp(self):
@@ -125,56 +124,6 @@ class TestAdaptiveGovernance(unittest.TestCase):
         diff = abs(p_35 - p_34)
         self.assertLess(diff, 0.25, f"Step delta must be continuous, got jump of {diff}")
 
-    def test_detect_task_tier_upgrades(self):
-        # Algorithmic & concurrency phrases must trigger deep
-        self.assertEqual(detect_task_tier("implement a lock-free ring buffer with memory ordering"), "deep")
-        self.assertEqual(detect_task_tier("cross-module refactor of the distributed scheduler"), "deep")
-        self.assertEqual(detect_task_tier("排查底层原子操作与无锁环形缓冲区死锁"), "deep")
-
-        # Fast probe inspect phrases must trigger fast (not deep on '安全')
-        self.assertEqual(detect_task_tier("快速查看这个按钮是否正常"), "fast")
-        self.assertEqual(detect_task_tier("快速探测系统配置"), "fast")
-
-        # Plain generic tasks without complex algorithms remain standard
-        self.assertEqual(detect_task_tier("设计一个登录页面"), "standard")
-        self.assertEqual(detect_task_tier("写一个简单的待办列表脚本"), "fast")
-
-    def test_boost_overclocking_penetrates_soft_penalties(self):
-        healthy_cache = {
-            "codex": {"status": "healthy"},
-            "claude": {"status": "healthy"},
-            "grok": {"status": "healthy"},
-            "agy": {"status": "healthy"},
-            "muse": {"status": "healthy"},
-        }
-        # Simulate a saturated heavy-usage penalty on codex (-4.0). The burn-rate
-        # penalty is a bounded soft down-weight (no hard 0.2 clamp any more): the
-        # engine stays eligible, but at saturation it loses the primary slot even
-        # with its algorithm affinity.
-        with patch("makewand.usage.get_burn_rate_penalty", side_effect=lambda eng: (-4.0, "Heavy usage") if eng == "codex" else (0.0, None)):
-            # Standard mode: codex score penalized
-            coders_std, _, meta_std = select_optimal_engine_pair("实现一个动态规划算法", tier="standard", cache=healthy_cache, boost=False)
-            self.assertNotEqual(meta_std["primary_coder"], "codex", "Heavily penalized codex must not be primary coder in standard mode")
-            self.assertIn("codex", coders_std, "Burn-rate penalty is soft: codex must remain an eligible fallback")
-
-            # Boost mode: codex penalty is penetrated!
-            coders_boost, _, meta_boost = select_optimal_engine_pair("实现一个动态规划算法", tier="deep", cache=healthy_cache, boost=True)
-            self.assertEqual(meta_boost["primary_coder"], "codex", "Boost mode must bypass soft penalties and allocate flagship model")
-            self.assertTrue(any("强制超频" in r for r in meta_boost["reasons"]))
-
-    def test_low_usage_performance_milking_bonus(self):
-        healthy_cache = {
-            "codex": {"status": "healthy"},
-            "claude": {"status": "healthy"},
-            "grok": {"status": "healthy"},
-            "agy": {"status": "healthy"},
-            "muse": {"status": "healthy"},
-        }
-        # With zero usage in past 24h, all healthy commercial models receive surplus milking bonus (+0.5)
-        with patch("makewand.usage.get_engine_usage_stats", return_value={"codex": {"total": 0}, "claude": {"total": 0}, "grok": {"total": 0}, "muse": {"total": 0}}), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            _, _, meta = select_optimal_engine_pair("一般性开发任务", tier="standard", cache=healthy_cache)
-            self.assertTrue(any("低频性能榨取放量加权" in r for r in meta["reasons"]), "Zero usage must grant surplus milking bonus")
 
     def test_autofix_reviewer_orthogonality_excludes_both_coder_and_fixer(self):
         # Test candidate selection logic in Auto-Fix

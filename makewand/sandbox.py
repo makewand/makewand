@@ -203,8 +203,7 @@ SAFE_HOME_BIN_DIRS = [
 # host originals (a symlinked entry binds its resolved target). Missing
 # protected paths get no mount: anything the model creates there lands in the
 # private directory and is deleted after the run, so nothing is ever created on
-# or removed from the host. (placeholder is only used by the legacy
-# sandbox_lifecycle helper.)
+# or removed from the host.
 # Session transcripts, history, sockets and daemon state of host sessions are
 # simply absent from the private directory.
 # ---------------------------------------------------------------------------
@@ -1038,31 +1037,6 @@ def _host_var_socket_masks() -> List[str]:
     _host_var_cache["masks"] = result
     _host_var_cache["at"] = now
     return list(result)
-
-
-# ---------------------------------------------------------------------------
-# provider state mounts
-# ---------------------------------------------------------------------------
-def _create_placeholder(path: str, kind: str, placeholder) -> None:
-    """Creates an empty host placeholder so it can be mounted read-only (see PROVIDER_PROFILES)."""
-    try:
-        if kind == "dir":
-            os.makedirs(path, mode=0o700, exist_ok=True)
-        else:
-            parent = os.path.dirname(path)
-            if not os.path.isdir(parent):
-                os.makedirs(parent, mode=0o700, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            try:
-                os.write(fd, str(placeholder).encode("utf-8"))
-            finally:
-                os.close(fd)
-    except FileExistsError:
-        return
-    except OSError as exc:
-        raise SandboxConfigError(
-            f"无法在宿主创建受保护路径占位 {path} ({exc})，拒绝以可写方式挂载 provider 凭据目录"
-        ) from exc
 
 
 def _mask_mount_args(path: str) -> List[str]:
@@ -3137,11 +3111,6 @@ def resolve_unsafe_host_exec() -> Tuple[bool, Optional[str]]:
     return True, "interactive-ack"
 
 
-def is_unsafe_host_exec_authorized() -> bool:
-    """Gate helper for callers that only need the decision (e.g. untrusted-repo checks)."""
-    return resolve_unsafe_host_exec()[0]
-
-
 def audit_unsafe_host_exec(context: str, cmd, cwd: str, source: Optional[str]) -> None:
     """Appends one host-execution record (same fields as the Go audit log). Never blocks execution."""
     try:
@@ -3583,144 +3552,6 @@ def provider_sandbox_launch(
             yield ProviderLaunch(list(exec_cmd), pass_fds, True, None, home)
 
 
-def apply_posix_sandbox_rlimits():
-    """
-    In-process POSIX rlimits (RLIMIT_AS, RLIMIT_NPROC, RLIMIT_FSIZE) for code
-    already running inside a sandbox. Launchers must not call it via
-    preexec_fn (fork safety, CON-01); they use sandbox_resource_limit_prefix().
-    """
-    if os.name != "posix":
-        return
-    try:
-        import resource
-    except ImportError:
-        return
-
-    # RLIMIT_FSIZE: Max file size writable by process (default: 1 GiB)
-    try:
-        fsize_bytes = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_FSIZE", 1024 * 1024 * 1024))
-        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_FSIZE)
-        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
-            soft = fsize_bytes
-        else:
-            soft = min(fsize_bytes, cur_hard)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, cur_hard))
-    except Exception:
-        pass
-
-    # RLIMIT_AS: Max virtual address space (default: 16 GiB)
-    try:
-        as_bytes = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_AS", 16 * 1024 * 1024 * 1024))
-        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_AS)
-        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
-            soft = as_bytes
-        else:
-            soft = min(as_bytes, cur_hard)
-        resource.setrlimit(resource.RLIMIT_AS, (soft, cur_hard))
-    except Exception:
-        pass
-
-    # RLIMIT_NPROC: Max number of processes/threads for UID (default: 65536)
-    try:
-        nproc_limit = int(os.environ.get("MAKEWAND_SANDBOX_RLIMIT_NPROC", 65536))
-        cur_soft, cur_hard = resource.getrlimit(resource.RLIMIT_NPROC)
-        effective_limit = min(nproc_limit, cur_soft) if cur_soft > 0 else nproc_limit
-        if cur_hard == resource.RLIM_INFINITY or cur_hard < 0:
-            soft = effective_limit
-        else:
-            soft = min(effective_limit, cur_hard)
-        resource.setrlimit(resource.RLIMIT_NPROC, (soft, cur_hard))
-    except Exception:
-        pass
-
-
-def _collect_uncreated_sensitive_files(
-    is_provider: bool = False,
-    provider_name: Optional[str] = None,
-    cmd: Optional[List[str]] = None,
-    readonly: bool = False,
-) -> List[str]:
-    """Find sensitive provider files that currently do not exist on the host."""
-    user_home = _norm(str(Path.home()))
-    targets: List[str] = []
-
-    p_names: List[str] = []
-    if is_provider:
-        p = (provider_name or "").lower().strip()
-        if p == "gemini":
-            p = "agy"
-        if not p and cmd:
-            first_bin = os.path.basename(str(cmd[0])).lower()
-            if first_bin == "gemini" or first_bin.startswith("gemini-") or first_bin.startswith("gemini."):
-                p = "agy"
-            else:
-                for cand in ["claude", "codex", "agy", "muse", "grok", "aider"]:
-                    if first_bin == cand or first_bin.startswith(cand + "-") or first_bin.startswith(cand + "."):
-                        p = cand
-                        break
-        if p:
-            p_names.append(p)
-
-    for p_name in p_names:
-        prof = PROVIDER_PROFILES.get(p_name)
-        if not prof:
-            continue
-        if readonly and prof.get("tmpfs_readonly_root"):
-            continue
-        roots: List[Tuple[str, str]] = []
-        if p_name == "codex":
-            codex_home = os.environ.get("CODEX_HOME")
-            selected = os.path.realpath(_norm(os.path.expanduser(codex_home or os.path.join(user_home, ".codex"))))
-            if os.path.isdir(selected):
-                roots.append((".codex", selected))
-        else:
-            for r in prof.get("roots", []):
-                rp = os.path.realpath(os.path.join(user_home, r))
-                if os.path.isdir(rp):
-                    roots.append((r, rp))
-
-        for root_rel, real_root in roots:
-            for entry in prof.get("protected", []):
-                e_root, sub, _, placeholder = entry[0], entry[1], entry[2], entry[3]
-                if e_root == root_rel or (p_name == "codex" and e_root == ".codex"):
-                    if placeholder is None:
-                        p = os.path.join(real_root, sub)
-                        if not os.path.lexists(p):
-                            targets.append(p)
-
-    return list(dict.fromkeys(targets))
-
-
-@dataclass
-class _SensitiveFileSnapshot:
-    paths: List[str]
-    initial_inodes: Dict[str, Optional[Tuple[int, int]]]
-    start_time: float
-    readonly: bool = False
-
-
-def _create_sensitive_snapshot(
-    paths: Sequence[str],
-    readonly: bool = False,
-) -> _SensitiveFileSnapshot:
-    initial_inodes: Dict[str, Optional[Tuple[int, int]]] = {}
-    for p in paths:
-        if os.path.lexists(p):
-            try:
-                st = os.lstat(p)
-                initial_inodes[p] = (st.st_dev, st.st_ino)
-            except OSError:
-                initial_inodes[p] = None
-        else:
-            initial_inodes[p] = None
-    return _SensitiveFileSnapshot(
-        paths=list(paths),
-        initial_inodes=initial_inodes,
-        start_time=time.time(),
-        readonly=readonly,
-    )
-
-
 def _robust_force_remove_inode_tracked(
     path: str,
     expected_dev_ino: Optional[Tuple[int, int]] = None,
@@ -3773,100 +3604,6 @@ def _robust_force_remove_inode_tracked(
 def _robust_force_remove(path: str) -> None:
     """Recursively removes a file or directory, adjusting read-only permissions if needed."""
     _robust_force_remove_inode_tracked(path, None)
-
-
-def _cleanup_uncreated_sensitive_files(
-    target: Union[Sequence[str], _SensitiveFileSnapshot],
-) -> None:
-    """
-    Removes sensitive files that were created during sandbox execution.
-    Guards against deleting files that existed before sandbox execution, files created
-    by concurrent host sessions in readonly tasks, or inodes replaced after creation.
-    """
-    if isinstance(target, _SensitiveFileSnapshot):
-        snapshot = target
-    else:
-        snapshot = _create_sensitive_snapshot(target, readonly=False)
-
-    # In readonly mode with whole-root ro-bind, Bubblewrap mounted the state root read-only,
-    # so the sandboxed process could never create or write to any sensitive provider file.
-    # Any sensitive path present on host was created by an external/concurrent host session;
-    # never delete in readonly mode.
-    if snapshot.readonly:
-        return
-
-    for p in snapshot.paths:
-        # Pre-existing paths must NEVER be deleted
-        if snapshot.initial_inodes.get(p) is not None:
-            continue
-
-        if not os.path.lexists(p):
-            continue
-
-        try:
-            st = os.lstat(p)
-        except OSError:
-            continue
-
-        # Files created before the sandbox started must not be deleted
-        if snapshot.start_time > 0 and st.st_ctime < snapshot.start_time - 1.0:
-            continue
-
-        expected_dev_ino = (st.st_dev, st.st_ino)
-        try:
-            _robust_force_remove_inode_tracked(p, expected_dev_ino)
-        except OSError:
-            pass
-
-
-@contextmanager
-def sandbox_lifecycle(
-    is_provider: bool = False,
-    provider_name: Optional[str] = None,
-    cmd: Optional[List[str]] = None,
-    readonly: bool = False,
-):
-    """
-    Manages safe provider sandbox lifecycle.
-    Tracks uncreated sensitive provider files before execution and ensures any that
-    are created during execution are cleanly removed on completion.
-    Guards against concurrent host file deletion and abnormal signal termination.
-    """
-    tracked = _collect_uncreated_sensitive_files(
-        is_provider=is_provider,
-        provider_name=provider_name,
-        cmd=cmd,
-        readonly=readonly,
-    )
-    snapshot = _create_sensitive_snapshot(tracked, readonly=readonly)
-
-    sig_handlers: Dict[int, Any] = {}
-    sig_fired: List[int] = []
-
-    def _sig_handler(signum: int, frame: Any) -> None:
-        sig_fired.append(signum)
-        raise KeyboardInterrupt(f"Sandbox terminated by signal {signum}")
-
-    if threading.current_thread() is threading.main_thread():
-        signals_to_catch = [sig for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)) if sig is not None]
-        for sig in signals_to_catch:
-            try:
-                sig_handlers[sig] = signal.signal(sig, _sig_handler)
-            except (ValueError, OSError):
-                pass
-
-    try:
-        yield tracked
-    finally:
-        try:
-            _cleanup_uncreated_sensitive_files(snapshot)
-        finally:
-            if threading.current_thread() is threading.main_thread():
-                for sig, old_h in sig_handlers.items():
-                    try:
-                        signal.signal(sig, old_h)
-                    except (ValueError, OSError):
-                        pass
 
 
 from makewand.shared_capacity import controlled_tool

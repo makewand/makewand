@@ -11,54 +11,21 @@ import time
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from makewand import __version__
-from makewand.command_contract import (
-    PYTHON_COMMANDS, ARCHIVED_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS,
-    WORKER_QUERY_COMMANDS, WORKER_STATIC_ARGS,
-)
-from makewand.config import (
-    c,
-    COLOR_BOLD,
-    COLOR_CYAN,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_RED,
-    COLOR_BLUE,
-    COLOR_PURPLE,
-    COLOR_RESET,
-    normalize_tier,
-    tier_to_go_mode,
-    API_ONLY_ENGINES,
-)
+from makewand.command_contract import ARCHIVED_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS, WORKER_QUERY_COMMANDS, WORKER_STATIC_ARGS
+from makewand.config import c, COLOR_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE, COLOR_PURPLE, COLOR_RESET, normalize_tier, API_ONLY_ENGINES
 from makewand.health import get_or_update_status
 from makewand.discovery import discover_available_models
-from makewand.execution_contract import (
-    EXIT_PASSED, EXIT_FAILED, EXIT_UNVERIFIED, EXIT_USAGE_ERROR, EXIT_APPLY_CONFLICT,
-)
+from makewand.execution_contract import EXIT_FAILED, EXIT_UNVERIFIED, EXIT_USAGE_ERROR
 
 # Query/help commands need no provider or orchestration imports. Keep these
 # public wrappers so integrations and existing patches retain their API.
-def run_pipeline(*args, **kwargs):
-    from makewand.orchestrator import run_pipeline as execute
-    return execute(*args, **kwargs)
-
-
 def run_review(*args, **kwargs):
     from makewand.orchestrator import run_review as execute
     return execute(*args, **kwargs)
 
 
-def review_saved_hybrid(*args, **kwargs):
-    from makewand.orchestrator import review_saved_hybrid as execute
-    return execute(*args, **kwargs)
-
-
-def run_race(*args, **kwargs):
-    from makewand.orchestrator import run_race as execute
-    return execute(*args, **kwargs)
-
-
 def select_optimal_engine_pair(*args, **kwargs):
-    from makewand.orchestrator import select_optimal_engine_pair as execute
+    from makewand.engine_selection import select_optimal_engine_pair as execute
     return execute(*args, **kwargs)
 
 
@@ -74,9 +41,8 @@ DIRECT_TASK_COMMANDS = frozenset({
 })
 
 
-TIMEOUT_DEFAULTS = {**dict.fromkeys(DIRECT_TASK_COMMANDS, 300),
-                    "run": 300, "review": 300, "race": 300, "ensemble": 900}
-PROMPT_COMMANDS = DIRECT_TASK_COMMANDS | {"run", "race", "plan"}
+TIMEOUT_DEFAULTS = {**dict.fromkeys(DIRECT_TASK_COMMANDS, 300), "review": 300}
+PROMPT_COMMANDS = DIRECT_TASK_COMMANDS
 
 
 def _resolve_direct_timeout(args):
@@ -95,10 +61,7 @@ def _command_wall_timeout(args):
     """Workflow budget, also used by the daemon and process observer."""
     if args.total_timeout is not None:
         return args.total_timeout
-    timeout = getattr(args, "timeout", None)
-    if args.subcommand == "run":
-        return max(900, timeout * 3)
-    return timeout
+    return getattr(args, "timeout", None)
 
 
 def _execute_direct_task(engine, execute, prompt, **kwargs):
@@ -531,7 +494,7 @@ def cmd_disable(args):
     if not set_provider_enabled(target, False):
         print(c(f"❌ 写入配置失败，未能禁用: {target}", COLOR_RED), file=sys.stderr)
         sys.exit(EXIT_FAILED)
-    print(c(f"✔ 已成功禁用 AI 工具: {target} (Makewand 调度流水线将不再向其派发任务)", COLOR_YELLOW + COLOR_BOLD))
+    print(c(f"✔ 已成功禁用 AI 工具: {target} (Makewand 将不再向其派发任务)", COLOR_YELLOW + COLOR_BOLD))
     if target == "local":
         if getattr(args, "manage_service", False):
             if _manage_ollama_service("stop"):
@@ -662,85 +625,6 @@ def cmd_repomap(args):
         else:
             print("未在当前工作区发现有效代码符号或工作区为空。")
 
-def cmd_plan(args):
-    """Decompose complex goals into DAG tasks and execute topologically."""
-    import json
-    from makewand.orchestrator import decompose_task_to_dag, execute_task_dag
-    cwd = getattr(args, "cwd", None) or os.getcwd()
-    prompt = getattr(args, "prompt", None) or _resolve_cli_prompt(args, required=True)
-    tier = getattr(args, "tier", "deep")
-    repo_trust = getattr(args, "repo_trust", "trusted")
-
-    dag = decompose_task_to_dag(prompt, cwd=cwd, tier=tier, local_only=getattr(args, "local_only", False))
-
-    if getattr(args, "json", False):
-        print(json.dumps(dag.to_dict(), indent=2, ensure_ascii=False))
-    else:
-        dag.render_terminal()
-
-    if getattr(args, "execute", False):
-        print(c("🚀 [Makewand DAG Engine] 正在拓扑推进执行流水线...", COLOR_BOLD + COLOR_GREEN))
-        ok, summary, stage_results = execute_task_dag(
-            dag,
-            cwd=cwd,
-            tier=tier,
-            effort=getattr(args, "effort", None),
-            repo_trust=repo_trust,
-            tiered=getattr(args, "tiered", False),
-            architect_engine=getattr(args, "architect", None),
-            worker_engine=getattr(args, "worker", None),
-            local_only=getattr(args, "local_only", False),
-        )
-        if not ok:
-            print(c(f"\n❌ [Makewand DAG Engine] 流水线执行未完全通过: {summary}", COLOR_BOLD + COLOR_RED))
-            code = _execution_exit_code()
-            sys.exit(code if code != EXIT_PASSED else EXIT_FAILED)
-        # execute_task_dag already printed what was applied to the workspace and what is pending.
-        sys.exit(EXIT_PASSED)
-
-def cmd_aci(args):
-    """LLM-dedicated Agent-Computer Interface commands (SWE-agent inspired)."""
-    from makewand.aci import view_window, search_code
-    cwd = getattr(args, "cwd", None) or os.getcwd()
-    if args.action == "view":
-        print(view_window(args.target, line_number=args.line, cwd=cwd))
-    elif args.action in ("search", "grep"):
-        print(search_code(args.target, cwd=cwd))
-
-def cmd_mcp(args):
-    """Model Context Protocol commands."""
-    import json
-    from makewand.mcp import MCPClient
-    cwd = getattr(args, "cwd", None) or os.getcwd()
-    client = MCPClient(args.server_cmd, cwd=cwd)
-    ok, msg = client.initialize()
-    if not ok:
-        print(c(f"❌ MCP 初始化失败: {msg}", COLOR_RED + COLOR_BOLD))
-        sys.exit(1)
-    try:
-        if args.action == "list":
-            tools = client.list_tools()
-            server_name = client.server_info.get("name", "unknown")
-            server_ver = client.server_info.get("version", "")
-            print(c(f"✔ 成功连接 MCP 服务端: {server_name} v{server_ver}", COLOR_GREEN + COLOR_BOLD))
-            print(f"发现可用工具 ({len(tools)} 个):\n")
-            for t in tools:
-                print(f"  • {c(t.get('name', ''), COLOR_BOLD + COLOR_CYAN)}: {t.get('description', '')}")
-        elif args.action == "call":
-            if not getattr(args, "tool", None):
-                print(c("❌ 请指定要调用的工具名称: --tool <name>", COLOR_RED))
-                sys.exit(1)
-            raw_args = {}
-            if getattr(args, "args", None):
-                try:
-                    raw_args = json.loads(args.args)
-                except Exception as e:
-                    print(c(f"❌ 参数 JSON 解析失败: {e}", COLOR_RED))
-                    sys.exit(1)
-            res = client.call_tool(args.tool, raw_args)
-            print(json.dumps(res, indent=2, ensure_ascii=False))
-    finally:
-        client.close()
 
 def cmd_sandbox(args):
     """Run command inside bubblewrap process sandbox."""
@@ -774,302 +658,6 @@ def cmd_sandbox(args):
         if ex:
             sys.stderr.write(f"Sandbox Error: {ex}\n")
         sys.exit(ret if ret > 0 else 1)
-
-def _obstacle_note(obstacles):
-    """Workspace entries apply cannot write (candidate.application_obstacles), for a listing."""
-    items = [f"{path} ({why})" for path, why in sorted(obstacles.items())]
-    return ", ".join(items[:6]) + (f" 等 {len(items)} 项" if len(items) > 6 else "")
-
-
-def _outcome_operations(race, kind):
-    """The inspect/apply/discard commands that work for this record as it is."""
-    from makewand.candidate import record_application_obstacles
-    r_id = race.get("race_id")
-    candidates = race.get("candidates", {})
-
-    def obstacles_of(label):
-        # Workspace entries that fail every apply of this candidate, also with --force.
-        return {} if race.get("applied_at") else record_application_obstacles(race, label)
-
-    if kind == "dag":
-        workspace = candidates.get("A", {}).get("path", "")
-        if (race.get("dag") or {}).get("blocked"):
-            return (f"makewand inspect {r_id} --candidate A | makewand discard {r_id} "
-                    f"(含符号链接/子模块条目，无法 apply；请从暂存区人工恢复: {workspace})")
-        obstacles = obstacles_of("A")
-        if obstacles:
-            return (f"makewand inspect {r_id} --candidate A | makewand discard {r_id} "
-                    f"(工作区中的 {_obstacle_note(obstacles)} 使 apply 无法交付，--force 也不例外；"
-                    f"请从暂存区人工恢复: {workspace})")
-        if candidates.get("A", {}).get("review_passed") is not True:
-            return (f"makewand inspect {r_id} --candidate A | 人工确认后: makewand apply {r_id} --candidate A --force"
-                    f" | makewand discard {r_id}")
-        return f"makewand inspect {r_id} --candidate A | makewand apply {r_id} --candidate A | makewand discard {r_id}"
-    merge = (f" | makewand apply {r_id} --merge"
-             if candidates.get("M", {}).get("review_passed") is True and not obstacles_of("M") else "")
-    blocked = {label: obstacles_of(label) for label in ("A", "B")}
-    notes = "".join(f" (工作区中的 {_obstacle_note(found)} 使 apply 选手 {label} 无法交付，--force 也不例外；"
-                    f"可从其候选工作区人工恢复: {candidates.get(label, {}).get('path', '')})"
-                    for label, found in blocked.items() if found)
-    if kind in ("judge", "winner_take_all"):
-        if blocked.get(race.get("winner")):
-            return f"makewand inspect {r_id}{merge} | makewand discard {r_id}{notes}"
-        return f"makewand inspect {r_id} | makewand apply {r_id}{merge} | makewand discard {r_id}"
-    usable = "|".join(label for label, found in blocked.items() if not found)
-    if not usable:
-        return f"makewand inspect {r_id} --candidate A|B{merge} | makewand discard {r_id}{notes}"
-    return (f"makewand inspect {r_id} --candidate A|B | 人工确认后: makewand apply {r_id} --candidate {usable} --force"
-            f"{merge} | makewand discard {r_id}{notes}")
-
-
-def cmd_candidates(args):
-    from makewand.candidate import CandidateManager, describe_race_outcome
-    races = CandidateManager.list_races()
-    if not races:
-        print("当前没有任何封存的候选工作区。通过 'makewand race <任务>' 发起竞速即可产生候选。")
-        return
-    print(c("\n============================================================", COLOR_BOLD))
-    print(c("             Makewand 竞速候选工作区列表", COLOR_BOLD + COLOR_CYAN))
-    print(c("============================================================\n", COLOR_BOLD))
-    for r in races:
-        r_id = r.get("race_id")
-        created = r.get("created_at", "")[:19]
-        prompt = r.get("prompt", "")
-        kind, label = describe_race_outcome(r)
-        color = COLOR_GREEN + COLOR_BOLD if kind in ("judge", "winner_take_all") else COLOR_YELLOW + COLOR_BOLD
-        print(f"• ID: {c(r_id, COLOR_YELLOW + COLOR_BOLD)}  时间: {created}")
-        print(f"  任务: {prompt}")
-        if kind == "dag":
-            print(f"  类型: {c(label, color)}")
-        else:
-            a_mod = r.get("candidates", {}).get("A", {}).get("model", "A")
-            b_mod = r.get("candidates", {}).get("B", {}).get("model", "B")
-            print(f"  对决: 选手 A ({a_mod}) vs 选手 B ({b_mod}) | {c(label, color)}")
-        print(f"  操作: {_outcome_operations(r, kind)}\n")
-
-def _inspect_dag(race, cand):
-    """A DAG record holds one cumulative result (A), not two contestants."""
-    cand_a = race.get("candidates", {}).get("A", {})
-    dag = race.get("dag") if isinstance(race.get("dag"), dict) else {}
-    if cand == "A":
-        print(c(f"--- DAG 累积结果 A ({cand_a.get('model')}) 改动详情 (git diff) ---", COLOR_CYAN + COLOR_BOLD))
-        diff = cand_a.get("diff", "")
-        print(diff if diff else "无有效代码变更")
-        return
-    if cand in ("B", "M"):
-        print(c(f"DAG 记录只有一个累积结果，请使用 'makewand inspect {race.get('race_id')} --candidate A' 查看。", COLOR_YELLOW))
-        return
-    if dag.get("subdirectory") not in (None, "."):
-        print(f"启动目录: {dag['subdirectory']} (子任务在仓库根目录的该子目录中执行，改动路径相对仓库根目录)")
-    labels = {"code": "代码子任务 (本地测试 + 独立审查)", "review": "只读审查", "explain": "只读解释", "identity": "只读问答"}
-    stages = dag.get("stages") or []
-    if stages:
-        print(c("--- DAG 子任务 ---", COLOR_BOLD))
-        for stage in stages:
-            print(f"  • {stage.get('task')}: {labels.get(stage.get('kind'), stage.get('kind') or '未知')}")
-        if dag.get("total") and len(stages) < dag["total"]:
-            print(f"  (共 {dag['total']} 个子任务，其余未执行或未通过)")
-    changes = cand_a.get("changes") or {}
-    print(f"累积改动: {len(changes)} 个文件, Diff大小={len(cand_a.get('diff', ''))} 字节")
-    for task_id, paths in (dag.get("discarded") or {}).items():
-        print(c(f"只读子任务 {task_id} 运行期间写入的文件已丢弃 (未交付): {', '.join(paths)}", COLOR_YELLOW))
-    if dag.get("blocked"):
-        print(c(f"无法 apply: 含符号链接/子模块条目 ({', '.join(dag['blocked'].get('paths') or [])})；"
-                f"请从暂存区人工恢复: {cand_a.get('path')}", COLOR_YELLOW))
-    elif not race.get("applied_at"):
-        from makewand.candidate import record_application_obstacles
-        obstacles = record_application_obstacles(race, "A")
-        if obstacles:
-            print(c(f"当前无法 apply: 工作区中的 {_obstacle_note(obstacles)} 使 makewand apply 无法交付 "
-                    f"(--force 也不例外)；请从暂存区人工恢复: {cand_a.get('path')}", COLOR_YELLOW))
-    print()
-    if race.get("judge_report"):
-        print(c("--- DAG 交付说明 ---", COLOR_BOLD))
-        print(race.get("judge_report").strip())
-    print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A' 查看完整累积代码差异。")
-
-
-def cmd_inspect(args):
-    from makewand.candidate import CandidateManager, describe_race_outcome
-    race = CandidateManager.get_race(args.race_id)
-    if not race:
-        print(c(f"未找到候选记录: {args.race_id or '最新'}", COLOR_RED))
-        sys.exit(EXIT_USAGE_ERROR)
-
-    print(c("\n============================================================", COLOR_BOLD))
-    print(c(f"         Makewand 候选方案详情 [{race.get('race_id')}]", COLOR_BOLD + COLOR_CYAN))
-    print(c("============================================================\n", COLOR_BOLD))
-    print(f"原始任务: {c(race.get('prompt', ''), COLOR_BOLD)}")
-    print(f"工作目录: {race.get('base_cwd')}")
-    print(f"创建时间: {race.get('created_at', '')[:19]}")
-    kind, label = describe_race_outcome(race)
-    color = COLOR_GREEN + COLOR_BOLD if kind in ("judge", "winner_take_all") else COLOR_YELLOW + COLOR_BOLD
-    print(f"结果类型: {c(label, color)}" if kind == "dag" else c(label, color))
-    print()
-
-    cand = (args.candidate.upper() if args.candidate else None)
-    if kind == "dag":
-        _inspect_dag(race, cand)
-        return
-    cand_a = race.get("candidates", {}).get("A", {})
-    cand_b = race.get("candidates", {}).get("B", {})
-    cand_m = race.get("candidates", {}).get("M", {})
-
-    if cand == "A":
-        pars_a = cand_a.get("parsimony", {})
-        if pars_a:
-            print(c(f"--- 选手 A ({cand_a.get('model')}) 补丁精简度: {pars_a.get('summary', '')} ---", COLOR_CYAN + COLOR_BOLD))
-        print(c(f"--- 选手 A ({cand_a.get('model')}) 改动详情 (git diff) ---", COLOR_CYAN + COLOR_BOLD))
-        diff = cand_a.get("diff", "")
-        print(diff if diff else "无有效代码变更")
-    elif cand == "B":
-        pars_b = cand_b.get("parsimony", {})
-        if pars_b:
-            print(c(f"--- 选手 B ({cand_b.get('model')}) 补丁精简度: {pars_b.get('summary', '')} ---", COLOR_BLUE + COLOR_BOLD))
-        print(c(f"--- 选手 B ({cand_b.get('model')}) 改动详情 (git diff) ---", COLOR_BLUE + COLOR_BOLD))
-        diff = cand_b.get("diff", "")
-        print(diff if diff else "无有效代码变更")
-    elif cand == "M":
-        if not cand_m:
-            print(c("尚未生成混合候选。请显式运行 makewand merge " + race.get("race_id", "") + " 创建候选后检查。", COLOR_YELLOW))
-            return
-        pars_m = cand_m.get("parsimony", {})
-        if pars_m:
-            print(c(f"--- 混合方案 M ({cand_m.get('model')}) 补丁精简度: {pars_m.get('summary', '')} ---", COLOR_GREEN + COLOR_BOLD))
-        print(c(f"--- 混合方案 M ({cand_m.get('model')}) 改动详情 (git diff) ---", COLOR_GREEN + COLOR_BOLD))
-        diff = cand_m.get("diff", "")
-        print(diff if diff else "无有效代码变更")
-    else:
-        print(c("--- 参赛方案表现对比 ---", COLOR_BOLD))
-        pars_a = cand_a.get("parsimony", {})
-        pars_b = cand_b.get("parsimony", {})
-        pars_info_a = f", 精简度={pars_a.get('parsimony_ratio', 1.0):.2f}" if pars_a else ""
-        pars_info_b = f", 精简度={pars_b.get('parsimony_ratio', 1.0):.2f}" if pars_b else ""
-        print(f"选手 A [{cand_a.get('model')}]: 耗时={cand_a.get('duration')}s, Diff大小={len(cand_a.get('diff', ''))} 字节{pars_info_a}, 状态={'成功' if cand_a.get('success') else '失败'}")
-        print(f"选手 B [{cand_b.get('model')}]: 耗时={cand_b.get('duration')}s, Diff大小={len(cand_b.get('diff', ''))} 字节{pars_info_b}, 状态={'成功' if cand_b.get('success') else '失败'}")
-        if cand_m:
-            pars_m = cand_m.get("parsimony", {})
-            pars_info_m = f", 精简度={pars_m.get('parsimony_ratio', 1.0):.2f}" if pars_m else ""
-            print(f"混合 M [{cand_m.get('model')}]: 3-Way 语义合成, 单测={'✔ 通过' if cand_m.get('test_passed') else '❌ 失败'}, Diff大小={len(cand_m.get('diff', ''))} 字节{pars_info_m}")
-        print()
-        if race.get("judge_report"):
-            print(c("--- 裁判裁决报告 ---", COLOR_BOLD))
-            print(race.get("judge_report").strip())
-        print(f"\n提示: 使用 'makewand inspect {race.get('race_id')} --candidate A|B|M' 查看完整代码差异。")
-
-def cmd_apply(args):
-    from makewand.candidate import CandidateManager
-    result = CandidateManager.apply_candidate(
-        race_id=args.race_id,
-        candidate_label=args.candidate,
-        dry_run=args.dry_run,
-        force=args.force,
-        merge=getattr(args, "merge", False),
-        **({"protected_paths": args.protected_paths} if getattr(args, "protected_paths", None) is not None else {})
-    )
-    ok, files, msg = result
-    if not ok:
-        print(c(f"❌ {msg}", COLOR_RED + COLOR_BOLD))
-        # apply's typed outcome (ApplyResult.status), never words of its message: the
-        # exit status is the one the execution contract gives that status (APPLY_CONFLICT
-        # 14, UNVERIFIED 11, TIMEOUT 16, UNKNOWN 17, FAILED 10), recorded as the typed result.
-        from makewand.execution_contract import ExecutionResult, STATUS_CODES
-        from makewand.execution_runtime import task_id
-        from makewand.workflow import remember_result
-        status = getattr(result, "status", None)
-        if status not in STATUS_CODES or status == "PASSED":
-            status = "FAILED"
-        remember_result(ExecutionResult(False, None, str(msg).replace("\0", "\\0"), status=status,
-            task_id=task_id(), stage="apply", engine="candidate"))
-        sys.exit(STATUS_CODES[status])
-
-    print(c(f"✔ {msg}", COLOR_GREEN + COLOR_BOLD))
-    if files:
-        for f in files:
-            print(f"  • {f}")
-    sys.exit(EXIT_PASSED)
-
-def cmd_discard(args):
-    from makewand.candidate import CandidateManager
-    ok, msg = CandidateManager.discard_race(race_id=args.race_id, all_races=args.all)
-    if ok:
-        print(c(f"✔ {msg}", COLOR_GREEN))
-    else:
-        print(c(f"❌ {msg}", COLOR_RED))
-
-def cmd_daemon(args):
-    from makewand.daemon import start_daemon, stop_daemon, daemon_status_cmd
-    action = args.action
-    if action == "start":
-        sys.exit(start_daemon(foreground=getattr(args, "foreground", False)))
-    elif action == "stop":
-        sys.exit(stop_daemon())
-    elif action == "restart":
-        stop_daemon()
-        sys.exit(start_daemon(foreground=getattr(args, "foreground", False)))
-    elif action == "status":
-        sys.exit(daemon_status_cmd())
-
-def cmd_sessions(args):
-    from makewand.collision import get_all_active_sessions_report
-    rep = get_all_active_sessions_report()
-    if getattr(args, "json", False):
-        import json
-        print(json.dumps(rep, ensure_ascii=False, indent=2))
-        return
-
-    print(c("\n============================================================", COLOR_BOLD))
-    print(c("       Makewand 跨会话活跃拓扑与工作树占用看板", COLOR_BOLD + COLOR_CYAN))
-    print(c("============================================================\n", COLOR_BOLD))
-    print(f"• 活跃 AI 进程数: {c(str(rep['total_active_sessions']), COLOR_GREEN + COLOR_BOLD)}")
-    print(f"• 活跃 Tmux 窗格数: {rep['total_tmux_panes']}\n")
-
-    by_repo = rep.get("sessions_by_repo", {})
-    if not by_repo:
-        print(c("✔ 当前主机无外部并发 AI 编码会话运行，工作树状态纯净。", COLOR_GREEN))
-        return
-
-    for repo, procs in by_repo.items():
-        print(c(f"📁 仓库/目录: {repo}", COLOR_BOLD + COLOR_YELLOW))
-        for p in procs:
-            tty = p.get("tty", "?")
-            comm = p.get("comm", "")
-            ai_type = p.get("ai_type", "")
-            pid = p.get("pid")
-            etime = p.get("etime", "")
-            cwd = p.get("cwd", "")
-            print(f"  • PID {c(str(pid), COLOR_CYAN)} [{c(ai_type.upper(), COLOR_GREEN)} - {comm}] 终端: {tty} 耗时: {etime}")
-            print(f"    工作目录: {cwd}")
-        print()
-
-
-def cmd_ensemble(args):
-    prompt = _resolve_cli_prompt(args)
-    if not prompt:
-        print(c("❌ 缺少任务提示词。请通过参数指定、管道输入或通过 -f / --prompt-file 提供。", COLOR_RED), file=sys.stderr)
-        sys.exit(EXIT_USAGE_ERROR)
-    from makewand.ensemble import run_ensemble
-    result = run_ensemble(
-        prompt=prompt,
-        providers=getattr(args, "providers", "all"),
-        cwd=args.cwd,
-        timeout=getattr(args, "timeout", 900),
-        tier=getattr(args, "tier", "deep"),
-        effort=getattr(args, "effort", "high") or "high",
-        output_dir=getattr(args, "output_dir", None),
-        prefix=getattr(args, "prefix", "review"),
-        matrix=getattr(args, "matrix", True),
-        stream=getattr(args, "stream", False),
-        local_only=getattr(args, "local_only", False),
-        repo_trust=getattr(args, "repo_trust", "trusted"),
-    )
-    if getattr(args, "json", False):
-        import json
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        if result.get("summary_matrix") and not getattr(args, "output_dir", None):
-            print("\n" + result["summary_matrix"])
-    sys.exit(0 if result.get("ok") else EXIT_FAILED)
 
 
 def cmd_clean(args):
@@ -1148,43 +736,6 @@ def cmd_clean(args):
 
     print(c(f"🧹 Makewand 临时文件清理完成: 已回收 {removed_count} 个临时目录/文件 (释放约 {freed_bytes / 1024:.1f} KB)。", COLOR_GREEN))
     sys.exit(0)
-
-
-def _normalize_version(text: str) -> str:
-    return text.strip().lstrip("vV")
-
-
-def read_go_binary_version(bin_path: str, timeout: float = 5.0) -> Optional[str]:
-    """Returns the version a Go makewand binary reports via --version (cobra format)."""
-    import re as _re
-    import subprocess
-    try:
-        res = subprocess.run([bin_path, "--version"], capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    match = _re.search(r"\bversion\s+(\S+)", f"{res.stdout}\n{res.stderr}")
-    return match.group(1) if match else None
-
-
-def check_go_python_version(bin_path: str) -> Optional[str]:
-    """
-    Compares the Go component's version with this Python engine's version.
-    Returns a warning string on mismatch/unknown, None when they agree.
-    Set MAKEWAND_SKIP_VERSION_CHECK=1 to skip.
-    """
-    if os.environ.get("MAKEWAND_SKIP_VERSION_CHECK") == "1":
-        return None
-    go_version = read_go_binary_version(bin_path)
-    if go_version is None:
-        return (f"⚠ 无法读取 Go 组件版本 ({bin_path} --version)，无法确认其与 Python 引擎 {__version__} 一致；"
-                "建议重新运行 scripts/install.sh")
-    if _normalize_version(go_version).startswith("dev"):
-        return (f"⚠ Go 组件 {bin_path} 为未标记版本的开发构建 ({go_version})，无法确认与 Python 引擎 {__version__} 一致；"
-                "发行安装请运行 scripts/install.sh")
-    if _normalize_version(go_version) != _normalize_version(__version__):
-        return (f"⚠ 版本不一致：Go 组件 {go_version} ({bin_path}) ≠ Python 引擎 {__version__}；"
-                "两套引擎可能行为不一致，请重新运行 scripts/install.sh 以同步")
-    return None
 
 
 def _find_go_binary() -> Optional[str]:
@@ -1281,8 +832,6 @@ def _archived_command(argv: List[str]) -> Optional[str]:
 
 # Set by makewand in the environment of every provider CLI it launches.
 from makewand.sandbox import PROVIDER_WORKER_ENV  # noqa: E402
-# Complete audited paths, shared with Go through command_contract.json.
-WORKER_SAFE_SUBCOMMANDS = frozenset(path for path, rule in WORKER_QUERY_COMMANDS.items() if rule["engine"] == "python")
 
 
 def _worker_query_matches(argv: List[str], path: str, rule: Dict[str, Any]) -> bool:
@@ -1368,41 +917,28 @@ def _main():
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")
     common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=None, help="Read task prompt from file")
     common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default="trusted", help="Repository trust level: trusted or untrusted")
-    common_parser.add_argument("--daemon", action="store_true", default=False, help="Dispatch command via resident daemon using an isolated task worker")
-    common_parser.add_argument("--no-daemon", action="store_true", default=False, help="Bypass resident daemon and run standalone")
-    common_parser.add_argument("--allow-collision", action="store_true", default=False, help="Bypass cross-session collision warning and force execution")
     common_parser.add_argument("--max-model-calls", type=int, default=None, help="Maximum attempted Makewand model tasks, including retries and reviewers")
     common_parser.add_argument("--request-id", default=None, help="Stable user-request ID shared by every CLI call; defaults to a total cap of 3")
     common_parser.add_argument("--caller", choices=["claude", "codex", "agy", "grok", "muse", "human", "automation"], default=None, help="Tool initiating this user request (metadata only)")
     common_parser.add_argument("--call-budget-file", default=None, help="Shared admission ledger for model task budgets")
-    common_parser.add_argument("--protect", dest="global_protected_paths", action="append", default=None, metavar="PATH", help="Preserve a task-relative file; repeat for multiple files")
     common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=None, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     sub_common_parser = argparse.ArgumentParser(add_help=False)
     sub_common_parser.add_argument("-C", "--cwd", dest="cwd", default=argparse.SUPPRESS, help="Target working directory (default: current directory)")
     sub_common_parser.add_argument("-f", "-F", "--file", "--prompt-file", dest="prompt_file", default=argparse.SUPPRESS, help="Read task prompt from file")
     sub_common_parser.add_argument("--repo-trust", choices=["trusted", "untrusted"], default=argparse.SUPPRESS, help="Repository trust level: trusted or untrusted")
-    sub_common_parser.add_argument("--daemon", action="store_true", default=argparse.SUPPRESS, help="Dispatch command via resident daemon using an isolated task worker")
-    sub_common_parser.add_argument("--no-daemon", action="store_true", default=argparse.SUPPRESS, help="Bypass resident daemon and run standalone")
-    sub_common_parser.add_argument("--allow-collision", action="store_true", default=argparse.SUPPRESS, help="Bypass cross-session collision warning and force execution")
     sub_common_parser.add_argument("--max-model-calls", type=int, default=argparse.SUPPRESS, help="Maximum attempted Makewand model tasks")
     sub_common_parser.add_argument("--request-id", default=argparse.SUPPRESS, help="Stable shared user-request ID")
     sub_common_parser.add_argument("--caller", choices=["claude", "codex", "agy", "grok", "muse", "human", "automation"], default=argparse.SUPPRESS, help="Initiating tool (metadata only)")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
-    sub_common_parser.add_argument("--protect", dest="protected_paths", action="append", default=None, metavar="PATH", help="Preserve file content and permissions; repeat for multiple files")
     sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
 
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
-        options.add_argument("--workflow", choices=["auto", "single", "pipeline", "race"],
-                             default="auto" if default is None else default,
-                             help="Verification workflow; single reviews with the coding engine itself in a separate read-only call, not an independent review")
         options.add_argument("--risk", choices=["auto", "low", "high"],
                              default="auto" if default is None else default,
                              help="Unknown risk requires cross-provider review; high cannot use single")
         options.add_argument("--total-timeout", type=float, default=default,
                              help="Shared wall-clock deadline for every task stage, in seconds")
-        options.add_argument("--judge-reserve-seconds", type=float, default=default,
-                             help="Race time reserved for judging; default is 25%%, capped at 60 seconds")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -1432,49 +968,12 @@ def _main():
     p_quota.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # run
-    p_run = subparsers.add_parser("run", help="Run auto-adaptive multi-model pipeline with auto-fix loop", parents=[sub_common_parser])
-    p_run.add_argument("prompt", nargs="?", default=None, help="The task prompt to execute")
-    p_run.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="auto", help="Execution tier: fast, standard (balanced), deep (power)")
-    p_run.add_argument("--mode", dest="tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], help="Alias for --tier: fast, balanced, power")
-    p_run.add_argument("--model", help="Explicit model override")
-    p_run.add_argument("--no-auto-fix", dest="auto_fix", action="store_false", default=True, help="Disable review defect auto-fix loop")
-    p_run.add_argument("--max-fix", type=int, default=2, help="Maximum auto-fix iterations (default: 2)")
-    p_run.add_argument("--stream", action="store_true", default=False, help="Stream subprocess output line-by-line")
-    p_run.add_argument("--boost", action="store_true", default=False, help="Force boost/overclock mode: bypass soft burn rate penalty and allocate highest reasoning power")
-    p_run.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: use local self-hosted models for both coding and review")
-    p_run.add_argument("--provider", dest="provider", default=None, help="Explicit primary provider override (e.g. deepseek, qwen, local, claude, codex, agy, grok, muse)")
-    p_run.add_argument("--timeout", type=int, default=None, help="Per-stage timeout in seconds (default: --total-timeout, otherwise 300)")
-
     # review
     p_rev = subparsers.add_parser("review", help="Review current git diff using Codex / Antigravity", parents=[sub_common_parser])
-    p_rev.add_argument("--race-id", help="Review and approve the exact sealed hybrid of this saved race")
-    p_rev.add_argument("--candidate", choices=["M"], default=None, help="Saved candidate to review (requires --race-id)")
     p_rev.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
     p_rev.add_argument("--stream", action="store_true", default=False, help="Stream review output line-by-line")
     p_rev.add_argument("--timeout", type=int, default=None)
     p_rev.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Strict local-only / 100%% offline mode: review diff using only local self-hosted model")
-
-    p_merge = subparsers.add_parser("merge", help="Synthesize and test a saved hybrid candidate", parents=[sub_common_parser])
-    p_merge.add_argument("race_id", nargs="?", default=None)
-
-    # race
-    p_race = subparsers.add_parser("race", help="Run prompt on two models in parallel worktrees and compare", parents=[sub_common_parser])
-    p_race.add_argument("prompt", nargs="?", default=None, help="Prompt for race comparison")
-    p_race.add_argument("--timeout", type=int, default=None)
-    p_race.add_argument("--hybrid", action="store_true", help="Also synthesize a sealed hybrid candidate; requires separate review before apply")
-
-    # ensemble (multi-model brain trust panel review)
-    p_ens = subparsers.add_parser("ensemble", help="Run multi-model brain trust panel review concurrently and synthesize verdicts", parents=[sub_common_parser])
-    p_ens.add_argument("prompt", nargs="?", default=None, help="Prompt or task description to review")
-    p_ens.add_argument("--providers", default="all", help="Comma-separated providers (e.g. claude,codex,muse,grok,agy or 'all')")
-    p_ens.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="deep", help="Model tier (default: deep)")
-    p_ens.add_argument("--output-dir", default=None, help="Directory to save individual markdown review files")
-    p_ens.add_argument("--prefix", default="review", help="Filename prefix for output review files (default: review)")
-    p_ens.add_argument("--no-matrix", dest="matrix", action="store_false", default=True, help="Disable generation of comparison synthesis matrix")
-    p_ens.add_argument("--json", action="store_true", default=False, help="Output structured review verdicts in JSON format")
-    p_ens.add_argument("--stream", action="store_true", default=False, help="Stream review outputs")
-    p_ens.add_argument("--timeout", type=int, default=None, help="Per-model timeout in seconds (default: --total-timeout, otherwise 900)")
-    p_ens.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False, help="Run only local/offline models")
 
     # search (budgeted search guardrail)
     p_search = subparsers.add_parser("search", help="Budgeted fast search excluding cold archives and databases", parents=[sub_common_parser])
@@ -1487,30 +986,6 @@ def _main():
     p_repomap.add_argument("--max-lines", type=int, default=80, help="Max lines of repo map output (default: 80)")
     p_repomap.add_argument("--max-files", type=int, default=40, help="Max files to include in repo map (default: 40)")
     p_repomap.add_argument("--json", action="store_true", help="Output repo map in JSON format")
-
-    # plan (multi-agent DAG task decomposition pipeline, inspired by OmO Ultrawork)
-    p_plan = subparsers.add_parser("plan", help="Decompose complex goals into DAG tasks and execute topologically", parents=[sub_common_parser])
-    p_plan.add_argument("prompt", nargs="?", default=None, help="High-level engineering goal to decompose")
-    p_plan.add_argument("--tier", choices=["auto", "fast", "standard", "deep", "balanced", "power"], default="deep")
-    p_plan.add_argument("--execute", action="store_true", default=False, help="Execute decomposed DAG tasks topologically with verification gates")
-    p_plan.add_argument("--json", action="store_true", default=False, help="Output plan in JSON format")
-    p_plan.add_argument("--local-only", "--offline", dest="local_only", action="store_true", default=False)
-    p_plan.add_argument("--tiered", action="store_true", default=False, help="Enable Architect-Worker tiered dispatch (Architect for design/audit, Worker for implementation)")
-    p_plan.add_argument("--architect", default=None, help="Engine for Architect role (e.g. claude, codex, agy)")
-    p_plan.add_argument("--worker", default=None, help="Engine for Worker role (e.g. local, deepseek, qwen)")
-
-    # aci (LLM-dedicated Agent-Computer Interface, inspired by SWE-agent)
-    p_aci = subparsers.add_parser("aci", help="LLM-dedicated Agent-Computer Interface (SWE-agent inspired)", parents=[sub_common_parser])
-    p_aci.add_argument("action", choices=["view", "search", "grep"], help="ACI action to perform")
-    p_aci.add_argument("target", help="Filepath for view, or search term for search/grep")
-    p_aci.add_argument("line", nargs="?", type=int, default=1, help="Line number for view window (default: 1)")
-
-    # mcp (Model Context Protocol client integration, inspired by Claude Code)
-    p_mcp = subparsers.add_parser("mcp", help="Model Context Protocol (MCP) server integration", parents=[sub_common_parser])
-    p_mcp.add_argument("action", choices=["list", "call"], help="MCP action: list tools, or call a tool")
-    p_mcp.add_argument("--tool", help="Tool name for call action")
-    p_mcp.add_argument("--args", help="JSON string arguments for tool call")
-    p_mcp.add_argument("server_cmd", nargs="+", help="Command to launch MCP server (e.g. npx -y @modelcontextprotocol/server-...)")
 
     # sandbox (bubblewrap process isolation)
     p_sb = subparsers.add_parser("sandbox", help="Run shell command inside bubblewrap process sandbox", parents=[sub_common_parser])
@@ -1586,32 +1061,8 @@ def _main():
                            help="Comma-separated PIDs from the --clean-hung candidate list to SIGTERM (explicit confirmation)")
 
     # Candidate Lifecycle Subcommands
-    subparsers.add_parser("candidates", help="List all pending multi-model race candidate workspaces", parents=[sub_common_parser])
-
-    p_inspect = subparsers.add_parser("inspect", help="Inspect race candidate diffs and referee verdicts", parents=[sub_common_parser])
-    p_inspect.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
-    p_inspect.add_argument("--candidate", choices=["A", "B", "M", "a", "b", "m"], default=None, help="Inspect specific candidate (A, B, or M)")
-
-    p_apply = subparsers.add_parser("apply", help="Safely apply a race candidate solution to current workspace with conflict checks", parents=[sub_common_parser])
-    p_apply.add_argument("race_id", nargs="?", default=None, help="Race ID (defaults to latest)")
-    p_apply.add_argument("--candidate", choices=["A", "B", "M", "a", "b", "m"], default=None, help="Candidate to apply (A, B, or M, defaults to winner)")
-    p_apply.add_argument("--merge", "--hybrid", dest="merge", action="store_true", default=False, help="Synthesize and apply 3-way AST & patch hybrid merged solution")
-    p_apply.add_argument("--dry-run", action="store_true", default=False, help="Simulate apply and show changed files without touching disk")
-    p_apply.add_argument("--force", action="store_true", default=False, help="Force overwrite even if local workspace has conflicts")
-
-    p_discard = subparsers.add_parser("discard", help="Discard saved race candidate workspaces", parents=[sub_common_parser])
-    p_discard.add_argument("race_id", nargs="?", default=None, help="Race ID to discard (defaults to latest)")
-    p_discard.add_argument("--all", action="store_true", default=False, help="Discard all candidate workspaces")
-
     # daemon (Resident Daemon / IPC Socket Fast-Path)
-    p_daemon = subparsers.add_parser("daemon", help="Manage resident daemon for IPC socket execution (no <15ms latency guarantee)", parents=[sub_common_parser])
-    p_daemon.add_argument("action", choices=["start", "stop", "restart", "status"], help="Daemon lifecycle action")
-    p_daemon.add_argument("--foreground", action="store_true", default=False, help="Run daemon in foreground (debug mode)")
-
     # sessions (Host-wide AI session observer and worktree collision detector)
-    p_sessions = subparsers.add_parser("sessions", help="Show active AI sessions across tmux/terminals and worktree allocation map", parents=[sub_common_parser])
-    p_sessions.add_argument("--json", action="store_true", default=False, help="Output sessions report in JSON format")
-
     # clean (cleanup stale /tmp restore, drill, and temporary artifact directories)
     p_clean = subparsers.add_parser("clean", help="Clean up stale /tmp restore, drill, and temporary artifact directories", parents=[sub_common_parser])
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
@@ -1711,58 +1162,8 @@ def _main():
         p_det = subparsers.add_parser(detect_only, help=f"{detect_only}: detected only, no execution adapter yet", parents=[sub_common_parser])
         p_det.add_argument("prompt", nargs="*", help=argparse.SUPPRESS)
 
-    known_subcommands = PYTHON_COMMANDS | {"route", "mark", "outcome"}
-    # Auto-route to `makewand run ...` if user invokes `makewand "prompt"`, `makewand -C /dir -f task.txt`, or pipes stdin
-    is_auto_routed_run = False
-    try:
-        # Only the options in front of the subcommand are global: parsing the
-        # whole argv here would consume a subcommand's own options as
-        # abbreviations of global ones (mark --reason -> --reasoning-effort).
-        argv_tail = list(sys.argv[1:])
-        # option string -> whether it takes a value, for the shared global options
-        _global_flags = {opt: action.nargs != 0
-                         for action in common_parser._actions for opt in action.option_strings}
-        _sub_at = None
-        _i = 0
-        while _i < len(argv_tail):
-            _tok = argv_tail[_i]
-            if _tok == "--":
-                break
-            if _tok.startswith("-") and _tok != "-":
-                _name = _tok.split("=", 1)[0]
-                if _name not in _global_flags:
-                    # A run option in front of the prompt (makewand --provider agy "fix"):
-                    # its value may look like a subcommand, so keep the whole-argv parse.
-                    break
-                _i += 2 if _global_flags[_name] and "=" not in _tok else 1
-                continue
-            # Only the first positional can be the subcommand, as in argparse.
-            # Anything else starts a prompt, and later tokens are its options
-            # (makewand "fix it" --provider agy must not stop at "agy").
-            if _tok in known_subcommands:
-                _sub_at = _i
-            break
-        if _sub_at is not None:
-            common_opts, _ignored = common_parser.parse_known_args(argv_tail[:_sub_at])
-            remaining = argv_tail[_sub_at:]
-        else:
-            common_opts, remaining = common_parser.parse_known_args(argv_tail)
-    except Exception:
-        common_opts, remaining = None, []
-
-    first_remaining = remaining[0] if remaining else None
-    has_subcmd = first_remaining in known_subcommands
-    is_help_or_version = any(arg in ("-h", "--help", "-v", "--version") for arg in sys.argv[1:])
-
-    if not has_subcmd and not is_help_or_version:
-        has_prompt_arg = bool(remaining)
-        has_file_flag = bool(getattr(common_opts, "prompt_file", None))
-        has_piped_stdin = not sys.stdin.isatty()
-
-        if has_prompt_arg or has_file_flag or has_piped_stdin:
-            sys.argv.insert(1, "run")
-            is_auto_routed_run = True
-
+    # A bare word used to start the pipeline. Anything that is not a command is
+    # now refused, so a mistyped command can never become a prompt for a model.
     args = parser.parse_args()
     try:
         _resolve_direct_timeout(args)
@@ -1786,34 +1187,13 @@ def _main():
     # be established before any provider can be started.
     from makewand.config import load_user_config
     load_user_config()
-    declared_protection = (getattr(args, "global_protected_paths", None) or []) + (getattr(args, "protected_paths", None) or [])
-    args.protected_paths = declared_protection or None
-    if args.protected_paths and args.subcommand not in ("run", "race", "apply"):
-        parser.error("--protect requires run, race or apply")
-    from makewand.workflow import choose_workflow, judge_reserve
+    from makewand.workflow import choose_workflow
     try:
-        selected = choose_workflow("race" if args.subcommand == "race" else args.workflow, args.risk)
+        selected = choose_workflow("auto", args.risk)
         if hasattr(args, "timeout") and args.timeout <= 0:
             raise ValueError("--timeout must be positive")
-        if args.subcommand == "race" and args.workflow not in ("auto", "race"):
-            raise ValueError("race command cannot use a different --workflow")
-        if args.workflow != "auto" and args.subcommand not in ("run", "race"):
-            raise ValueError("--workflow applies to run and race commands")
-        if selected.workflow == "race" and args.subcommand == "run":
-            if getattr(args, "local_only", False):
-                raise ValueError("race requires distinct providers and cannot use --local-only")
-            if getattr(args, "model", None) is not None or getattr(args, "stream", False):
-                raise ValueError("race does not accept a shared --model or --stream override")
-        if args.total_timeout is not None:
-            judge_reserve(args.total_timeout, 0)
-        if args.judge_reserve_seconds is not None:
-            if selected.workflow != "race" or args.subcommand not in ("run", "race"):
-                raise ValueError("--judge-reserve-seconds requires a race workflow")
-            judge_reserve(args.total_timeout if args.total_timeout is not None else getattr(args, "timeout", 300), args.judge_reserve_seconds)
     except ValueError as error:
         parser.error(str(error))
-    if args.subcommand == "review" and args.candidate and not args.race_id:
-        parser.error("review --candidate requires --race-id")
     if hasattr(args, "tier") and args.tier:
         args.tier = normalize_tier(args.tier)
 
@@ -1835,7 +1215,7 @@ def _main():
             if args.caller not in CALLERS:
                 raise ValueError("invalid MAKEWAND_CALLER")
             os.environ["MAKEWAND_CALLER"] = args.caller
-        dispatch_subcommands = PROMPT_COMMANDS | {"review", "ensemble", "chat", None}
+        dispatch_subcommands = PROMPT_COMMANDS | {"review", None}
         if (explicit_request or (request_id is not None and args.subcommand in dispatch_subcommands)) and args.max_model_calls is None and inherited_maximum is None:
             args.max_model_calls = 3
             # The ledger keeps this apart from a limit somebody chose.
@@ -1874,25 +1254,6 @@ def _main():
         from makewand.execution_runtime import initialize_cli_task
         initialize_cli_task()
 
-    # Honor --no-daemon flag
-    if getattr(args, "no_daemon", False):
-        os.environ["MAKEWAND_NO_DAEMON"] = "1"
-
-    # Daemon isolated-worker dispatch if requested via --daemon or MAKEWAND_DAEMON=1
-    if (getattr(args, "daemon", False) or os.environ.get("MAKEWAND_DAEMON") == "1") and args.subcommand != "daemon":
-        if os.environ.get("MAKEWAND_INSIDE_DAEMON") != "1":
-            from makewand.daemon import try_dispatch_via_daemon
-            stdin_text = None
-            if args.subcommand in PROMPT_COMMANDS:
-                if not getattr(args, "prompt", None) and not getattr(args, "prompt_file", None) and not sys.stdin.isatty():
-                    stdin_text = sys.stdin.read()
-            duration = _command_wall_timeout(args)
-            daemon_code = try_dispatch_via_daemon(
-                sys.argv[1:], cwd=original_cwd, stdin=stdin_text,
-                timeout=duration + 30 if duration is not None else None)
-            if daemon_code is not None:
-                sys.exit(daemon_code)
-
     # Handle directory redirection (-C / --cwd) across all commands
     if hasattr(args, "cwd") and args.cwd:
         args.cwd = os.path.abspath(args.cwd)
@@ -1904,32 +1265,8 @@ def _main():
     elif not getattr(args, "cwd", None):
         args.cwd = os.getcwd()
 
-    # Pre-flight cross-session collision check for engineering commands
-    if args.subcommand in ("run", "race", "apply"):
-        if not getattr(args, "allow_collision", False) and not getattr(args, "force", False) and not os.environ.get("MAKEWAND_DISABLE_COLLISION_GUARD"):
-            try:
-                from makewand.collision import detect_cross_session_collisions, format_collision_warning
-                col_rep = detect_cross_session_collisions(args.cwd)
-                if col_rep.get("has_collision"):
-                    print(format_collision_warning(col_rep), file=sys.stderr)
-                    if col_rep.get("git_locked"):
-                        print(c("❌ [Makewand Collision Guard] Git 索引锁已被占用，终止执行以防止写坏 Git 仓库。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
-                        sys.exit(EXIT_FAILED)
-                    if col_rep.get("same_worktree_sessions"):
-                        print(c("❌ [Makewand Collision Guard] 检测到其他活动会话正在同个工作区运行，终止执行以防止互相踩踏冲突 (加 --allow-collision 强制执行)。", COLOR_RED + COLOR_BOLD), file=sys.stderr)
-                        sys.exit(EXIT_FAILED)
-            except SystemExit:
-                raise
-            except Exception:
-                pass
-
     if not args.subcommand:
-        # Interactive sessions dispatch pipelines too; mark them (no deadline) as master did,
-        # so `makewand observe` attributes their provider children to makewand.
-        from makewand.observer import mark_process_as_dispatcher
-        mark_process_as_dispatcher()
-        from makewand.interactive import start_interactive_session
-        start_interactive_session(repo_trust=getattr(args, "repo_trust", "trusted"))
+        parser.print_help()
         sys.exit(0)
 
     # Subcommands that consume prompt text (from argument, -f file, or stdin pipe)
@@ -1941,7 +1278,7 @@ def _main():
     from makewand.telemetry import stage
     remember_result(None)
     deadline = math.ceil(time.time() * 1000 + args.total_timeout * 1000) if args.total_timeout is not None else None
-    workflow = selected.workflow if args.subcommand in ("run", "race") else "review" if args.subcommand == "review" else "direct"
+    workflow = "review" if args.subcommand == "review" else "direct"
     with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk):
         # Publish the deadline after preflight/prompt reads, immediately before
         # dispatch. With no total budget, allow 30s for workflow startup/teardown.
@@ -1956,7 +1293,7 @@ def _main():
         exit_signal = None
         with stage("command") as span:
             try:
-                result = _dispatch_parsed_command(args, is_auto_routed_run)
+                result = _dispatch_parsed_command(args)
             except SystemExit as signal:
                 exit_signal = signal
                 from makewand.execution_contract import STATUS_CODES
@@ -1973,7 +1310,7 @@ def _main():
         return result
 
 
-def _dispatch_parsed_command(args, is_auto_routed_run=False):
+def _dispatch_parsed_command(args):
 
     if args.subcommand == "route":
         from makewand.route_cli import cmd_route
@@ -1987,10 +1324,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
     elif args.subcommand == "budget":
         from makewand.budget_cli import cmd_budget
         cmd_budget(args)
-    elif args.subcommand == "daemon":
-        cmd_daemon(args)
-    elif args.subcommand == "sessions":
-        cmd_sessions(args)
     elif args.subcommand == "models":
         cmd_models(args)
     elif args.subcommand == "status":
@@ -2000,47 +1333,9 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
         cmd_status(args)
     elif args.subcommand == "quota":
         cmd_quota(args)
-    elif args.subcommand == "run":
-        # Explicit `makewand run <prompt>` indicates the user intended code execution, but natural language
-        # entrypoint `makewand "<prompt>"` must allow intent classification (e.g. explain, identity, review)
-        force_code = not is_auto_routed_run
-        repo_trust = getattr(args, "repo_trust", "trusted")
-        ok = run_pipeline(
-            args.prompt,
-            cwd=args.cwd,
-            tier=normalize_tier(args.tier),
-            model=args.model,
-            effort=getattr(args, "effort", None),
-            stream=args.stream,
-            auto_fix=args.auto_fix,
-            max_fix=getattr(args, "max_fix", 2),
-            timeout=getattr(args, "timeout", 300),
-            force_code=force_code,
-            repo_trust=repo_trust,
-            boost=getattr(args, "boost", False),
-            forced_engine=getattr(args, "provider", None),
-            local_only=getattr(args, "local_only", False),
-            workflow=args.workflow, risk=args.risk, total_timeout=args.total_timeout,
-            judge_reserve_seconds=args.judge_reserve_seconds,
-            **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}),
-        )
-        if not ok:
-            sys.exit(_execution_exit_code())
-        sys.exit(EXIT_PASSED)
-    elif args.subcommand == "merge":
-        from makewand.candidate import CandidateManager
-        ok, hybrid, detail = CandidateManager.create_hybrid_candidate(args.race_id)
-        print(detail)
-        if not ok:
-            sys.exit(EXIT_FAILED)
-        race = CandidateManager.get_race(args.race_id)
-        print("独立复审: makewand review --race-id " + race["race_id"] + " --candidate M")
-        sys.exit(EXIT_PASSED if hybrid.get("test_passed") is True else EXIT_UNVERIFIED)
     elif args.subcommand == "review":
-        review_fn = review_saved_hybrid if args.race_id else run_review
-        review_options = {"race_id": args.race_id} if args.race_id else {"cwd": args.cwd}
-        exit_code = review_fn(
-            **review_options,
+        exit_code = run_review(
+            cwd=args.cwd,
             stream=args.stream,
             timeout=args.timeout,
             effort=getattr(args, "effort", None),
@@ -2049,21 +1344,8 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
             local_only=getattr(args, "local_only", False)
         )
         sys.exit(exit_code if exit_code is not None else 0)
-    elif args.subcommand == "race":
-        exit_code = run_race(args.prompt, cwd=args.cwd, timeout=args.timeout, effort=getattr(args, "effort", None), repo_trust=getattr(args, "repo_trust", "trusted"), synthesize_hybrid=getattr(args, "hybrid", False), total_timeout=args.total_timeout, judge_reserve_seconds=args.judge_reserve_seconds, risk=args.risk, **({"protected_paths": args.protected_paths} if args.protected_paths is not None else {}))
-        sys.exit(exit_code if exit_code is not None else 0)
-    elif args.subcommand in ("ensemble", "panel"):
-        cmd_ensemble(args)
     elif args.subcommand == "clean":
         cmd_clean(args)
-    elif args.subcommand == "candidates":
-        cmd_candidates(args)
-    elif args.subcommand == "inspect":
-        cmd_inspect(args)
-    elif args.subcommand == "apply":
-        cmd_apply(args)
-    elif args.subcommand == "discard":
-        cmd_discard(args)
     elif args.subcommand == "enable":
         cmd_enable(args)
     elif args.subcommand == "disable":
@@ -2072,12 +1354,6 @@ def _dispatch_parsed_command(args, is_auto_routed_run=False):
         cmd_search(args)
     elif args.subcommand == "repomap":
         cmd_repomap(args)
-    elif args.subcommand == "plan":
-        cmd_plan(args)
-    elif args.subcommand == "aci":
-        cmd_aci(args)
-    elif args.subcommand == "mcp":
-        cmd_mcp(args)
     elif args.subcommand == "sandbox":
         cmd_sandbox(args)
     elif args.subcommand == "claude":

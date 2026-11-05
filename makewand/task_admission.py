@@ -3,60 +3,10 @@ Makewand Task Admission & Intent Classification:
 Task tiering, prompt intent routing, conversational detection, and backpressure control.
 """
 
-import os
 import re
 from typing import List
 
-from makewand.config import (
-    c,
-    COLOR_BOLD,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_BLUE,
-    COLOR_CYAN,
-    COLOR_PURPLE,
-    COLOR_RED,
-    COLOR_RESET,
-)
-
-
-def detect_task_tier(prompt: str) -> str:
-    p_lower = prompt.lower()
-
-    # 1. Fast inspect queries (probe, typo, format, simple inspect)
-    fast_phrases = [
-        "快速查看", "快速探测", "快速检查", "快速看下", "随便看看",
-        "查看一下", "简单探测", "拼写检查", "probe", "quick check",
-        "just check", "typo", "format only", "format json", "format code",
-        "print version", "help info"
-    ]
-    if any(k in p_lower for k in fast_phrases):
-        return "fast"
-
-    # 2. Deep battle-tested / architectural / algorithmic domains
-    deep_keywords = [
-        "审查", "审计", "死锁", "并发", "竞态", "内存泄露", "内存泄漏", "漏洞",
-        "全局架构", "底层架构", "重构", "无锁", "环形缓冲区", "内存序",
-        "动态规划", "图论", "红队", "渗透", "安全漏洞", "高并发", "分布式共识",
-        "review", "deadlock", "race condition", "memory leak", "lock-free",
-        "ring buffer", "memory order", "memory model", "paxos", "raft",
-        "consensus", "dynamic programming", "cross-module", "monorepo",
-        "security audit", "vulnerability", "red-team", "battle-tested",
-        "heavy refactor", "deep reasoning", "formal verification"
-    ]
-    if any(k in p_lower for k in deep_keywords):
-        return "deep"
-
-    # Complexity heuristic: very long prompts (> 250 words / 800 chars) typically involve complex tasks
-    if len(prompt) > 800 or len(prompt.split()) > 250:
-        return "deep"
-
-    # 3. Fast individual keywords if not matched above
-    fast_individual = ["简单", "探测", "快速", "拼写", "quick", "fast", "probe"]
-    if any(k in p_lower for k in fast_individual):
-        return "fast"
-
-    return "standard"
+from makewand.config import c
 
 
 def is_identity_or_chit_chat(prompt: str) -> bool:
@@ -422,57 +372,3 @@ def classify_prompt_intent(prompt: str) -> str:
     return "explain"
 
 
-def get_identity_message() -> str:
-    return (
-        f"{COLOR_BOLD}{COLOR_GREEN}✨ 我是 Makewand (v3.1) —— 零成本多模型 AI 订阅与全生态编程工具统一调度中枢。{COLOR_RESET}\n\n"
-        "我统合调度本机主流 AI 订阅服务、云端 API 与本地大模型：\n"
-        f"  {COLOR_GREEN}• Google AI Pro (Antigravity / AGY){COLOR_RESET}: 全局架构设计、复杂推理与闭环兜底\n"
-        f"  {COLOR_BLUE}• Claude Code (Anthropic){COLOR_RESET}: 高敏捷代码编写、多文件重构与实现\n"
-        f"  {COLOR_CYAN}• Codex CLI (OpenAI / gpt-6-astra){COLOR_RESET}: 独立红队代码审查与算法攻防\n"
-        f"  {COLOR_RED}• Grok Build CLI (xAI / grok-4.7){COLOR_RESET}: 前沿深度推理、大上下文架构与快速原型开发\n"
-        f"  {COLOR_PURPLE}• Muse Code (Meta / Muse Spark){COLOR_RESET}: 辅助生成、沙箱验证与备用编码\n"
-        f"  {COLOR_GREEN}• Aider / Cursor / Copilot{COLOR_RESET}: 结对编程命令行与代码辅助生成\n"
-        f"  {COLOR_CYAN}• DeepSeek / Qwen / GLM / Kimi{COLOR_RESET}: 主流商业云端 API 动态接入\n"
-        f"  {COLOR_PURPLE}• Local Self-Hosted (Ollama / vLLM){COLOR_RESET}: 本地私有离线大模型 (0 成本/安全)\n\n"
-        f"{COLOR_BOLD}核心机制：{COLOR_RESET}\n"
-        "  1. 智能意图路由：精准区分闲聊/问答（直接响应）与工程开发任务（多模型流水线），杜绝误触发程序检查或缺陷修复\n"
-        "  2. 跨模型联合流水线：自动规划、编码实现、红队盲审与 Auto-Fix 缺陷自愈\n"
-        "  3. 双模型沙箱竞速 (/race)：临时工作区并发派发比拼与主裁判评定\n"
-        "  4. 订阅配额健康监控 (/status, /quota)：按订阅额度与显式 API 费用策略切换\n"
-        "  5. 安全搜索与物理沙箱 (/search, /sandbox)：护栏搜索与 Bubblewrap 进程隔离"
-    )
-
-
-def check_load_backpressure(load_threshold: float = 24.0) -> bool:
-    """
-    Monitors system 1-minute load average. When load exceeds load_threshold,
-    yields process priority and logs throttled concurrency notice.
-    """
-    try:
-        load_1m = os.getloadavg()[0]
-        if load_1m > load_threshold:
-            print(c(f"⏳ [Makewand Backpressure] 检测到主机负载偏高 (1m load: {load_1m:.1f} > {load_threshold})，自适应降低调度优先级...", COLOR_YELLOW))
-            try:
-                os.nice(5)
-            except Exception:
-                pass
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _explicit_readonly_request(prompt: str) -> bool:
-    # Reuse the pipeline's existing negative-instruction boundary when an
-    # explicit workflow is selected; workflow selection cannot grant writes.
-    # Scoped / localized negative phrases (e.g. "do not edit tests") are
-    # negative constraints on specific scopes, not whole-task read-only requests.
-    cleaned = strip_localized_negatives(prompt).lower()
-    triggers = (
-        "不要修改", "不用修改", "别修改", "不要改", "别改", "不用改",
-        "只看不改", "只解释", "无需修改", "不要写代码", "别写代码", "不用写代码",
-        "只分析", "只做分析", "只读", "don't modify", "do not modify", "without modifying",
-        "don't edit", "do not edit", "don't write code", "do not write code", "never write code",
-        "read only", "readonly", "explain only", "just explain",
-    )
-    return any(value in cleaned for value in triggers)

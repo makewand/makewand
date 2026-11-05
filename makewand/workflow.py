@@ -83,10 +83,3 @@ def choose_workflow(workflow="auto", risk="auto", evidence=None):
                         "explicit workflow" if workflow != "auto" else "verified low-risk scope" if resolved_risk == "low" else "risk unknown or elevated; cross review required")
 
 
-def judge_reserve(total_seconds, requested=None):
-    if isinstance(total_seconds, bool) or not isinstance(total_seconds, (int, float)) or not math.isfinite(total_seconds) or total_seconds <= 0:
-        raise ValueError("total timeout must be a finite positive number")
-    reserve = min(60.0, total_seconds * .25) if requested is None else requested
-    if isinstance(reserve, bool) or not isinstance(reserve, (int, float)) or not math.isfinite(reserve) or not 0 <= reserve < total_seconds:
-        raise ValueError("judge reserve must be finite, nonnegative and less than the total timeout")
-    return float(reserve)

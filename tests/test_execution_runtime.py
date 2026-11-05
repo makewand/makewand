@@ -267,38 +267,6 @@ class ExecutionRuntimeTests(unittest.TestCase):
             execute(self.request(), interrupted)
         self.assertEqual([a["result_status"] for a in self.ledger()["attempts"]], ["UNKNOWN", "CANCELLED"])
 
-    def test_review_hold_cannot_be_eaten_and_claim_is_not_a_second_call(self):
-        lease = call_budget.reserve_capacity(1, "workflow-task")
-        self.assertEqual(call_budget.remaining_capacity(), 2)
-        execute(self.request(), lambda timeout: (True, "A", None))
-        execute(self.request(), lambda timeout: (True, "B", None))
-        self.assertEqual(execute(self.request(), lambda timeout: (True, "steal", None)).status, "BUDGET_EXHAUSTED")
-        with execution_context(lease_id=lease):
-            result = execute(self.request(stage="review", readonly=True), lambda timeout: (True, "judge", None))
-        self.assertEqual(result.status, "PASSED")
-        ledger = self.ledger()
-        self.assertEqual(len(ledger["attempts"]), 3)
-        self.assertEqual(ledger["holds"][lease]["remaining"], 0)
-        call_budget.release_capacity(lease)
-        self.assertNotIn(lease, self.ledger()["holds"])
-
-    def test_expired_hold_releases_only_unused_capacity(self):
-        lease = call_budget.reserve_capacity(2, "workflow-task")
-        with execution_context(lease_id=lease):
-            execute(self.request(), lambda timeout: (False, None, "failed"))
-        data = self.ledger()
-        data["holds"][lease]["expires_at"] = time.time() - 1
-        self.budget.write_text(json.dumps(data))
-        self.assertEqual(call_budget.remaining_capacity(), 2)
-        with execution_context(lease_id=lease):
-            self.assertEqual(execute(self.request(), lambda timeout: (True, "bad", None)).status, "BUDGET_EXHAUSTED")
-        self.assertEqual(len(self.ledger()["attempts"]), 1)
-
-    def test_failed_multi_stage_capacity_plan_starts_no_provider(self):
-        os.environ["MAKEWAND_MAX_MODEL_CALLS"] = "2"
-        with self.assertRaises(call_budget.BudgetError):
-            call_budget.reserve_capacity(3, "race-task")
-        self.assertFalse(self.budget.exists())
 
     def test_explicit_ledger_does_not_mutate_process_environment(self):
         custom = self.root / "custom.json"

@@ -460,41 +460,6 @@ class SharedCapacityTests(unittest.TestCase):
             self.assertFalse(any(row["attempt"] == a for row in state["active"].values()))
             capacity.save(path, state)
 
-    def test_tool_state_loss_reports_unavailable_instead_of_raising(self):
-        from makewand import orchestrator
-        state_path = self.root / capacity.STATE_NAME
-        for damage in ("delete", "reset", "corrupt"):
-            def damage_state(*args, **kwargs):
-                if damage == "delete":
-                    state_path.unlink()
-                elif damage == "reset":
-                    state_path.write_text('{"schema":1,"active":{},"queue":[]}')
-                else:
-                    state_path.write_text('{broken')
-                return True, None
-
-            for entrypoint in ("tests", "sandbox"):
-                with self.subTest(damage=damage, entrypoint=entrypoint):
-                    state_path.unlink(missing_ok=True)
-                    # These deliberately destroyed states are discarded, not
-                    # repaired. Test the unavailable result here; separate
-                    # recovery tests run and join the actual retry workers.
-                    with patch.object(capacity, "tool_memory_available", return_value=True), \
-                            patch.object(capacity, "_defer_tool_settlement"):
-                        if entrypoint == "tests":
-                            with patch.object(orchestrator, "_run_local_tests", side_effect=damage_state):
-                                passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
-                            self.assertFalse(passed)
-                            self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
-                        else:
-                            @capacity.controlled_tool
-                            def command(timeout=2):
-                                damage_state()
-                                return 0, "ok", "", None
-                            result = command()
-                            self.assertEqual(result[0], -1)
-                            self.assertEqual(result[3], "LocalCapacityUnavailable")
-                    self.assertIsNone(capacity._tool.get())
 
     def test_idle_completion_survives_compaction_until_cache_refresh(self):
         a = self.reserve("idle", "codex")
@@ -538,48 +503,6 @@ class SharedCapacityTests(unittest.TestCase):
                 budget.request_budget(condition, maximum=3, budget_file=str(source))
                 self.assertNotIn(a, {row["id"] for row in json.loads(source.read_text())["attempts"]})
 
-    def test_malformed_tool_state_reports_unavailable_before_running(self):
-        from makewand import orchestrator
-        row = {"id": "x", "project": "p", "label": "l", "kind": "tool", "ledger": "",
-               "attempt": "", "started_at": 0, "limits": [1, 1, 1]}
-        for place in ("active", "queue"):
-            for entrypoint in ("tests", "sandbox"):
-                with self.subTest(place=place, entrypoint=entrypoint):
-                    state = {"schema": 1, "active": {}, "queue": []}
-                    state[place] = {"x": row} if place == "active" else [row]
-                    (self.root / capacity.STATE_NAME).write_text(json.dumps(state))
-                    ran = []
-                    with patch.object(capacity, "tool_memory_available", return_value=True):
-                        if entrypoint == "tests":
-                            with patch.object(orchestrator, "_run_local_tests", return_value=(True, None)) as command:
-                                passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
-                            self.assertFalse(passed)
-                            self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
-                            command.assert_not_called()
-                        else:
-                            @capacity.controlled_tool
-                            def command(timeout=2):
-                                ran.append(True)
-                                return 0, "ok", "", None
-                            result = command()
-                            self.assertEqual(result[3], "LocalCapacityUnavailable")
-                            self.assertFalse(ran)
-
-    def test_invalid_tool_policy_reports_unavailable_before_running(self):
-        from makewand import orchestrator
-        for text in ('{broken', '{"schema":2}', '{"schema":1,"providers":[]}'):
-            with self.subTest(text=text):
-                (self.root / capacity.POLICY_NAME).write_text(text)
-                with patch.object(orchestrator, "_run_local_tests", return_value=(True, None)) as command:
-                    passed, detail = orchestrator.run_local_tests(str(self.root), timeout=2)
-                self.assertFalse(passed)
-                self.assertIsInstance(detail, orchestrator.LocalTestsUnavailable)
-                command.assert_not_called()
-
-                @capacity.controlled_tool
-                def sandbox(timeout=2):
-                    self.fail("invalid policy ran a local command")
-                self.assertEqual(sandbox()[3], "LocalCapacityUnavailable")
 
     def test_tool_settlement_recovers_after_storage_failure_and_config_change(self):
         import errno

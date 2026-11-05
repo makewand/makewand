@@ -10,7 +10,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from makewand import git_helper as git
-from makewand.candidate import get_candidate_files_changed
 
 
 class GitDiffFailClosedTests(unittest.TestCase):
@@ -62,16 +61,6 @@ class GitDiffFailClosedTests(unittest.TestCase):
         with self.assertRaises(OSError):
             git.get_git_diff(str(self.root))
 
-    def test_candidate_plan_expands_untracked_directories_to_files(self):
-        self.baseline()
-        index = self.root / ".git/index"
-        before = index.read_bytes()
-        new_dir = self.root / "new package" / "nested"
-        new_dir.mkdir(parents=True)
-        (new_dir / "module.py").write_text("VALUE = 2\n")
-        changes = get_candidate_files_changed(self.root)
-        self.assertEqual(changes, {"new package/nested/module.py": "A"})
-        self.assertEqual(index.read_bytes(), before)
 
     def test_failed_diff_never_falls_back_to_empty_success(self):
         self.baseline()
@@ -88,16 +77,6 @@ class GitDiffFailClosedTests(unittest.TestCase):
         self.assertIn("fixture diff failure", error)
         self.assertEqual(len(calls), 1)
 
-    def test_candidate_plan_checks_failed_intent_to_add(self):
-        self.baseline()
-        original = git.run_git_cmd
-        def intercepted(command, **kwargs):
-            if "--intent-to-add" in command:
-                return 128, "", "fixture add failure"
-            return original(command, **kwargs)
-        with patch.object(git, "run_git_cmd", side_effect=intercepted):
-            with self.assertRaisesRegex(OSError, "fixture add failure"):
-                get_candidate_files_changed(self.root)
 
     def test_failed_attribute_shield_cannot_start_host_git(self):
         attributes = self.root / ".git/info/attributes"

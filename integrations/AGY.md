@@ -10,5 +10,4 @@ skill 规定了何时调用、各命令的成本、如何按退出码判断结�
 
 ## 注意
 
-- 在 agy 交互界面中调用时，agy 自身会被识别为同目录的交互式 AI 会话，`makewand run` 通常走影子工作树，只生成补丁。
 - makewand 派发 agy 时会带 `MAKEWAND_PROVIDER_WORKER=1`；被派发的 agy 不能再调用 makewand。

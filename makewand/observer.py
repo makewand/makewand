@@ -404,15 +404,6 @@ def capture_session_pane(session_name, lines_count=25):
     except Exception:
         return []
 
-def is_file_locked(lock_path):
-    """Check if a file lock is actively held by a process using non-blocking flock."""
-    if not os.path.exists(lock_path):
-        return False
-    try:
-        res = subprocess.run(["flock", "-n", lock_path, "true"], capture_output=True, timeout=1)
-        return res.returncode != 0
-    except Exception:
-        return False
 
 def is_session_holding_file_lock(session_name: str, lock_path: str) -> bool:
     """Check if the given tmux session or any of its descendant processes holds the lock file."""

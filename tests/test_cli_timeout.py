@@ -51,8 +51,7 @@ def test_direct_cli_timeout_global_total(provider):
 
 
 @pytest.mark.parametrize("command, default", [
-    ("run", 300), ("review", 300), ("race", 300),
-    ("ensemble", 900), ("sandbox", 120),
+    ("review", 300), ("sandbox", 120),
 ])
 def test_other_cli_timeout_defaults_unchanged(command, default):
     assert parsed_timeout([command]) == default
@@ -83,42 +82,6 @@ def test_invalid_total_names_correct_option(value, capsys):
             cli._main()
     assert caught.value.code == 2
     assert "--total-timeout must be a finite positive number" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("command,options,expected", [
-    ("codex", ["--timeout", "3600", "--total-timeout", "3600"], 3630),
-    ("review", ["--total-timeout", "5400"], 5430),
-    ("run", ["--timeout", "3600"], 10830),
-    ("ensemble", ["--total-timeout", "10800"], 10830),
-    ("race", ["--timeout", "300", "--total-timeout", "10800"], 10830),
-])
-def test_cli_forwards_daemon_wall_budget(command, options, expected):
-    with mock.patch.object(sys, "stdin", io.StringIO("task")), \
-            mock.patch.object(sys, "argv", ["makewand", command, "--daemon", *options]), \
-            mock.patch("makewand.daemon.try_dispatch_via_daemon", return_value=0) as dispatch:
-        with pytest.raises(SystemExit) as caught:
-            cli._main()
-    assert caught.value.code == 0
-    assert dispatch.call_args.kwargs["timeout"] == expected
-
-
-@pytest.mark.parametrize("duration", [5430, 10830, 21600])
-def test_daemon_accepts_long_requests(duration, tmp_path):
-    from makewand.daemon_context import validate_request, PROTOCOL_VERSION
-    request = dict(version=PROTOCOL_VERSION, request_id="a" * 32, cmd="execute",
-                   argv=["review"], cwd=str(tmp_path), env={}, timeout=duration)
-    assert validate_request(request)["timeout"] == duration
-
-
-@pytest.mark.parametrize("required,expected", [(False, None), (True, 2)])
-def test_daemon_over_safety_cap_runs_standalone_or_errors(required, expected, tmp_path, monkeypatch):
-    from makewand import daemon
-    monkeypatch.setenv("MAKEWAND_DAEMON_REQUIRE", "1" if required else "0")
-    monkeypatch.delenv("MAKEWAND_NO_DAEMON", raising=False)
-    with mock.patch.object(daemon, "get_daemon_socket_path", return_value=tmp_path), \
-            mock.patch.object(daemon, "_probe_daemon") as probe:
-        assert daemon.try_dispatch_via_daemon(["review"], timeout=30000) == expected
-    probe.assert_not_called()
 
 
 @pytest.mark.parametrize("deadline,expected", [(20000000, "long_running"), (1000000, "hung_anomaly")])
@@ -158,28 +121,6 @@ def test_dispatch_marker_exports_deadline(monkeypatch):
     assert observer.os.environ[observer.DEADLINE_ENV_VAR] == "123456"
     observer.mark_process_as_dispatcher()
     assert observer.DEADLINE_ENV_VAR not in observer.os.environ
-
-
-@pytest.mark.parametrize("saved", [False, True])
-def test_review_workflow_deadline_inherits_cli_total(saved):
-    from makewand import orchestrator
-    from makewand.execution_runtime import current_context, execution_context
-    import time
-    timeout = parsed_timeout(["review", "--total-timeout", "1800"])
-    parent = int((time.time() + 1800) * 1000)
-
-    def inspect(*args, **kwargs):
-        remaining = current_context()["deadline_unix_ms"] / 1000 - time.time()
-        assert 1790 < remaining <= 1800
-        assert args[2] == 1800
-        return 0
-
-    method = "_review_saved_hybrid_impl" if saved else "_run_review_impl"
-    with execution_context(deadline_unix_ms=parent), mock.patch.object(orchestrator, method, side_effect=inspect):
-        if saved:
-            assert orchestrator.review_saved_hybrid("fake-race", timeout=timeout) == 0
-        else:
-            assert orchestrator.run_review(timeout=timeout) == 0
 
 
 def test_cli_exports_deadline_before_dispatch(monkeypatch):

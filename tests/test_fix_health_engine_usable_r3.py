@@ -34,10 +34,8 @@ from makewand.outcome_ledger import Mark
 
 import makewand.config as config
 import makewand.health as health
-import makewand.interactive as interactive
 from makewand import cli
 from makewand.engine_selection import _engine_usable, _usable_or_api_relay, select_optimal_engine_pair
-from makewand.ensemble import resolve_ensemble_providers, run_ensemble
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
 from makewand.providers.muse import execute_muse_task
@@ -89,90 +87,6 @@ class _IsolatedStatusFile(unittest.TestCase):
 
     def on_disk(self):
         return json.loads(health.STATUS_CACHE_FILE.read_text(encoding="utf-8"))
-
-
-class TestNothingIsDispatchedWithoutAUsableEngine(unittest.TestCase):
-    CACHE = {"claude": live("error", reason="broken CLI"), "codex": live("needs_auth", reason="login expired"),
-             "agy": live("missing", reason="agy is not installed"), "grok": live("missing"),
-             "muse": live("missing"), "local": live("missing")}
-
-    def test_repl_turn_dispatches_nothing_and_names_each_engines_reason(self):
-        calls, history, out = [], [], io.StringIO()
-
-        def dispatch(engine, prompt, **kwargs):
-            calls.append(engine)
-            return False, None, f"fake failure {engine}"
-
-        with routing(), patch.object(interactive, "get_or_update_status", return_value=self.CACHE), \
-             patch.object(interactive, "dispatch_task", side_effect=dispatch), contextlib.redirect_stdout(out):
-            interactive.handle_conversational_turn("解释一下这个函数", history, tempfile.gettempdir(), stream=False)
-        self.assertEqual(calls, [], "no engine may be dispatched (the fallback used to be agy, agy, claude, codex, local)")
-        self.assertEqual(history, [])
-        text = out.getvalue()
-        for expected in ("• claude:", "broken CLI", "• codex:", "login expired", "codex login", "makewand probe"):
-            self.assertIn(expected, text)
-        self.assertNotIn("• agy", text)
-
-    def test_run_outcome_error_names_each_engines_reason(self):
-        from makewand.engine_selection import _no_provider_error
-        with routing():
-            _, _, meta = select_optimal_engine_pair("解释一下这个函数", cache=self.CACHE)
-        error = _no_provider_error(meta)
-        self.assertTrue(error.startswith("No usable execution provider: "), error)
-        for expected in ("claude", "broken CLI", "codex", "login expired"):
-            self.assertIn(expected, error)
-        with patch("makewand.config.get_active_providers", return_value=[]):
-            self.assertEqual(_no_provider_error({}), "No enabled execution provider")
-
-    def test_repl_turn_still_dispatches_the_usable_engines_only(self):
-        calls = []
-        cache = dict(self.CACHE, claude=live("healthy"))
-        with routing(), patch.object(interactive, "get_or_update_status", return_value=cache), \
-             patch.object(interactive, "dispatch_task", side_effect=lambda e, p, **k: calls.append(e) or (False, None, "x")), \
-             contextlib.redirect_stdout(io.StringIO()):
-            interactive.handle_conversational_turn("解释一下这个函数", [], tempfile.gettempdir(), stream=False)
-        self.assertEqual(calls, ["claude"])
-
-    @contextlib.contextmanager
-    def ensemble_env(self, cache, local=(False, "Ollama 未响应", []), enabled=lambda name: True):
-        with patch("makewand.health.load_status_cache", return_value=cache), \
-             patch("makewand.ensemble.is_provider_enabled", side_effect=enabled), \
-             patch("makewand.config.is_provider_enabled", side_effect=enabled), \
-             patch("makewand.ensemble.has_subscription_configured", side_effect=lambda name: name != "local"), \
-             patch("makewand.config.has_api_configured", return_value=False), \
-             patch("makewand.providers.local.is_local_model_available", return_value=local):
-            yield
-
-    def test_ensemble_without_a_usable_engine_is_empty_and_says_why(self):
-        cache = dict(self.CACHE, agy=live("error", reason="region blocked", ttl_seconds=6 * 3600),
-                     grok=live("limited", resets_at="in 3 hours"), muse=live("needs_auth"))
-        unavailable = {}
-        with self.ensemble_env(cache):
-            self.assertEqual(resolve_ensemble_providers(None, unavailable=unavailable), [])
-        self.assertEqual(sorted(unavailable), ["agy", "claude", "codex", "grok", "local", "muse"])
-        self.assertIn("region blocked", unavailable["agy"])
-        self.assertIn("Ollama 未响应", unavailable["local"])
-
-        dispatched = []
-        with self.ensemble_env(cache), \
-             patch("makewand.orchestrator.dispatch_task", side_effect=lambda e, p, **k: dispatched.append(e) or (True, "ok", None)), \
-             contextlib.redirect_stderr(io.StringIO()) as err:
-            result = run_ensemble("审查这段代码", providers="claude,codex,agy")
-        self.assertEqual(dispatched, [], "the local fallback used to be dispatched although it is not running")
-        self.assertFalse(result["ok"])
-        for engine in ("claude", "codex", "agy", "local"):
-            self.assertIn(engine, result["error"])
-            self.assertIn(engine, result["unavailable"])
-            self.assertIn(f"• {engine}:", err.getvalue())
-
-    def test_ensemble_falls_back_only_to_an_engine_that_can_run(self):
-        cache = {"claude": live("error"), "agy": live("error", ttl_seconds=6 * 3600)}
-        with self.ensemble_env(cache, local=(True, "", ["qwen2.5-coder"])):
-            self.assertEqual(resolve_ensemble_providers(["claude"]), ["local"])
-        with self.ensemble_env(cache, local=(True, "", ["qwen2.5-coder"]), enabled=lambda name: name != "local"):
-            self.assertEqual(resolve_ensemble_providers(["claude"]), [])
-        with self.ensemble_env({"claude": live("error")}):
-            self.assertEqual(resolve_ensemble_providers(["claude"]), ["agy"])
 
 
 class TestVerdictWithoutUsableTimestampDecays(_IsolatedStatusFile):

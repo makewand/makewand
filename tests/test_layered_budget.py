@@ -104,14 +104,6 @@ class LayeredBudgetTests(unittest.TestCase):
         self.assertEqual({day: counter["used"] for day, counter in scopes["machine"].items()},
                          {"2026-10-15": 1, "2026-10-16": 2})
 
-    def test_review_hold_cannot_be_stolen_and_midnight_rechecks_daily(self):
-        with execution_context(task_id="task-a"), patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="2"):
-            hold = b.reserve_capacity(1, "review")
-            b.reserve("fake", "fast", task_id="other")
-            with self.assertRaises(b.BudgetError):
-                b.reserve("fake", "fast", task_id="other")
-            b.reserve("fake", "fast", task_id="task-a", lease_id=hold, stage="review")
-            b.release_capacity(hold)
 
     def test_exception_and_cancel_do_not_refund(self):
         for stage in ("provider", "repair", "review"):
@@ -123,16 +115,6 @@ class LayeredBudgetTests(unittest.TestCase):
             execute(request, lambda timeout: (_ for _ in ()).throw(KeyboardInterrupt()))
         self.assertEqual(self.data()["scopes"]["tasks"]["task-a"]["used"], 4)
 
-    def test_hold_crossing_midnight_cannot_bypass_new_day_machine_cap(self):
-        with execution_context(task_id="task-a"), patch.dict(os.environ, MAKEWAND_MACHINE_DAILY_CALLS="1"):
-            with patch("time.time", return_value=1792079999):
-                hold = b.reserve_capacity(1, "review", ttl_seconds=60)
-            with patch("time.time", return_value=1792080000):
-                a = b.reserve("fake", "fast", task_id="other")
-                b.complete(a, True, 0)
-                with self.assertRaises(b.BudgetError):
-                    b.reserve("fake", "fast", lease_id=hold, task_id="task-a", stage="review")
-        self.assertEqual(len(self.data()["attempts"]), 1)
 
     def test_daily_configuration_without_path_uses_shared_default(self):
         with patch.dict(os.environ, MAKEWAND_CALL_BUDGET_FILE="", MAKEWAND_CONFIG_DIR=self.tmp.name):
@@ -142,12 +124,3 @@ class LayeredBudgetTests(unittest.TestCase):
             b.complete(a, True, 0)
             self.assertEqual(len(json.loads((Path(self.tmp.name) / "call-budget.json").read_text())["attempts"]), 2)
 
-    def test_day_clock_rollback_does_not_revive_expired_hold(self):
-        with execution_context(task_id="task-a"):
-            with patch("time.time", return_value=1792079900):
-                hold = b.reserve_capacity(1, "review", ttl_seconds=1)
-            with patch("time.time", return_value=1792079902):
-                b.remaining_capacity()
-            with patch("time.time", return_value=1792079900):
-                with self.assertRaises(b.BudgetError):
-                    b.reserve("fake", "fast", lease_id=hold, task_id="task-a")

@@ -140,12 +140,6 @@ jobs:
       - name: Dispatch regression tests
         run: bash dispatch/test.sh
 
-      - name: Offline benchmark harness
-        run: |
-          python3 -I benchmarks/test_runner.py
-          python3 -I benchmarks/test_deep_config_acceptance_v4.py
-          python3 -I benchmarks/test_analyze_results.py
-
       - name: Installer and unpacked release contract
         run: python3 -I scripts/test_installation.py
 

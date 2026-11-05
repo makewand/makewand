@@ -27,13 +27,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 
-from makewand.orchestrator import (
-    select_optimal_engine_pair,
-    dispatch_task,
-    run_race,
-    run_pipeline,
-    classify_prompt_intent,
-)
+from makewand.orchestrator import dispatch_task
 from makewand.execution_runtime import mark_provider_invocation
 from makewand.pacing import parse_reset_time_to_seconds_left
 from makewand.providers.base import run_subprocess
@@ -43,7 +37,6 @@ from makewand.providers.grok import execute_grok_task
 from makewand.providers.muse import execute_muse_task
 from makewand.providers.aider import execute_aider_task
 from makewand.providers.agy import execute_agy_task
-from makewand.interactive import handle_conversational_turn
 import makewand.config as makewand_config
 
 
@@ -94,42 +87,6 @@ class TestAuditV31Fixes(unittest.TestCase):
         self.assertIsNotNone(sec_in)
         self.assertGreater(sec_in, 0)
 
-    def test_p1_4_non_agentic_models_excluded_from_coding_tasks(self):
-        """P1-4: Pure API and Local models cannot be primary coders for file-editing tasks."""
-        cache = {
-            "claude": {"status": "healthy"},
-            "codex": {"status": "healthy"},
-            "local": {"status": "healthy"},
-            "deepseek": {"status": "healthy"},
-            "qwen": {"status": "healthy"},
-        }
-        # The local model is enabled *and reachable* by construction: the result must
-        # not depend on whether an Ollama daemon happens to run on the test host.
-        with patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
-             patch("makewand.config.load_user_config", return_value={"enabled_providers": {"local": True}}), \
-             patch("makewand.providers.local.is_local_model_available",
-                   return_value=(True, "qwen2.5-coder:7b", ["qwen2.5-coder:7b"])):
-            # 1. Coding prompt: local and deepseek must NOT be in available coders
-            coders, reviewers, meta = select_optimal_engine_pair(
-                "在当前目录编写一个支持重试机制的 HTTP Client",
-                tier="standard",
-                cache=cache,
-                require_file_editing=True,
-            )
-            self.assertNotIn("local", coders)
-            self.assertNotIn("deepseek", coders)
-            self.assertIn(meta["primary_coder"], ["claude", "codex"])
-            # But local IS accepted in reviewers (part of active pool)
-            self.assertIn("local", reviewers)
-
-            # 2. Explain prompt: local CAN be included in coders
-            coders_exp, _, meta_exp = select_optimal_engine_pair(
-                "在本地私有大模型上运行离线分析",
-                tier="standard",
-                cache=cache,
-                require_file_editing=False,
-            )
-            self.assertIn("local", coders_exp)
 
     def test_p0_3_long_prompt_uses_stdin_or_file(self):
         """P0-3: Prompts > 32KB must NOT be passed as plain argv strings to avoid E2BIG."""
@@ -192,106 +149,6 @@ class TestAuditV31Fixes(unittest.TestCase):
             # every host launch was audited
             self.assertEqual(host_audit.call_count, 4)
 
-    def test_p0_4_race_mode_symmetric_dispatch_and_usage(self):
-        """P0-4: Race mode must symmetrically handle Claude, Codex, Grok, Muse, AGY with dispatch_task."""
-        with tempfile.TemporaryDirectory() as td:
-            from makewand.git_helper import run_git_cmd
-            run_git_cmd(["git", "init"], cwd=td)
-            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=td)
-            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=td)
-            run_git_cmd(["git", "commit", "-m", "init", "--allow-empty"], cwd=td)
-
-            def fake_clone(src, target):
-                target.mkdir(parents=True, exist_ok=True)
-                run_git_cmd(["git", "init"], cwd=str(target))
-                run_git_cmd(["git", "config", "user.name", "Tester"], cwd=str(target))
-                run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=str(target))
-                run_git_cmd(["git", "commit", "-m", "init", "--allow-empty"], cwd=str(target))
-
-            def fake_dispatch(engine, prompt, cwd=None, readonly=False, **kwargs):
-                if readonly:
-                    return True, nonced(prompt, 'MAKEWAND_RACE_VERDICT: {"pass": true, "winner": "A", "defects": []}'), None
-                (Path(cwd) / "app.py").write_text(f"ENGINE = {engine!r}\n", encoding="utf-8")
-                return True, "output code", None
-
-            with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
-                 patch("makewand.orchestrator.clone_isolated_worktree", side_effect=fake_clone), \
-                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "all passed")), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={engine: {"status": "healthy"} for engine in ("claude", "codex", "agy")}), \
-                 patch("makewand.config.is_provider_enabled", return_value=True), \
-                 patch("makewand.orchestrator.execute_agy_task", side_effect=AssertionError("AGY must use the unified dispatcher")):
-                mock_dispatch.side_effect = fake_dispatch
-
-                # Test Claude as Racer A, Codex as Racer B
-                rc = run_race("task", cwd=td, engine_a="claude", engine_b="codex")
-                self.assertEqual(rc, 0)
-                self.assertEqual(mock_dispatch.call_count, 3)
-                called_engines = [call[0][0] for call in mock_dispatch.call_args_list]
-                self.assertIn("claude", called_engines)
-                self.assertIn("codex", called_engines)
-                readonly_calls = [call for call in mock_dispatch.call_args_list if call.kwargs.get("readonly")]
-                self.assertEqual(len(readonly_calls), 1)
-                self.assertEqual(readonly_calls[0].args[0], "agy")
-                self.assertEqual(readonly_calls[0].kwargs["tier"], "deep")
-
-        # Verify dispatch_task records usage
-        def launched_claude(*_args, **_kwargs):
-            mark_provider_invocation()
-            return True, "ok", None
-
-        with patch("makewand.orchestrator.execute_claude_task", side_effect=launched_claude), \
-             patch("makewand.usage.record_engine_usage") as mock_usage:
-            dispatch_task("claude", "test prompt", tier="standard")
-            # The fake adapter reports no route (cli/api): the ledger then infers it (usage.dispatch_route).
-            mock_usage.assert_called_once_with("claude", tier="standard", success=True, task="test prompt", route=None, model=None)
-
-    def test_p1_3_fail_and_cleanup_hard_reset_to_baseline(self):
-        """P1-3: fail_and_cleanup in host mode resets hard to task_baseline when initial workspace is clean."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            from makewand.git_helper import run_git_cmd
-            run_git_cmd(["git", "init"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.name", "Test"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.email", "test@test.com"], cwd=tmpdir)
-            init_file = Path(tmpdir) / "app.py"
-            init_file.write_text("print('v1')\n")
-            run_git_cmd(["git", "add", "."], cwd=tmpdir)
-            run_git_cmd(["git", "commit", "-m", "Initial commit"], cwd=tmpdir)
-
-            # Coder commits a buggy change that advances HEAD
-            def coder_advances_head(prompt, cwd=None, **kw):
-                (Path(cwd) / "app.py").write_text("print('buggy v2')\n")
-                (Path(cwd) / "untracked_bug.py").write_text("# bug\n")
-                run_git_cmd(["git", "add", "."], cwd=cwd)
-                run_git_cmd(["git", "commit", "-m", "Buggy model commit"], cwd=cwd)
-                return True, "committed", None
-
-            # Reviewer fails the change
-            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
-                 patch("makewand.orchestrator.execute_claude_task", side_effect=coder_advances_head), \
-                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"fatal bug\"]}", None))):
-                res = run_pipeline("写一段代码", cwd=tmpdir, stream=False, auto_fix=False, force_code=True)
-                self.assertFalse(res)
-                # Verify hard reset to initial baseline: app.py must be reverted and commit rolled back!
-                self.assertEqual(init_file.read_text(), "print('v1')\n")
-                self.assertFalse((Path(tmpdir) / "untracked_bug.py").exists())
-                _, log_out, _ = run_git_cmd(["git", "log", "--oneline"], cwd=tmpdir)
-                self.assertNotIn("Buggy model commit", log_out)
-
-    def test_interactive_context_capping(self):
-        """Interactive REPL bounds conversation history context to prevent infinite expansion."""
-        history = []
-        for i in range(10):
-            history.append({"role": "user", "content": f"User question {i}: " + ("A" * 3000)})
-            history.append({"role": "assistant", "content": f"Assistant answer {i}: " + ("B" * 3000)})
-
-        with patch("makewand.interactive.dispatch_task") as mock_dispatch:
-            mock_dispatch.return_value = (True, "Answer", None)
-            handle_conversational_turn("What is next?", history, "/tmp", forced_engine="codex")
-            dispatched_prompt = mock_dispatch.call_args[0][1]
-            # Context must be truncated and capped, well under 65KB
-            self.assertLess(len(dispatched_prompt), 15000)
-            self.assertIn("历史截断", dispatched_prompt)
 
     def test_run_subprocess_pipe_cleanup(self):
         """Subprocess run must cleanly close pipes and avoid file descriptor leaks."""
@@ -299,37 +156,6 @@ class TestAuditV31Fixes(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("test_cleanup", out)
 
-    def test_p0_a_clone_isolated_worktree_copies_files_and_excludes_dirs(self):
-        """P0-A: copies have distinct inodes; dependencies and ignored caches stay excluded."""
-        from makewand.git_helper import clone_isolated_worktree
-        with tempfile.TemporaryDirectory() as td:
-            src = Path(td) / "src"
-            dst = Path(td) / "dst"
-            src.mkdir()
-            (src / "app.py").write_text("print('hello')\n")
-            (src / ".gitignore").write_text("__pycache__/\n")
-            (src / "node_modules").mkdir()
-            (src / "node_modules" / "pkg.js").write_text("dummy")
-            (src / "benchmarks").mkdir()
-            (src / "benchmarks" / "bench.py").write_text("dummy")
-            (src / ".venv").mkdir()
-            (src / ".venv" / "pip").write_text("dummy")
-            (src / "__pycache__").mkdir()
-            (src / "__pycache__" / "c.pyc").write_text("dummy")
-
-            clone_isolated_worktree(str(src), dst)
-
-            # File must be copied with distinct inode
-            src_file = src / "app.py"
-            dst_file = dst / "app.py"
-            self.assertTrue(dst_file.exists())
-            self.assertNotEqual(src_file.stat().st_ino, dst_file.stat().st_ino)
-
-            # Excluded directories must NOT be in dst
-            self.assertFalse((dst / "node_modules").exists())
-            self.assertFalse((dst / "benchmarks").exists())
-            self.assertFalse((dst / ".venv").exists())
-            self.assertFalse((dst / "__pycache__").exists())
 
     def test_p1_a_streaming_long_stdin_no_deadlock(self):
         """P1-A: run_subprocess with stream=True handles >64KB stdin via async thread without deadlocking."""
@@ -339,82 +165,6 @@ class TestAuditV31Fixes(unittest.TestCase):
         self.assertIn("line line", out)
         self.assertIsNone(ex)
 
-    def test_p1_c_forced_engine_not_passed_as_model_arg(self):
-        """P1-C: forced_engine prioritizes engine without passing engine name to child CLI --model."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            from makewand.git_helper import run_git_cmd
-            run_git_cmd(["git", "init"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=tmpdir)
-            (Path(tmpdir) / "app.py").write_text("print('test')\n")
-            run_git_cmd(["git", "add", "."], cwd=tmpdir)
-            run_git_cmd(["git", "commit", "-m", "init"], cwd=tmpdir)
-
-            with patch("makewand.orchestrator.dispatch_task") as mock_dispatch:
-                mock_dispatch.return_value = (True, "Answer", None)
-                # Test explain mode with forced_engine
-                run_pipeline("解释这段代码", cwd=tmpdir, forced_engine="codex")
-                self.assertEqual(mock_dispatch.call_args[0][0], "codex")
-                self.assertIsNone(mock_dispatch.call_args[1].get("model"))
-
-            # Test code modification mode with forced_engine
-            call_args_list = []
-            def fake_dispatch(eng, prompt, cwd=None, **kw):
-                call_args_list.append((eng, kw))
-                if kw.get("readonly"):
-                    return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"), None
-                else:
-                    (Path(cwd) / "app.py").write_text("print('updated')\n")
-                    return True, "written", None
-
-            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={"agy": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
-                 patch("makewand.config.get_active_providers", return_value=["agy", "claude"]), \
-                 patch("makewand.orchestrator.dispatch_task", side_effect=fake_dispatch), \
-                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "ok")):
-                run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=False, force_code=True, forced_engine="agy")
-                self.assertEqual(call_args_list[0][0], "agy")
-                self.assertIsNone(call_args_list[0][1].get("model"))
-
-            # Test conversational turn with forced_engine
-            with patch("makewand.interactive.dispatch_task") as mock_chat_dispatch:
-                mock_chat_dispatch.return_value = (True, "Chat answer", None)
-                from makewand.interactive import handle_conversational_turn
-                handle_conversational_turn("hello", [], tmpdir, forced_engine="codex")
-                self.assertEqual(mock_chat_dispatch.call_args[0][0], "codex")
-                self.assertIsNone(mock_chat_dispatch.call_args[1].get("model"))
-
-    def test_p1_d_single_tool_auto_fix_loop(self):
-        """P1-D: Single-tool mode allows coder engine to re-review its own fixes."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            from makewand.git_helper import run_git_cmd
-            run_git_cmd(["git", "init"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=tmpdir)
-            run_git_cmd(["git", "config", "user.email", "test@test.local"], cwd=tmpdir)
-            (Path(tmpdir) / "app.py").write_text("v1\n")
-            run_git_cmd(["git", "add", "."], cwd=tmpdir)
-            run_git_cmd(["git", "commit", "-m", "init"], cwd=tmpdir)
-
-            call_count = [0]
-            def single_engine_dispatch(eng, prompt, cwd=None, **kw):
-                call_count[0] += 1
-                if kw.get("readonly"):
-                    if "经过上一轮缺陷修复后" in prompt:
-                        return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": true, \"defects\": []}"), None
-                    else:
-                        return True, nonced(prompt, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"typo bug\"]}"), None
-                else:
-                    (Path(cwd) / "app.py").write_text(f"new content {call_count[0]}\n")
-                    return True, "code written", None
-
-            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}}), \
-                 patch("makewand.config.get_active_providers", return_value=["codex"]), \
-                 patch("makewand.orchestrator.dispatch_task", side_effect=single_engine_dispatch), \
-                 patch("makewand.orchestrator.run_local_tests", return_value=(True, "ok")):
-                res = run_pipeline("修改代码", cwd=tmpdir, stream=False, auto_fix=True, force_code=True,
-                                   workflow="single", risk="low")
-                self.assertTrue(res)
 
     def test_p1_e_aider_sandbox_env_and_mount(self):
         """P1-E: Aider in sandbox passes API keys and ro-bind mounts ~/.aider.conf.yml if exists."""
@@ -431,88 +181,6 @@ class TestAuditV31Fixes(unittest.TestCase):
                 self.assertIn("sk-test-aider-123", bwrap_cmd)
                 self.assertIn("ANTHROPIC_API_KEY", bwrap_cmd)
                 self.assertIn(str(conf_file), bwrap_cmd)
-
-    def test_p2_improvements(self):
-        """P2 improvements: 0600 api_keys, agy --mode plan in readonly, fail_and_cleanup baseline diff, LRU eviction."""
-        # 1. 0600 api_keys.json
-        import stat
-        from makewand.config import save_api_key
-        with tempfile.TemporaryDirectory() as td:
-            f = Path(td) / "api_keys.json"
-            with patch("makewand.config.API_KEYS_FILE", f), patch("makewand.config.CONFIG_DIR", Path(td)):
-                save_api_key("claude", "test-key")
-                self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
-
-        # 2. AGY --mode plan in readonly (authorized host run, H1)
-        with patch("makewand.health.load_status_cache", return_value={}), \
-             patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
-             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
-             patch("makewand.sandbox.audit_unsafe_host_exec"), \
-             patch("makewand.providers.agy.run_subprocess") as mock_sub:
-            mock_sub.return_value = (0, "ok", "", None)
-            execute_agy_task("plan prompt", readonly=True)
-            cmd = mock_sub.call_args[0][0]
-            self.assertIn("--mode", cmd)
-            self.assertIn("plan", cmd)
-            self.assertNotIn("--dangerously-skip-permissions", cmd)
-
-        # 3. Candidate LRU eviction
-        from makewand.candidate import CandidateManager
-        with tempfile.TemporaryDirectory() as td:
-            cand_dir = Path(td) / "candidates"
-            cand_dir.mkdir()
-            for i in range(7):
-                d = cand_dir / f"rc_{i}"
-                d.mkdir()
-                (d / "meta.json").write_text(f"{{\"created_at\": \"2026-09-27T0{i}:00:00\"}}")
-            with patch("makewand.config.CANDIDATES_DIR", cand_dir):
-                evicted = CandidateManager.prune_old_candidates(max_candidates=4)
-                self.assertEqual(evicted, 3)
-                self.assertEqual(len(list(cand_dir.iterdir())), 4)
-
-                # Symlink eviction test: must unlink symlinks without crashing with OSError: Cannot call rmtree on a symbolic link
-                cand_link = cand_dir / "rc_symlink"
-                cand_target = Path(td) / "external_target"
-                cand_target.mkdir()
-                os.utime(cand_target, (1000, 1000))
-                cand_link.symlink_to(cand_target)
-                CandidateManager.prune_old_candidates(max_candidates=4)
-                self.assertFalse(cand_link.exists())
-
-        # 4. fail_and_cleanup captures committed changes against task_baseline into rejected.patch
-        with tempfile.TemporaryDirectory() as td:
-            from makewand.git_helper import run_git_cmd
-            run_git_cmd(["git", "init"], cwd=td)
-            run_git_cmd(["git", "config", "user.name", "Tester"], cwd=td)
-            run_git_cmd(["git", "config", "user.email", "tester@test.local"], cwd=td)
-            (Path(td) / "main.py").write_text("print('baseline')\n")
-            run_git_cmd(["git", "add", "."], cwd=td)
-            run_git_cmd(["git", "commit", "-m", "init"], cwd=td)
-
-            def buggy_coder(p, cwd=None, **kw):
-                (Path(cwd) / "main.py").write_text("print('committed bug')\n")
-                run_git_cmd(["git", "add", "."], cwd=cwd)
-                run_git_cmd(["git", "commit", "-m", "bug commit"], cwd=cwd)
-                return True, "ok", None
-
-            with patch("makewand.orchestrator.check_working_tree_isolation", return_value=(True, None)), \
-                 patch("makewand.orchestrator.get_or_update_status", return_value={"codex": {"status": "healthy"}, "claude": {"status": "healthy"}}), \
-                 patch("makewand.orchestrator.execute_claude_task", side_effect=buggy_coder), \
-                 patch("makewand.orchestrator.execute_codex_task", side_effect=answer_with_nonce((True, "MAKEWAND_VERDICT: {\"pass\": false, \"defects\": [\"bug\"]}", None))):
-                art_base = _isolation.artifacts_root()
-                rej_before = {d: _patch_stamp(d) for d in art_base.glob("rejected_*")}
-                run_pipeline("fix code", cwd=td, stream=False, auto_fix=False, force_code=True)
-                rej_dirs = [d for d in art_base.glob("rejected_*")
-                            if _patch_stamp(d) != rej_before.get(d)
-                            and "committed bug" in _read_text(d / "rejected.patch")]
-                for rej in rej_dirs:
-                    if rej not in rej_before:  # never delete a directory we did not create
-                        self.addCleanup(shutil.rmtree, rej, True)
-                self.assertTrue(len(rej_dirs) > 0)
-                patch_file = rej_dirs[0] / "rejected.patch"
-                self.assertTrue(patch_file.exists())
-                self.assertIn("committed bug", patch_file.read_text())
 
 
 if __name__ == "__main__":

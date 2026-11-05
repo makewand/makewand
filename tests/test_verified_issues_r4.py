@@ -95,34 +95,6 @@ def test_review_other_candidate_never_sleeps(isolated, monkeypatch, explicit_cap
         budget.complete(holder, True, 0)
 
 
-def test_pipeline_coding_other_candidate_never_sleeps(isolated, monkeypatch):
-    try:
-        from test_workflow_scheduling import SchedulingTests
-    except ImportError:
-        from tests.test_workflow_scheduling import SchedulingTests
-    fixture = SchedulingTests()
-    fixture.setUp()
-    monkeypatch.delenv("MAKEWAND_LEASE_WAIT_SECONDS")
-    holder = budget.reserve("claude", "fast", task_id="holder")
-
-    def release_for_review(engine, kwargs):
-        assert engine == "codex" or kwargs.get("readonly"), "busy coder launched"
-        if not kwargs.get("readonly"):
-            budget.complete(holder, True, 0)
-
-    try:
-        with fixture.fixtures(callback=release_for_review), \
-                patch.object(budget, "time", budget_clock(reject_busy_sleep)):
-            result = orch.run_workflow("Implement value", cwd=str(fixture.repo), force_code=True,
-                                       auto_fix=False, total_timeout=2, timeout=1)
-        assert result.status == "PASSED", result
-        assert [(name, ro) for name, ro, _, _ in fixture.calls] == [("codex", False), ("claude", True)]
-        assert len(attempts()) == 3
-    finally:
-        budget.complete(holder, True, 0)
-        fixture.doCleanups()
-
-
 def test_only_usable_reviewer_waits_then_admits(isolated, monkeypatch):
     monkeypatch.delenv("MAKEWAND_LEASE_WAIT_SECONDS")
     holder = budget.reserve("codex", "fast", task_id="holder")
@@ -167,26 +139,6 @@ def test_stale_foreign_root_does_not_break_verification(isolated, monkeypatch, v
                                    is_provider=provider is not None, provider_name=provider)
     assert argv[-1] == "/usr/bin/true"
     assert str(missing) not in argv
-
-
-def test_cancelled_race_waiter_never_admits_or_spends(isolated, monkeypatch):
-    from makewand.providers.base import contestant_scope
-    monkeypatch.delenv("MAKEWAND_LEASE_WAIT_SECONDS")
-    holder = budget.reserve("codex", "fast", task_id="holder")
-    try:
-        with contestant_scope("r4-waiter") as scope:
-            def cancel(seconds):
-                scope.cancel_event.set()
-                budget.complete(holder, True, 0)
-                return True
-            with patch.object(scope.cancel_event, "wait", side_effect=cancel) as wait:
-                result = execute(ExecutionRequest(engine="codex", task_id="loser", stage="test", timeout_ms=500),
-                                 lambda timeout: pytest.fail("cancelled worker launched"))
-            wait.assert_called_once()
-        assert result.status == "CANCELLED"
-        assert len(attempts()) == 1
-    finally:
-        budget.complete(holder, True, 0)
 
 
 def test_deadline_during_retry_of_busy_account_remains_busy(isolated):

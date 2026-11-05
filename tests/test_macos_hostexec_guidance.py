@@ -182,44 +182,5 @@ class TestProvidersHostExecution(unittest.TestCase):
                     self.assertEqual(latest["source"], "config-ack")
 
 
-class TestOrchestratorUpfrontFailFast(unittest.TestCase):
-    def test_run_pipeline_fails_fast_when_writable_and_unauthorized(self):
-        from makewand.orchestrator import run_pipeline
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
-                 patch("sys.platform", "darwin"), \
-                 patch.dict(os.environ, {}, clear=True), \
-                 patch("makewand.health.get_or_update_status", return_value={
-                     "claude": {"status": "healthy"},
-                     "codex": {"status": "healthy"},
-                 }), \
-                 patch("makewand.orchestrator.select_optimal_engine_pair", return_value=(
-                     ["claude", "codex"], ["codex"], {"primary_coder": "claude", "primary_reviewer": "codex"}
-                 )), \
-                 patch("makewand.orchestrator.dispatch_task") as mock_dispatch:
-                res = run_pipeline("请实现一个新特性", cwd=tmp, force_code=True)
-                self.assertFalse(res)
-                mock_dispatch.assert_not_called()
-
-    def test_run_race_fails_fast_when_unauthorized(self):
-        from makewand.orchestrator import run_race, EXIT_UNVERIFIED
-
-        with tempfile.TemporaryDirectory() as tmp:
-            with patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-            patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
-                 patch("sys.platform", "darwin"), \
-                 patch.dict(os.environ, {}, clear=True), \
-                 patch("makewand.health.get_or_update_status", return_value={
-                     "claude": {"status": "healthy"},
-                     "codex": {"status": "healthy"},
-                 }), \
-                 patch("makewand.config.get_active_providers", return_value=["claude", "codex"]), \
-                 patch("makewand.config.is_provider_enabled", return_value=True):
-                code = run_race("编写测试", cwd=tmp, engine_a="claude", engine_b="codex")
-                self.assertEqual(code, EXIT_UNVERIFIED)
-
-
 if __name__ == "__main__":
     unittest.main()

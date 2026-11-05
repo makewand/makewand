@@ -23,21 +23,8 @@ import makewand.config as config
 import makewand.health as health
 import makewand.usage as usage
 import makewand.orchestrator as orchestrator
-from makewand.orchestrator import select_optimal_engine_pair
 from makewand.pacing import calculate_dynamic_pacing
 
-# New penalty-math helpers are looked up lazily so that, on the pre-fix code,
-# the behavioural tests below still run and fail on their assertions.
-def burn_rate_factor(pen):
-    return orchestrator.burn_rate_factor(pen)
-
-
-def apply_burn_rate_penalty(score, pen):
-    return orchestrator.apply_burn_rate_penalty(score, pen)
-
-
-def reliability_factor(rate):
-    return orchestrator.reliability_factor(rate)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CORE = ["claude", "codex", "grok", "agy", "muse"]
@@ -76,106 +63,6 @@ class _IsolatedState(unittest.TestCase):
                     "updated_at": datetime.now().isoformat()} for e in engines}
 
 
-class TestPenaltyMathBounds(unittest.TestCase):
-    """py-reliability#5: bounded, continuous, monotone penalty math."""
-
-    PENALTIES = [0.0, -0.2, -0.8, -1.49, -1.5, -1.51, -2.0, -3.0, -3.5, -4.0, -6.0, -1e9, float("-inf")]
-
-    def test_burn_rate_factor_upper_and_lower_bounds(self):
-        floor = orchestrator.BURN_PENALTY_MIN_FACTOR
-        self.assertGreater(floor, 0.0)
-        for pen in self.PENALTIES:
-            f = burn_rate_factor(pen)
-            self.assertLessEqual(f, 1.0, pen)
-            self.assertGreaterEqual(f, floor, pen)
-        self.assertEqual(burn_rate_factor(0.0), 1.0)
-        self.assertEqual(burn_rate_factor(0.7), 1.0, "positive input is not a penalty")
-        self.assertEqual(burn_rate_factor(float("nan")), 1.0)
-        self.assertAlmostEqual(burn_rate_factor(-4.0), floor)
-
-    def test_penalty_is_monotone_and_has_no_cliff_at_minus_1_5(self):
-        score = 4.3  # codex base 1.8 + algorithm affinity 2.5
-        values = [apply_burn_rate_penalty(score, p) for p in self.PENALTIES]
-        for earlier, later in zip(values, values[1:]):
-            self.assertLessEqual(later, earlier + 1e-12)
-        # Old code: -1.49 -> 2.81, -1.51 -> max(0.2, 1.5-1.51) = 0.2 (a 2.6 point cliff).
-        self.assertLess(abs(apply_burn_rate_penalty(score, -1.49) - apply_burn_rate_penalty(score, -1.51)), 0.05)
-
-    def test_positive_scores_stay_eligible_and_non_positive_untouched(self):
-        for score in (0.05, 0.8, 2.0, 5.3):
-            for pen in self.PENALTIES:
-                out = apply_burn_rate_penalty(score, pen)
-                self.assertGreater(out, 0.0)
-                self.assertGreaterEqual(out, score * orchestrator.BURN_PENALTY_MIN_FACTOR - 1e-12)
-                self.assertLessEqual(out, score)
-        self.assertEqual(apply_burn_rate_penalty(-999.0, -4.0), -999.0)
-        self.assertEqual(apply_burn_rate_penalty(0.0, -4.0), 0.0)
-
-    def test_reliability_factor_bounds(self):
-        self.assertEqual(reliability_factor(None), 1.0)
-        self.assertEqual(reliability_factor(float("nan")), 1.0)
-        previous = None
-        floor = orchestrator.RELIABILITY_MIN_FACTOR
-        for rate in [x / 20 for x in range(0, 21)]:
-            f = reliability_factor(rate)
-            self.assertGreaterEqual(f, floor)
-            self.assertLessEqual(f, 1.0)
-            if previous is not None:
-                self.assertGreaterEqual(f, previous - 1e-12)
-            previous = f
-        self.assertEqual(reliability_factor(1.0), 1.0)
-        self.assertEqual(reliability_factor(0.0), floor)
-
-
-class TestRoutingInversionRegression(_IsolatedState):
-    """runtime-state#2: real-state dry run put agy (93% failing) first and clamped claude/codex/grok to 0.2."""
-
-    PENALTIES = {"claude": -3.5, "codex": -4.0, "grok": -1.72, "muse": -2.56}
-
-    def _agy_failure_ledger(self):
-        now = datetime.now()
-        records = []
-        for i in range(42):
-            records.append({
-                "timestamp": (now - timedelta(hours=1 + i)).isoformat(),
-                "engine": "agy", "tier": "standard", "success": i < 3, "task": "real task",
-            })
-        return records
-
-    def test_failing_agy_is_not_primary_and_main_engines_are_not_flattened(self):
-        self.write_ledger(self._agy_failure_ledger())
-        with patch("makewand.usage.get_burn_rate_penalty",
-                   side_effect=lambda e: (self.PENALTIES.get(e, 0.0), "heavy" if e in self.PENALTIES else None)):
-            coders, reviewers, meta = select_optimal_engine_pair(
-                "实现用户数据导出功能并落盘", tier="standard", cache=self.healthy_cache())
-        scores = meta["scores"]
-        self.assertNotEqual(coders[0], "agy", f"agy with 3/42 real successes must not lead: {scores}")
-        for engine in ("claude", "codex", "grok"):
-            self.assertIn(engine, coders, "bounded penalty must keep main engines eligible")
-            self.assertGreater(scores[engine], 0.2 + 1e-6, f"{engine} must not be clamped to 0.2: {scores}")
-        self.assertGreater(len({round(scores[e], 6) for e in ("claude", "codex", "grok")}), 1,
-                           "main engines must not collapse to one identical floor score")
-        self.assertLess(scores["agy"], 1.4, "low real success rate must down-weight agy and drop its +0.5")
-        self.assertTrue(any("真实派发成功率" in r for r in meta["reasons"]))
-
-    def test_task_affinity_survives_moderate_burn_penalty(self):
-        # Old clamp: codex (1.8 + 2.5 affinity) with pen -1.8 -> max(0.2, 1.5 - 1.8) = 0.2.
-        with patch("makewand.usage.get_burn_rate_penalty",
-                   side_effect=lambda e: (-1.8, "heavy") if e == "codex" else (0.0, None)):
-            coders, _, meta = select_optimal_engine_pair(
-                "修复 goroutine 并发死锁", tier="standard", cache=self.healthy_cache())
-        self.assertEqual(coders[0], "codex", meta["scores"])
-        self.assertGreater(meta["scores"]["codex"], 2.0)
-
-    def test_reviewer_scores_use_bounded_penalty(self):
-        with patch("makewand.usage.get_burn_rate_penalty",
-                   side_effect=lambda e: (-4.0, "heavy") if e == "codex" else (0.0, None)):
-            _, reviewers, _ = select_optimal_engine_pair(
-                "实现用户数据导出功能并落盘", tier="standard", cache=self.healthy_cache())
-        # Old code: 2.2 + (-4.0) = -1.8 -> codex silently dropped from the reviewer pool.
-        self.assertIn("codex", reviewers)
-
-
 class TestUnknownStatusIsNeutral(_IsolatedState):
     """py-reliability#4: never-probed providers must not be treated as 0% quota (-999)."""
 
@@ -186,13 +73,6 @@ class TestUnknownStatusIsNeutral(_IsolatedState):
             self.assertNotEqual(p["pacing_state"], "limited", engine)
             self.assertIn("makewand probe", p["reason"])
 
-    def test_fresh_install_routes_by_base_scores(self):
-        cache = {k: dict(v) for k, v in health.DEFAULT_CACHE.items()}
-        with patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("实现用户数据导出功能并落盘", tier="standard", cache=cache)
-        self.assertEqual(coders[0], "claude", meta["scores"])
-        self.assertTrue(all(meta["scores"][e] > 0 for e in CORE), meta["scores"])
-        self.assertFalse(any("无可用自主工具" in r for r in meta["reasons"]))
 
     def test_fresh_install_primary_is_independent_of_hash_seed(self):
         script = (
@@ -203,7 +83,7 @@ class TestUnknownStatusIsNeutral(_IsolatedState):
             "config.CONFIG_DIR = tmp; config.CANDIDATES_DIR = tmp / 'c'; config.BACKUPS_DIR = tmp / 'b'\n"
             "config.LEGACY_TRIO_CACHE = tmp / 'none' / 't.json'; health.LEGACY_TRIO_CACHE = config.LEGACY_TRIO_CACHE\n"
             "health.STATUS_CACHE_FILE = tmp / 'status.json'; usage.USAGE_WINDOW_FILE = tmp / 'usage.json'\n"
-            "from makewand.orchestrator import select_optimal_engine_pair\n"
+            "from makewand.engine_selection import select_optimal_engine_pair\n"
             "pool = ['claude', 'codex', 'grok', 'agy', 'muse', 'copilot', 'cursor']\n"
             "with patch('makewand.config.get_active_providers', return_value=pool), \\\n"
             "     patch('makewand.config.has_api_configured', return_value=False), \\\n"
@@ -221,20 +101,6 @@ class TestUnknownStatusIsNeutral(_IsolatedState):
             outputs.add(res.stdout.strip().splitlines()[-1])
         self.assertEqual(len(outputs), 1, f"routing must not depend on PYTHONHASHSEED: {outputs}")
         self.assertTrue(next(iter(outputs)).startswith("claude "), outputs)
-
-
-class TestDetectOnlyToolsAreNotDispatched(_IsolatedState):
-    """arch-product#6: cursor/copilot have no execution adapter."""
-
-    def test_cursor_and_copilot_never_selected(self):
-        pool = list(CORE) + ["cursor", "copilot"]
-        cache = self.healthy_cache(pool)
-        with patch("makewand.config.get_active_providers", return_value=pool), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("实现用户数据导出功能并落盘", tier="standard", cache=cache)
-        for tool in ("cursor", "copilot"):
-            self.assertNotIn(tool, coders)
-            self.assertNotIn(tool, reviewers)
 
 
 class TestAgyReliabilityBonus(_IsolatedState):
@@ -277,64 +143,6 @@ class TestAgyReliabilityBonus(_IsolatedState):
         self.assertEqual(raw, 36)
         undecayed = 6 / 36
         self.assertGreater(rate, undecayed + 0.2, "week-old failures must weigh less than recent successes")
-
-
-class TestLimitedModelApiFallbackRouting(_IsolatedState):
-    def test_limited_model_with_api_avoids_pacing_penalty_and_allows_fallback(self):
-        pool = ["claude", "codex"]
-        cache = {
-            "claude": {"status": "limited", "updated_at": datetime.now().isoformat()},
-            "codex": {"status": "healthy", "updated_at": datetime.now().isoformat()},
-        }
-        with patch("makewand.config.get_active_providers", return_value=pool), \
-             patch("makewand.config.has_api_configured", side_effect=lambda e: e == "claude"), \
-             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "allow_paid"}), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
-            # Claude base score is 2.0. With api_ok and limited, it should be 2.0 - 1.0 = 1.0 > 0, not -999
-            self.assertIn("claude", coders)
-            self.assertGreater(meta["scores"]["claude"], 0.0)
-
-    def test_limited_model_with_a_key_the_api_policy_forbids_is_excluded(self):
-        # The adapter relays only when the policy allows paid calls (api-policy-relay).
-        pool = ["claude", "codex"]
-        cache = {
-            "claude": {"status": "limited", "updated_at": datetime.now().isoformat()},
-            "codex": {"status": "healthy", "updated_at": datetime.now().isoformat()},
-        }
-        with patch("makewand.config.get_active_providers", return_value=pool), \
-             patch("makewand.config.has_api_configured", side_effect=lambda e: e == "claude"), \
-             patch.dict(os.environ, {"MAKEWAND_API_POLICY": "subscription_only"}), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
-            self.assertNotIn("claude", coders)
-            self.assertEqual(meta["scores"]["claude"], -999.0)
-
-    def test_limited_model_without_api_is_excluded(self):
-        pool = ["claude", "codex"]
-        cache = {
-            "claude": {"status": "limited", "updated_at": datetime.now().isoformat()},
-            "codex": {"status": "healthy", "updated_at": datetime.now().isoformat()},
-        }
-        with patch("makewand.config.get_active_providers", return_value=pool), \
-             patch("makewand.config.has_api_configured", return_value=False), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
-            self.assertNotIn("claude", coders)
-            self.assertEqual(meta["scores"]["claude"], -999.0)
-
-    def test_error_model_with_api_is_excluded(self):
-        pool = ["claude", "codex"]
-        cache = {
-            "claude": {"status": "error", "updated_at": datetime.now().isoformat()},
-            "codex": {"status": "healthy", "updated_at": datetime.now().isoformat()},
-        }
-        with patch("makewand.config.get_active_providers", return_value=pool), \
-             patch("makewand.config.has_api_configured", return_value=True), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            coders, reviewers, meta = select_optimal_engine_pair("编写Python脚本", tier="standard", cache=cache)
-            self.assertNotIn("claude", coders)
-            self.assertLess(meta["scores"]["claude"], 0.0)
 
 
 if __name__ == "__main__":

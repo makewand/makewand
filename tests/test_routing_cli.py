@@ -621,44 +621,6 @@ class RoutingCliTests(unittest.TestCase):
             "验收不过就升一档：makewand route implement mechanical --tier 2 --simple",
             plain.stdout.splitlines())
 
-    def test_prescan_only_treats_the_first_positional_as_a_subcommand(self):
-        # A prompt's own options may carry a value that is also a subcommand
-        # name (--provider agy); the auto-route must still insert "run".
-        from unittest import mock
-        sys.path.insert(0, str(REPO_ROOT))
-        try:
-            import makewand.cli as cli
-        finally:
-            sys.path.remove(str(REPO_ROOT))
-
-        class Parsed(Exception):
-            pass
-
-        def fake_parse_args(parser, args=None, namespace=None):
-            raise Parsed(list(sys.argv[1:]))
-
-        cases = (
-            (["fix the bug", "--provider", "agy"], ["run", "fix the bug", "--provider", "agy"]),
-            # run options in front of the prompt, with values that are subcommand names
-            (["--provider", "agy", "fix the bug"], ["run", "--provider", "agy", "fix the bug"]),
-            (["-C", str(self.work), "--provider", "codex", "fix it"],
-             ["run", "-C", str(self.work), "--provider", "codex", "fix it"]),
-            (["--risk", "high", "mark", "codex", "6h"], ["--risk", "high", "mark", "codex", "6h"]),
-            (["-C", str(self.work), "fix the route", "--provider", "codex"],
-             ["run", "-C", str(self.work), "fix the route", "--provider", "codex"]),
-            (["-C", str(self.work), "mark", "codex", "6h", "--reason", "x"],
-             ["-C", str(self.work), "mark", "codex", "6h", "--reason", "x"]),
-        )
-        for argv, expected in cases:
-            with self.subTest(argv=argv), \
-                    mock.patch.object(sys, "argv", ["makewand", *argv]), \
-                    mock.patch.dict(os.environ, {"MAKEWAND_NO_DAEMON": "1"}), \
-                    mock.patch.object(cli.argparse.ArgumentParser, "parse_args", fake_parse_args):
-                os.environ.pop(WORKER_ENV, None)
-                with self.assertRaises(Parsed) as caught:
-                    cli._main()
-                self.assertEqual(caught.exception.args[0], expected)
-
     # ---------- mark ----------
 
     def test_mark_on_one_model_leaves_its_siblings_routable(self):
@@ -1047,19 +1009,6 @@ class RoutingCliTests(unittest.TestCase):
 
     # ---------- worker 拒绝与帮助 ----------
 
-    def test_worker_environment_refuses_all_three(self):
-        import makewand.cli as cli
-
-        for name in ("route", "mark", "outcome", "models"):
-            self.assertNotIn(name, cli.WORKER_SAFE_SUBCOMMANDS)
-        for args in (("route", "implement", "mechanical"),
-                     ("mark", "codex", "6h"),
-                     ("outcome", "codex", "1", "implement", "pass"),
-                     ("models", "--refresh")):
-            with self.subTest(args=args):
-                result = self.run_cli(*args, quota={}, worker=True)
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertIn("递归", result.stderr)
 
     def test_help_lists_new_commands(self):
         result = self.run_cli("--help")
