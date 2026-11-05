@@ -176,7 +176,7 @@ def execute_muse_task(
     If readonly=True, omits --yolo bypass flag.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, record_engine_limit
+    from makewand.health import find_cli_messages, load_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
         SandboxConfigError, ProviderStartupError,
@@ -355,7 +355,10 @@ def execute_muse_task(
 
     is_limited, reason, resets = parse_muse_quota(out, err if apart else None)
     if is_limited:
-        record_engine_limit("muse", reason, resets, model=target_model)
+        # Meta's quota window covers the whole subscription: muse-wonder-full-1.0 and muse-wonder-1.0
+        # were refused with the same reset. A rate limit may still be one model's.
+        whole_subscription = "quota" in find_cli_messages("muse", ("quota",), out, err if apart else None)
+        record_engine_limit("muse", reason, resets, model=None if whole_subscription else target_model)
         if relay.available:
             return relay(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Muse Code 执行中检测到限制: {reason}", "可配置 META_API_KEY 实现自动接力")
