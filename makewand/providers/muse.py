@@ -17,7 +17,8 @@ def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
     found = find_cli_messages("muse", ("auth", "quota", "rate"), output, stderr)
     if "auth" in found:
         return True, "未登录或需配置凭据 (运行 'muse login' 或在 ~/.config/muse/env 中配置 META_API_KEY)", "需登录授权"
-    line = next((line for kind, line in found.items() if kind != "auth"), None)
+    # A retry's rate limit may print first; only the quota line knows when the subscription resets.
+    line = found.get("quota") or found.get("rate")
     if line is not None:
         reset_time = extract_reset_phrase(line)
         if reset_time:

@@ -170,6 +170,43 @@ class SharedCapacityTests(unittest.TestCase):
         row = self._waits()[-1]
         self.assertEqual((row["kind"], row["admitted"]), ("tool", False))
 
+    def test_an_interrupt_while_logging_an_admission_gives_the_slot_back(self):
+        with patch.object(capacity, "record_wait", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            budget.reserve("codex", "fast", task_id="first", working_directory=REPO)
+        budget.complete(budget.reserve("codex", "fast", task_id="second", working_directory=REPO), True, 0)
+
+    def test_an_interrupt_while_logging_a_tool_admission_settles_the_slot(self):
+        with patch.object(capacity, "tool_memory_available", return_value=True), \
+                patch.object(capacity, "record_wait", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            with capacity.tool_scope(capacity.policy(), time.monotonic() + 5):
+                self.fail("the body must not run")
+        self.assertEqual(json.loads((self.root / capacity.STATE_NAME).read_text())["active"], {})
+
+    def _queue_when_logged(self):
+        seen = []
+
+        def record(*_args):
+            seen.append(json.loads((self.root / capacity.STATE_NAME).read_text())["queue"])
+        return seen, patch.object(capacity, "record_wait", side_effect=record)
+
+    def test_a_refusal_is_logged_after_its_ticket_left_the_queue(self):
+        holder = budget.reserve("codex", "fast", task_id="holder", working_directory=REPO)
+        self.addCleanup(budget.complete, holder, True, 0)
+        seen, recording = self._queue_when_logged()
+        with recording, self.assertRaises(budget.ConcurrencyBusyError):
+            budget.reserve("codex", "fast", task_id="waiter", working_directory=self.root)
+        self.assertEqual(seen, [[]])
+
+    def test_a_tool_refusal_is_logged_after_its_ticket_left_the_queue(self):
+        seen, recording = self._queue_when_logged()
+        with recording, patch.object(capacity, "tool_memory_available", return_value=False), \
+                self.assertRaises(budget.ConcurrencyBusyError):
+            with capacity.tool_scope(capacity.policy(), time.monotonic() + .15):
+                pass
+        self.assertEqual(seen, [[]])
+
     def test_queue_wait_never_spends_and_reserves_execution_time(self):
         a = self.reserve("a", "codex")
         os.environ["MAKEWAND_LEASE_WAIT_SECONDS"] = "300"

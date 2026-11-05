@@ -521,6 +521,7 @@ def tool_scope(current_policy, deadline):
     start = time.monotonic()
     wait_until = start + min(current_policy["wait_seconds"], max(0, deadline - start) / 3)
     next_report = 0
+    refusal = None
     try:
         while True:
             _check_admission_cancelled()
@@ -544,13 +545,12 @@ def tool_scope(current_policy, deadline):
                 message = diagnostic(state, ticket, current_policy)
                 save(path, state)
             if time.monotonic() >= wait_until:
-                record_wait("tool", "tool", time.monotonic() - start, False, message)
+                refusal = message
                 raise ConcurrencyBusyError(message)
             if time.monotonic() >= next_report:
                 report_busy(message)
                 next_report = time.monotonic() + 15
             time.sleep(min(.1, max(0, wait_until - time.monotonic())))
-        record_wait("tool", "tool", time.monotonic() - start, True)
         token = _tool.set(identifier)
         stop = threading.Event()
 
@@ -563,6 +563,7 @@ def tool_scope(current_policy, deadline):
         thread = threading.Thread(target=heartbeat, daemon=True)
         thread.start()
         try:
+            record_wait("tool", "tool", time.monotonic() - start, True)
             yield
         finally:
             stop.set()
@@ -577,6 +578,8 @@ def tool_scope(current_policy, deadline):
                 _tool.reset(token)
     finally:
         cancel(identifier, current_policy)
+        if refusal is not None:
+            record_wait("tool", "tool", time.monotonic() - start, False, refusal)
 
 
 def controlled_tool(function):

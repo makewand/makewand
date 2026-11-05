@@ -47,6 +47,10 @@ class MuseQuotaCloseoutTests(unittest.TestCase):
     def test_a_subscription_quota_refusal_covers_every_model(self):
         self.assertIsNone(self._refusal_model(MUSE_QUOTA))
 
+    def test_a_quota_line_sets_the_reset_even_after_a_rate_line(self):
+        rate = "rate limited (http 429 · attempt 2). Resets at 2026-10-27T00:01:00Z."
+        self.assertIn("2026-10-28T10:47:45Z", parse_muse_quota(rate, MUSE_QUOTA)[2])
+
     def test_a_rate_limit_stays_with_its_model(self):
         self.assertEqual(self._refusal_model("rate limited (http 429 · attempt 2)"), "muse-wonder-1.0")
 
