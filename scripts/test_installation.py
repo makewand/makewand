@@ -145,12 +145,12 @@ class InstallationTests(unittest.TestCase):
                     elif failure == "version":
                         go.write_text(fake_go(version_override="0.0.0-wrong"))
                     else:
-                        package.write_text(old_source + "\nif 'run' in sys.argv: raise RuntimeError('broken smoke')\n")
+                        package.write_text(old_source + "\nif 'review' in sys.argv: raise RuntimeError('broken smoke')\n")
                     try:
                         failed = subprocess.run(command, env=env, capture_output=True)
                         self.assertNotEqual(failed.returncode, 0)
                         self.assertEqual(current.resolve(), previous_target)
-                        for args in (("--version",), ("run", "--help"), ("status", "--help")):
+                        for args in (("--version",), ("review", "--help"), ("status", "--help")):
                             subprocess.run([str(launcher), *args], env=env, check=True, capture_output=True)
                     finally:
                         go.write_text(old_go)
@@ -224,7 +224,7 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual((temp / "installed/previous").resolve(), frozen_target)
             self.assertFalse(list((temp / "bin").glob(".makewand.*")))
             for target in (previous_target, frozen_target, current.resolve()):
-                subprocess.run([sys.executable, "-I", str(target / "bin/makewand"), "run", "--help"],
+                subprocess.run([sys.executable, "-I", str(target / "bin/makewand"), "review", "--help"],
                                env=env, check=True, capture_output=True)
 
     def test_site_upgrade_replaces_symlink_and_ignores_cwd_package(self):
