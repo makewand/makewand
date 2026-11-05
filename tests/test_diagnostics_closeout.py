@@ -30,6 +30,30 @@ MUSE_QUOTA = (
 
 
 class MuseQuotaCloseoutTests(unittest.TestCase):
+    def _refusal_model(self, stderr):
+        from makewand.providers.muse import execute_muse_task
+        try:
+            from test_multi_model_optimization import _FakeProviderHome
+        except ImportError:  # python3 -m unittest tests.<module>
+            from tests.test_multi_model_optimization import _FakeProviderHome
+        with _FakeProviderHome() as home, patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+                patch("makewand.sandbox._provider_socket_preflight"), \
+                patch("makewand.providers.muse.run_subprocess", return_value=(1, "", stderr, None)), \
+                patch("makewand.health.record_engine_limit") as record:
+            execute_muse_task("review", cwd=str(home.workspace), model="muse-wonder-1.0", readonly=True)
+        record.assert_called_once()
+        return record.call_args.kwargs["model"]
+
+    def test_a_subscription_quota_refusal_covers_every_model(self):
+        self.assertIsNone(self._refusal_model(MUSE_QUOTA))
+
+    def test_a_quota_line_sets_the_reset_even_after_a_rate_line(self):
+        rate = "rate limited (http 429 · attempt 2). Resets at 2026-10-27T00:01:00Z."
+        self.assertIn("2026-10-28T10:47:45Z", parse_muse_quota(rate, MUSE_QUOTA)[2])
+
+    def test_a_rate_limit_stays_with_its_model(self):
+        self.assertEqual(self._refusal_model("rate limited (http 429 · attempt 2)"), "muse-wonder-1.0")
+
     def test_observed_cli_quota_is_classified_on_both_streams(self):
         for output, stderr in (("", MUSE_QUOTA), (MUSE_QUOTA, ""), (MUSE_QUOTA, None)):
             with self.subTest(stderr=stderr):

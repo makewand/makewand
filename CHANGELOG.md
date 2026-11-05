@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Muse 的订阅额度拒绝覆盖整个订阅，不再只算当前模型：`muse-wonder-1.0` 和 `muse-wonder-full-1.0` 被拒时给的是同一个重置时间。
+- 容量排队写入 `capacity-waits.jsonl`：等了 1 秒以上才入场的和最终被拒的，含当时谁占着名额。此前半小时采样看不出等了多久、谁放弃了。
+
 ## [4.0.0] - 2026-11-05
 
 破坏性版本：Go 的 TUI、server、引擎和 Python 流水线移除，见下。不再发布预编译包；用源码安装。
