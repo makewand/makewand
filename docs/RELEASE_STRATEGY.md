@@ -32,8 +32,8 @@
     [ci.yml](../.github/workflows/ci.yml) (`workflow_call`), and publication
     also waits for `package-smoke` and the native Windows gate
   - [native-windows.yml](../.github/workflows/native-windows.yml) (reusable;
-    also run on every push and pull request by
-    [architecture.yml](../.github/workflows/architecture.yml))
+    also run on Mondays and by hand by
+    [windows-weekly.yml](../.github/workflows/windows-weekly.yml))
 - Website deployment (`site/`, including the `install.sh` one-liner):
   - [deploy-site.yml](../.github/workflows/deploy-site.yml), see
     [CLOUDFLARE_WEBSITE_DEPLOYMENT.md](CLOUDFLARE_WEBSITE_DEPLOYMENT.md)
@@ -63,8 +63,8 @@
    `CHANGELOG.md`; `bash scripts/check_version.sh --tag vX.Y.Z` must pass.
 2. Run `make prelaunch` (see [PRELAUNCH.md](PRELAUNCH.md)).
 3. (Recommended) run live probe: `MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch`.
-4. Confirm the CI run for the release commit is green, and the
-   `native-windows / verify` check of the Architecture runtime workflow too.
+4. Confirm the CI run for the release commit is green, and run the Windows
+   weekly workflow by hand on that commit.
    Branch protection on `master` requires only the `verify` check, does not
    enforce it for admins and does not require pull requests, so a red CI does
    **not** block a direct push, and nothing requires the native Windows gate
