@@ -672,6 +672,20 @@ class RoutingCliTests(unittest.TestCase):
         reasons = {item["provider"]: item["reason"] for item in payload["skipped"]}
         self.assertIn(f"部分模型受限（{models[0]}）", reasons["agy"])
 
+    def test_a_codex_review_gets_a_shorter_time_limit(self):
+        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        self.assertEqual(payload["timeout"], 5400)
+        by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
+        self.assertIn("--timeout 1800 --total-timeout 1800", by_tool["codex"])
+        self.assertIn("--timeout 5400 --total-timeout 5400", by_tool["agy"])
+
+    def test_a_requested_time_limit_applies_to_codex_too(self):
+        payload = self.route_json("review", "hard", "--risk", "high", "--total-timeout", "4000", quota={})
+        by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
+        self.assertIn("--timeout 4000 --total-timeout 4000", by_tool["codex"])
+        implement = self.route_json("implement", "hard", quota={})
+        self.assertNotIn("provider_timeouts", implement)
+
     def test_mark_rejects_a_blank_or_ambiguous_model(self):
         for model in ("", " ", "a:b"):
             result = self.run_cli("mark", "muse", "6h", "--model", model, quota={})

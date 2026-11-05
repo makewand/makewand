@@ -47,6 +47,8 @@ _OUTCOME_HINT = (
     " --request-id <请求ID> --caller <发起工具>"
     "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls，批准须带 --candidate-hash <SHA256>）"
 )
+# Codex reviews finished within 692 seconds over two weeks; a hung one holds its only slot.
+_CODEX_REVIEW_TIMEOUT = 1800
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _UNIT_ORDER = {"d": 0, "h": 1, "m": 2, "s": 3}
@@ -154,7 +156,24 @@ def _execution_options(task_type, difficulty, tier=1, total_timeout=None) -> dic
         timeout = total_timeout
     if float(timeout).is_integer():
         timeout = int(timeout)
-    return {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
+    options = {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
+    if task_type == "review" and total_timeout is None and timeout > _CODEX_REVIEW_TIMEOUT:
+        options["provider_timeouts"] = {"codex": _CODEX_REVIEW_TIMEOUT}
+    return options
+
+
+def weekly_forecasts(policy) -> dict:
+    """Provider -> warning for the pools that run out before their reset. Display only."""
+    from makewand.pacing import weekly_forecast
+    forecasts = {}
+    for provider, gate in (("codex", policy.codex_max_weekly), ("claude", policy.claude_max_weekly)):
+        try:
+            note = weekly_forecast(provider, gate)
+        except Exception:
+            note = None
+        if note:
+            forecasts[provider] = note
+    return forecasts
 
 
 def _request_arguments(execution_options, *, include_maximum=False):
@@ -176,8 +195,9 @@ def _command_for(candidate, execution_options) -> str:
              "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls",
              str(execution_options.get("request_budget", 1))]
     parts += _request_arguments(execution_options)
-    parts += ["--timeout", str(math.ceil(execution_options["timeout"])),
-              "--total-timeout", str(execution_options["total_timeout"])]
+    timeout = execution_options.get("provider_timeouts", {}).get(candidate.provider)
+    parts += ["--timeout", str(math.ceil(timeout or execution_options["timeout"])),
+              "--total-timeout", str(timeout or execution_options["total_timeout"])]
     if execution_options["readonly"]:
         parts.append("--readonly")
     return " ".join(parts)
@@ -289,6 +309,9 @@ def cmd_route(args) -> None:
             "escalate_tier": result.escalate_tier,
             "budget": budget,
         }
+        forecasts = weekly_forecasts(policy)
+        if forecasts:
+            payload["quota_warnings"] = list(forecasts.values())
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -311,6 +334,7 @@ def cmd_route(args) -> None:
     if result.skipped:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
+    lines.extend(f"  注意：{note}" for note in weekly_forecasts(policy).values())
     if not result.candidates:
         if result.escalate_tier is not None:
             lines.append("  没有可用候选：可以升一档，或等额度恢复、暂停结束后再试。")

@@ -72,6 +72,33 @@ def merge_limits(previous, incoming):
     return sorted(rows.values(), key=_written_at)[-128:]
 
 
+def _live_refusals(info, identity):
+    """The stored refusals of this account that have not expired."""
+    from makewand.health import is_reset_time_passed, status_age_seconds
+    for row in info["quota_limits"]:
+        if not isinstance(row, dict) or row.get("status") != "limited":
+            continue
+        scope = row.get("quota_scope")
+        if not isinstance(scope, dict) or scope.get("account_ref") != identity["account_ref"]:
+            continue
+        # Known account aliases share a pool; unknown directories do not.
+        if not identity["identity_known"] and scope.get("credential_root") != identity["credential_root"]:
+            continue
+        if status_age_seconds(row) is None or is_reset_time_passed(
+                row.get("resets_at"), row.get("updated_at", ""), row.get("hold_seconds")):
+            continue
+        yield row
+
+
+def refused_models(provider, info):
+    """(model, reason) of each model this account's provider is currently refusing."""
+    if not isinstance(info, dict) or not isinstance(info.get("quota_limits"), list):
+        return []
+    identity = selected_scope(provider)
+    return [(row["quota_scope"]["model"], str(row.get("reason") or "供应商拒绝") + _hold_note(row))
+            for row in _live_refusals(info, identity) if row["quota_scope"].get("model")]
+
+
 def projected_status(provider, info, model=None, identity=None):
     """Project a scoped refusal without changing its observation or other rows."""
     if not isinstance(info, dict):
@@ -108,22 +135,9 @@ def projected_status(provider, info, model=None, identity=None):
     if not isinstance(info.get("quota_limits"), list):
         return info
     identity = identity or selected_scope(provider)
-    matches = []
-    for row in info["quota_limits"]:
-        if not isinstance(row, dict) or row.get("status") != "limited":
-            continue
-        scope = row.get("quota_scope")
-        if not isinstance(scope, dict) or scope.get("account_ref") != identity["account_ref"]:
-            continue
-        # Known account aliases share a pool; unknown directories do not.
-        if not identity["identity_known"] and scope.get("credential_root") != identity["credential_root"]:
-            continue
-        if scope.get("model") and not model_matches(scope["model"], canonical_model(provider, model)):
-            continue
-        age = status_age_seconds(row)
-        if age is None or is_reset_time_passed(row.get("resets_at"), row.get("updated_at", ""), row.get("hold_seconds")):
-            continue
-        matches.append(row)
+    matches = [row for row in _live_refusals(info, identity)
+               if not row["quota_scope"].get("model")
+               or model_matches(row["quota_scope"]["model"], canonical_model(provider, model))]
     result = dict(info)
     if matches:
         from makewand.health import _written_at

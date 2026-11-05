@@ -1096,10 +1096,13 @@ def _sanitize_cache(cache: Dict[str, Any]) -> Dict[str, Any]:
                     elif reserve_gate and info.get("status") == "limited":
                         # Sufficient quota is not a new successful health probe.
                         info["status"] = "unknown"
-                        info["reason"] = f"官方额度达到当前保护阈值；可用性待实际派发验证: {off_q.get('desc')}"
+                        info["reason"] = f"官方额度已回到保护阈值以内；可用性待实际派发验证: {off_q.get('desc')}"
                         info["resets_at"] = None
                         info["updated_at"] = now_dt.isoformat()
                         info["quota_reserve_gate"] = True
+                    elif reserve_gate and info.get("status") == "unknown":
+                        # Keep the stored reading current; it is not a new observation of the provider.
+                        info["reason"] = f"官方额度已回到保护阈值以内；可用性待实际派发验证: {off_q.get('desc')}"
         if isinstance(info, dict):
             age = status_age_seconds(info)
             info["stale"] = bool(

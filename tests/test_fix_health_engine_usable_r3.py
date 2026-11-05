@@ -24,10 +24,13 @@ import os
 import io
 import json
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+
+from makewand.outcome_ledger import Mark
 
 import makewand.config as config
 import makewand.health as health
@@ -264,6 +267,27 @@ class TestStatusRecommendsOnlyUsableEngines(unittest.TestCase):
             cli.cmd_status(args)
         text = out.getvalue()
         return text.split("Dynamic Topology")[1].split("AI 工具开关")[0]
+
+    def test_status_names_marks_and_refused_models(self):
+        identity = {"credential_root": "/x", "account_ref": "a", "identity_known": True, "pool_ref": "p"}
+        row = {"status": "limited", "reason": "额度用完", "resets_at": "待重置", "source": "dispatch",
+               "updated_at": datetime.now().isoformat(), "quota_scope": dict(identity, model="m-full")}
+        cache = {"claude": live("healthy"), "codex": dict(live("healthy"), quota_limits=[row]),
+                 "agy": live("healthy")}
+        marks = {"codex:m-other": Mark(time.time() + 3600, "周额度"), "claude": Mark(time.time() + 3600, "")}
+        out = io.StringIO()
+        args = argparse.Namespace(json=False, probe=False, repo_trust="trusted", cwd=None)
+        with routing(pool=("claude", "codex", "agy")), patch("makewand.cli.get_or_update_status", return_value=cache), \
+             patch("makewand.model_quota.selected_scope", return_value=identity), \
+             patch("makewand.outcome_ledger.OutcomeLedger.active_marks", return_value=marks), \
+             patch("makewand.route_cli.weekly_forecasts", return_value={"codex": "codex 周额度预计到线"}), \
+             contextlib.redirect_stdout(out):
+            cli.cmd_status(args)
+        text = out.getvalue()
+        self.assertIn("受限模型: m-full（额度用完）", text)
+        self.assertIn("额度标记: m-other 到", text)
+        self.assertIn("额度标记: 整个工具 到", text)
+        self.assertIn("消耗预测: codex 周额度预计到线", text)
 
     def test_nothing_is_recommended_when_every_engine_is_in_error(self):
         cache = {e: live("error", reason=f"{e} broken", source="dispatch") for e in ("claude", "codex", "agy")}

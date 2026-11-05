@@ -9,6 +9,9 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- `route` 和 `status` 在 Codex、Claude 周额度按目前速度会在重置前到线时给出预计时间。
+- `status` 显示额度标记和正在拒绝的模型；额度恢复后不再显示“达到保护阈值”和旧读数；推荐分工注明实际派发以 `route` 为准。
+- `route` 给 Codex 审查的默认时限从 5400 秒降到 1800 秒（两周内成功调用最长 692 秒），调用方指定 `--total-timeout` 时不变。
 - `makewand mark` 新增 `--model`，只标记一个模型，同一工具的其他模型照常参选；此前一条标记会跳过整个工具。
 - 没有重置时间的额度拒绝，同一账号和模型连续被拒时保留时间从 2 小时延长到 6 小时、24 小时；这个模型有真实成功或在保留结束后安静 1 天就重新从 2 小时算。Grok 和 Muse 不再把估计的 2 小时当成官方重置时间。使用记录新增 `model` 字段。
 - Grok 只读任务的轮数上限从 25 提高到 80；`Error: max turns reached` 现在记为已知失败，不再记成结果未知。
