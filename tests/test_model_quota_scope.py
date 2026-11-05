@@ -40,6 +40,125 @@ class ModelQuotaScopeTests(unittest.TestCase):
     def info(self, provider):
         return health.load_status_cache().get(provider, {})
 
+    def _age_refusals(self, provider, seconds):
+        """Move this provider's stored refusals into the past."""
+        path = self.root / "status.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        def older(row):
+            row["updated_at"] = (datetime.fromisoformat(row["updated_at"]) - timedelta(seconds=seconds)).isoformat()
+        older(data[provider])
+        for row in data[provider].get("quota_limits", []):
+            older(row)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def _refuse(self, provider="agy", model="gemini-4-argon-high", reset="待重置"):
+        health.record_engine_limit(provider, "fixture refusal", reset, model=model)
+        return self.info(provider)["quota_limits"][-1].get("hold_seconds", health.UNKNOWN_RESET_HOLDS[0])
+
+    def _limited(self, provider="agy", model="gemini-4-argon-high"):
+        return model_quota.quota_reason(provider, model, quota=False, info=self.info(provider))
+
+    def _usage(self):
+        guard = patch("makewand.usage._get_active_usage_file", return_value=self.root / "usage.json")
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def test_a_pool_that_keeps_refusing_is_held_longer_each_time(self):
+        self._usage()
+        hours = 3600
+        self.assertEqual(self._refuse(), 2 * hours)
+        self.assertIsNotNone(self._limited())
+        self._age_refusals("agy", 2 * hours + 60)
+        self.assertIsNone(self._limited())
+        self.assertEqual(self._refuse(), 6 * hours)
+        self._age_refusals("agy", 3 * hours)
+        self.assertIn("连续被拒", self._limited())
+        self._age_refusals("agy", 3 * hours + 60)
+        self.assertIsNone(self._limited())
+        self.assertEqual(self._refuse(), 24 * hours)
+        self._age_refusals("agy", 24 * hours + 60)
+        self.assertIsNone(self._limited())
+        self.assertEqual(self._refuse(), 24 * hours)
+
+    def test_a_late_refusal_during_the_hold_does_not_move_its_end(self):
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 3600)
+        before = self.info("agy")["quota_limits"][-1]["updated_at"]
+        self._refuse()
+        self.assertEqual(self.info("agy")["quota_limits"][-1]["updated_at"], before)
+
+    def test_a_success_during_the_hold_starts_over(self):
+        from makewand import usage
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        self._refuse()
+        self._age_refusals("agy", 3600)
+        usage.record_engine_usage("agy", success=True, route="cli", model="gemini-4-argon-high")
+        self.assertEqual(self._refuse(), 2 * 3600)
+        self.assertNotIn("hold_seconds", self.info("agy")["quota_limits"][-1])
+
+    def test_an_api_relay_success_says_nothing_about_the_subscription(self):
+        from makewand import usage
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        usage.record_engine_usage("agy", success=True, route="api", model="gemini-4-argon-high")
+        self.assertEqual(self._refuse(), 6 * 3600)
+
+    def test_a_damaged_status_file_still_records_the_refusal(self):
+        with patch("makewand.model_quota.hold_after_refusal", side_effect=TypeError("damaged")):
+            health.record_engine_limit("agy", "fixture refusal", "待重置", model="gemini-4-argon-high")
+        self.assertIsNotNone(self._limited())
+
+    def test_a_success_on_that_model_starts_over(self):
+        from makewand import usage
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        usage.record_engine_usage("agy", success=True, route="cli", model="claude-opus-5-5-high")
+        usage.record_engine_usage("agy", success=False, route="cli", model="gemini-4-argon-high")
+        usage.record_engine_usage("agy", success=True, route="cli")
+        self.assertEqual(self._refuse(), 6 * 3600)
+        self._age_refusals("agy", 6 * 3600 + 60)
+        usage.record_engine_usage("agy", success=True, route="cli", model="gemini-4-argon-medium")
+        self.assertEqual(self._refuse(), 2 * 3600)
+
+    def test_a_quiet_day_after_the_hold_starts_over(self):
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        self._refuse()
+        self._age_refusals("agy", 6 * 3600 + 24 * 3600 + 60)
+        self.assertEqual(self._refuse(), 2 * 3600)
+
+    def test_a_named_reset_time_is_not_held_longer(self):
+        self._usage()
+        self.assertEqual(self._refuse(reset=self.reset), 2 * 3600)
+        self.assertEqual(self._refuse(reset=self.reset), 2 * 3600)
+        self.assertNotIn("hold_seconds", self.info("agy")["quota_limits"][-1])
+
+    def test_each_model_keeps_its_own_hold(self):
+        self._usage()
+        self._refuse(provider="muse", model="muse-wonder-full-1.0")
+        self._age_refusals("muse", 2 * 3600 + 60)
+        self.assertEqual(self._refuse(provider="muse", model="muse-spark-1.3"), 2 * 3600)
+        self.assertEqual(self._refuse(provider="muse", model="muse-wonder-full-1.0"), 6 * 3600)
+
+    def test_a_stored_hold_outside_the_known_steps_counts_as_the_shortest(self):
+        for hold in (True, "86400", 99 * 86400, -1, None, 7200.0):
+            self.assertEqual(health.unknown_reset_hold(hold), 2 * 3600, hold)
+        observed = (datetime.now() - timedelta(hours=3)).isoformat()
+        self.assertTrue(health.is_reset_time_passed("待重置", observed, 99 * 86400))
+        self.assertFalse(health.is_reset_time_passed("待重置", observed, 6 * 3600))
+
+    def test_grok_and_muse_refusals_without_a_time_name_no_reset(self):
+        from makewand.providers.grok import parse_grok_quota
+        from makewand.providers.muse import parse_muse_quota
+        self.assertEqual(parse_grok_quota("", "API error (status 429)")[2], "待重置")
+        self.assertEqual(parse_muse_quota("", "rate limited (http 429 · attempt 2)")[2], "待重置")
+
     def test_agy_native_failure_does_not_block_opus_or_sonnet(self):
         health.record_engine_limit("agy", "fixture native refusal", self.reset, model="gemini-4-argon-high")
         for model in ("claude-opus-5-5-high", "claude-sonnet-5-5-high"):

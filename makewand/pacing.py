@@ -17,7 +17,7 @@ Scope, stated honestly:
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Tuple
 
 from makewand.config import (
@@ -134,6 +134,30 @@ def parse_reset_time_to_seconds_left(resets_at_str: Optional[str], updated_at: O
         return None
     current = now.astimezone() if now.tzinfo is None else now
     return max(0.0, (reset - current).total_seconds())
+
+
+def weekly_forecast(provider: str, gate: float) -> Optional[str]:
+    """A warning when a weekly pool reaches `gate` percent at the pace so far, before its reset."""
+    from makewand.health import _get_official_subscription_quota
+    quota = _get_official_subscription_quota(provider)
+    if not isinstance(quota, dict) or quota.get("source") != "official" or quota.get("window_minutes") != 10080:
+        return None
+    remaining = quota.get("percentage")
+    seconds_left = parse_reset_time_to_seconds_left(quota.get("resets_at"), updated_at=quota.get("observed_at"))
+    if not isinstance(remaining, (int, float)) or seconds_left is None:
+        return None
+    used = 100.0 - remaining
+    elapsed = 10080 * 60 - seconds_left
+    # The first hours of a window say little about its pace.
+    if elapsed < 3 * 3600 or used <= 0 or used >= gate:
+        return None
+    seconds_to_gate = (gate - used) * elapsed / used
+    if seconds_to_gate >= seconds_left:
+        return None
+    now = datetime.now()
+    at, reset = now + timedelta(seconds=seconds_to_gate), now + timedelta(seconds=seconds_left)
+    return (f"{provider} 周额度已用 {used:g}%，按目前速度约 {at:%m-%d %H:%M} 到 {gate:g}%，"
+            f"重置要到 {reset:%m-%d %H:%M}")
 
 
 def calculate_dynamic_pacing(

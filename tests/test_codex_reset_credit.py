@@ -309,6 +309,15 @@ class RouteRestoreTests(unittest.TestCase):
         restore.assert_called_once_with("route")
         self.assertNotIn("codex", self.ledger.active_marks())
 
+    def test_a_redeemed_reset_also_clears_marks_on_single_models(self):
+        self.ledger.mark("codex:gpt-x", self.mark.until, "周额度")
+        self.ledger.mark("muse:m", self.mark.until, "别家")
+        answer, _ = self._restore("部分模型受限（m）：limit", marked=False, gate="limit")
+        self.assertTrue(answer)
+        marks = self.ledger.active_marks()
+        self.assertNotIn("codex:gpt-x", marks)
+        self.assertIn("muse:m", marks)
+
     def test_a_route_blocked_by_the_gate_redeems(self):
         answer, restore = self._restore("部分模型受限（m）：limit", marked=False, gate="limit")
         self.assertTrue(answer)

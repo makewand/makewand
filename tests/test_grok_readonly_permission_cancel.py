@@ -63,6 +63,17 @@ class GrokReadonlyReplyTests(unittest.TestCase):
         self.assertFalse(outcome.success)
         self.assertEqual(outcome.error_kind, "incomplete_turn")
 
+    def test_the_turn_limit_exit_is_a_known_failure(self):
+        with patch("makewand.cli_failure_log.record") as logged:
+            outcome, command = self._run((1, "partial", "Error: max turns reached\n", None))
+        self.assertEqual((outcome.status, outcome.error_kind, outcome.outcome_known), ("FAILED", "incomplete_turn", True))
+        self.assertEqual(_values(command, "--max-turns"), ["80"])
+        logged.assert_not_called()
+
+    def test_the_answer_cannot_claim_the_turn_limit(self):
+        outcome, _ = self._run((1, "Error: max turns reached", "", None))
+        self.assertEqual(outcome.status, "UNKNOWN")
+
     def test_a_json_error_still_reaches_limit_detection(self):
         message = "API error (status 402 Payment Required): limit reached"
         with patch("makewand.providers.grok.parse_grok_quota", return_value=(False, "", None)) as parse:

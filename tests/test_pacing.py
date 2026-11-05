@@ -127,5 +127,40 @@ class TestDynamicQuotaPacing(unittest.TestCase):
         self.assertIn("astra", model.lower())
 
 
+class WeeklyForecastTests(unittest.TestCase):
+    def forecast(self, used, hours_left, window=10080, gate=90):
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        from makewand.pacing import weekly_forecast
+        quota = {"source": "official", "percentage": 100 - used, "window_minutes": window,
+                 "resets_at": (datetime.now(timezone.utc) + timedelta(hours=hours_left)).isoformat(),
+                 "observed_at": datetime.now(timezone.utc).isoformat()}
+        with patch("makewand.health._get_official_subscription_quota", return_value=quota):
+            return weekly_forecast("codex", gate)
+
+    def test_a_pool_on_course_to_run_out_says_when(self):
+        note = self.forecast(35, 148)
+        self.assertIn("codex 周额度已用 35%", note)
+        self.assertIn("到 90%", note)
+        self.assertIn("重置要到", note)
+
+    def test_a_pool_that_lasts_says_nothing(self):
+        self.assertIsNone(self.forecast(10, 100))
+
+    def test_the_first_hours_and_other_windows_say_nothing(self):
+        self.assertIsNone(self.forecast(20, 166))
+        self.assertIsNone(self.forecast(50, 2, window=300))
+
+    def test_a_pool_past_its_gate_says_nothing(self):
+        self.assertIsNone(self.forecast(95, 100))
+
+    def test_no_official_reading_says_nothing(self):
+        from unittest.mock import patch
+        from makewand.pacing import weekly_forecast
+        for quota in (None, {"source": "estimate", "percentage": 10, "window_minutes": 10080}):
+            with patch("makewand.health._get_official_subscription_quota", return_value=quota):
+                self.assertIsNone(weekly_forecast("codex", 90))
+
+
 if __name__ == "__main__":
     unittest.main()

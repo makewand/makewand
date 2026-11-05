@@ -21,7 +21,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "bin" / "makewand"
 WORKER_ENV = "MAKEWAND_PROVIDER_WORKER"
-FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
+FOOTER = ("派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>（只限某个模型时加 --model <模型>）；"
           "验收后记录成绩：makewand outcome <工具> <档> <类型> pass|fail"
           " --model <模型> --effort <推理深度>"
           " --request-id <请求ID> --caller <发起工具>"
@@ -379,13 +379,17 @@ class RoutingCliTests(unittest.TestCase):
                     self.assertTrue(commands)
                     payload = self.route_json(task_type, difficulty, "--simple", quota={})
                     self.assertTrue(payload["candidates"])
-                    for item in [payload, *payload["candidates"]]:
-                        self.assertEqual(item["timeout"], timeout)
-                        self.assertEqual(item["total_timeout"], timeout)
+                    self.assertEqual(payload["timeout"], timeout)
+                    codex_cap = 1800 if task_type == "review" else timeout
+                    for item in payload["candidates"]:
+                        wanted = min(timeout, codex_cap) if item["provider"] == "codex" else timeout
+                        self.assertEqual(item["timeout"], wanted)
+                        self.assertEqual(item["total_timeout"], wanted)
                         self.assertEqual(item["readonly"], task_type == "review")
                     commands += [item["command"] for item in payload["candidates"]]
                     for command in commands:
-                        self.assertIn(f"--timeout {timeout} --total-timeout {timeout}", command)
+                        wanted = min(timeout, codex_cap) if " codex " in command else timeout
+                        self.assertIn(f"--timeout {wanted} --total-timeout {wanted}", command)
                         self.assertEqual("--readonly" in command, task_type == "review")
 
     def test_route_timeout_tracks_tier_risk_and_explicit_total(self):
@@ -656,6 +660,41 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertEqual(caught.exception.args[0], expected)
 
     # ---------- mark ----------
+
+    def test_mark_on_one_model_leaves_its_siblings_routable(self):
+        before = self.route_json("review", "hard", "--risk", "high", quota={})["candidates"]
+        models = sorted({item["model"] for item in before if item["provider"] == "agy"})
+        self.assertGreater(len(models), 1)
+        result = self.run_cli("mark", "agy", "6h", "--model", models[0], "--reason", "周额度", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"agy 的 {models[0]}", result.stdout)
+        marks = json.loads((self.routing_dir / "marks.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(marks), [f"agy:{models[0]}"])
+        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        left = {item["model"] for item in payload["candidates"] if item["provider"] == "agy"}
+        self.assertEqual(left, set(models[1:]))
+        reasons = {item["provider"]: item["reason"] for item in payload["skipped"]}
+        self.assertIn(f"部分模型受限（{models[0]}）", reasons["agy"])
+
+    def test_a_codex_review_gets_a_shorter_time_limit(self):
+        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        self.assertEqual(payload["timeout"], 5400)
+        by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
+        self.assertIn("--timeout 1800 --total-timeout 1800", by_tool["codex"])
+        self.assertIn("--timeout 5400 --total-timeout 5400", by_tool["agy"])
+
+    def test_a_requested_time_limit_applies_to_codex_too(self):
+        payload = self.route_json("review", "hard", "--risk", "high", "--total-timeout", "4000", quota={})
+        by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
+        self.assertIn("--timeout 4000 --total-timeout 4000", by_tool["codex"])
+        implement = self.route_json("implement", "hard", quota={})
+        self.assertNotIn("provider_timeouts", implement)
+
+    def test_mark_rejects_a_blank_or_ambiguous_model(self):
+        for model in ("", " ", "a:b"):
+            result = self.run_cli("mark", "muse", "6h", "--model", model, quota={})
+            self.assertNotEqual(result.returncode, 0, model)
+        self.assertFalse((self.routing_dir / "marks.json").exists())
 
     def test_mark_writes_and_route_skips(self):
         result = self.run_cli("mark", "codex", "6h", "--reason", "额度用完", quota={})

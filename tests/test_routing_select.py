@@ -319,6 +319,23 @@ class SelectTests(unittest.TestCase):
         self.assertEqual(names, ["agy", "grok"])
         self.assertFalse(self.ledger.outcomes_path.exists())
 
+    def test_a_mark_on_one_model_matches_only_that_model(self):
+        from makewand.route_select import _model_mark_reason as reason
+        self.ledger.mark("agy:gemini-4-argon-high", self.now + 3600, "Gemini 用完")
+        marks = self.ledger.active_marks(self.now)
+        self.assertEqual(reason(marks, "agy", "gemini-4-argon-medium", self.now), "额度标记未过期：Gemini 用完")
+        for provider, model in (("agy", "claude-opus-5-5-high"), ("agy", None), ("muse", "gemini-4-argon-high")):
+            self.assertIsNone(reason(marks, provider, model, self.now))
+        self.assertIsNone(reason(self.ledger.active_marks(self.now + 3600), "agy", "gemini-4-argon-high", self.now + 3600))
+
+    def test_the_quota_gate_outranks_a_mark_on_one_model(self):
+        rows = candidates(3, full=True, discovered={})
+        model = next(row.model for row in rows if row.provider == "codex")
+        self.ledger.mark(f"codex:{model}", self.now + 3600, "模型标记")
+        result = self._select(task_type="review", difficulty="hard", quota_reader=lambda: {"codex": (100, "")},
+                              not_tool="claude", full=True)
+        self.assertNotIn("模型标记", dict(result.skipped)["codex"])
+
     def test_weekly_threshold_skips_codex_and_claude_only(self):
         def reader():
             return {
