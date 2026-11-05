@@ -17,4 +17,3 @@ func lockUserHandle(f *os.File, exclusive bool) error {
 func unlockUserHandle(f *os.File) error {
 	return windows.UnlockFileEx(windows.Handle(f.Fd()), 0, 1, 0, &windows.Overlapped{})
 }
-func syncUserDirectory(string) error { return nil }
