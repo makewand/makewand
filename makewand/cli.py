@@ -136,7 +136,7 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
         return result
     try:
         record_engine_usage(engine, tier=kwargs.get("tier", "standard"), success=result[0], task=prompt,
-                            route=route.route)
+                            route=route.route, model=kwargs.get("model"))
     except Exception:
         pass
     return result
@@ -316,7 +316,17 @@ def cmd_status(args):
     # 1. Active Tools Section
     print(c(f"--- 🟢 已激活可用工具池 (Active Dynamic Pool: N={len(active_tools)}) ---", COLOR_BOLD + COLOR_GREEN))
     if active_tools:
+        from datetime import datetime
         from makewand.health import calculate_provider_quota, format_quota_bar, get_reauth_hint
+        from makewand.model_quota import refused_models
+        from makewand.outcome_ledger import OutcomeLedger
+        from makewand.route_cli import weekly_forecasts
+        from makewand.route_select import load_policy
+        marks = OutcomeLedger().active_marks()
+        try:
+            forecasts = weekly_forecasts(load_policy())
+        except ValueError:
+            forecasts = {}
         for key in active_tools:
             info = cache.get(key, {})
             status = info.get("status", "unknown")
@@ -341,6 +351,14 @@ def cmd_status(args):
                 print(f"      额度指示: {bar}  ({quota_desc})")
             if reason and reason != quota_desc and not (status == "healthy" and "运行正常" in reason and "运行正常" in quota_desc):
                 print(f"      运行状态: {reason}")
+            for model, why in refused_models(key, info):
+                print(f"      受限模型: {model}（{why}）")
+            for name, mark in marks.items():
+                if name == key or name.startswith(key + ":"):
+                    subject = name.partition(":")[2] or "整个工具"
+                    print(f"      额度标记: {subject} 到 {datetime.fromtimestamp(mark.until):%m-%d %H:%M}（{mark.reason or '无说明'}）")
+            if key in forecasts:
+                print(c(f"      消耗预测: {forecasts[key]}", COLOR_YELLOW))
             if status == "needs_auth" and "重新登录" not in f"{reason}{quota_desc}":
                 print(c(f"      操作提示: {get_reauth_hint(key)}", COLOR_YELLOW))
             if resets:
@@ -387,6 +405,7 @@ def cmd_status(args):
         print(f"     • 活跃工具池: {c(', '.join(active_tools), COLOR_CYAN)}")
         print(f"     • 推荐通用分工: 主力实现 [{c(coder, COLOR_BOLD)}] -> 独立跨模型红队盲审 [{c(reviewer, COLOR_BOLD)}]")
         print(f"     • 调度机制: 自动按任务类型 (代码/架构/审查/自愈) 进行领域自适应，零人工配置负担。")
+        print("     • 实际派发以 makewand route 为准（按额度和成绩实时选择）。")
     elif active_tools:
         single = coders[0]
         if len(active_tools) == 1:
@@ -1695,6 +1714,7 @@ def _main():
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
     p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
     p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
+    p_mark.add_argument("--model", dest="mark_model", default=None, help="只标记这一个模型，同一工具的其他模型照常参选")
 
     p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
     p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")

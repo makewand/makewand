@@ -4,7 +4,7 @@ Grok Build CLI provider adapter (xAI subscription / Grok Build interactive codin
 
 import json
 import os
-from datetime import datetime, timedelta
+import re
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
 from makewand.execution_contract import ExecutionResult
@@ -28,8 +28,7 @@ def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
         reset_time = extract_reset_phrase(line)
         if reset_time:
             return True, f"xAI 订阅额度耗尽或频次受限 (429 / {reset_time})", reset_time
-        iso_reset = (datetime.now() + timedelta(hours=2)).isoformat()
-        return True, "xAI 订阅额度耗尽或频次受限 (429)", iso_reset
+        return True, "xAI 订阅额度耗尽或频次受限 (429)", "待重置"
 
     return False, "", None
 
@@ -74,6 +73,10 @@ _READONLY_RULES = (
     "which, joined only by pipes, && or ;. Do not use sed, find, awk, python, xargs or tee, or subshells, "
     "command substitution, redirection or background jobs."
 )
+# Reviews of a large repository commonly take 40 to 60 turns; the run's timeout still bounds it.
+_READONLY_MAX_TURNS = 80
+# Grok's own line when the limit stops a run with a nonzero exit.
+_MAX_TURNS_ERROR = re.compile(r"^error: max turns reached\s*$", re.IGNORECASE | re.MULTILINE)
 # Exit code 0 with one of these is not a finished answer.
 _INCOMPLETE_STOP_REASONS = frozenset(("cancelled", "refusal", "max_tokens", "max_turn_requests"))
 
@@ -191,7 +194,7 @@ def execute_grok_task(
             cmd = ["grok", "-p", prompt, "--output-format", output_format]
 
         if readonly:
-            cmd.extend(["--permission-mode", "plan", "--max-turns", "25", "--rules", _READONLY_RULES])
+            cmd.extend(["--permission-mode", "plan", "--max-turns", str(_READONLY_MAX_TURNS), "--rules", _READONLY_RULES])
             for rule in _READONLY_ALLOW_RULES:
                 cmd.extend(["--allow", rule])
             for rule in _READONLY_DENY_RULES:
@@ -282,6 +285,12 @@ def execute_grok_task(
 
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("grok", code, combined, err, ex, readonly)
+
+    if apart and _MAX_TURNS_ERROR.search(err or ""):
+        # The model ran and stopped at a known limit, so the outcome is not in doubt.
+        return ExecutionResult(
+            False, out, f"Grok 未完成本轮（已到 --max-turns {_READONLY_MAX_TURNS} 上限）",
+            status="FAILED", engine="grok", readonly=readonly, outcome_known=True, error_kind="incomplete_turn")
 
     is_limited, reason, resets = parse_grok_quota(out, own_lines if apart else None)
     if is_limited:

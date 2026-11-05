@@ -47,6 +47,8 @@ _OUTCOME_HINT = (
     " --request-id <请求ID> --caller <发起工具>"
     "（review 另带 --candidate-verdict pass|fail|unverified 与实测 --seconds/--calls，批准须带 --candidate-hash <SHA256>）"
 )
+# Codex reviews finished within 692 seconds over two weeks; a hung one holds its only slot.
+_CODEX_REVIEW_TIMEOUT = 1800
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 _UNIT_ORDER = {"d": 0, "h": 1, "m": 2, "s": 3}
@@ -154,7 +156,24 @@ def _execution_options(task_type, difficulty, tier=1, total_timeout=None) -> dic
         timeout = total_timeout
     if float(timeout).is_integer():
         timeout = int(timeout)
-    return {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
+    options = {"timeout": timeout, "total_timeout": timeout, "readonly": task_type == "review"}
+    if task_type == "review" and total_timeout is None and timeout > _CODEX_REVIEW_TIMEOUT:
+        options["provider_timeouts"] = {"codex": _CODEX_REVIEW_TIMEOUT}
+    return options
+
+
+def weekly_forecasts(policy) -> dict:
+    """Provider -> warning for the pools that run out before their reset. Display only."""
+    from makewand.pacing import weekly_forecast
+    forecasts = {}
+    for provider, gate in (("codex", policy.codex_max_weekly), ("claude", policy.claude_max_weekly)):
+        try:
+            note = weekly_forecast(provider, gate)
+        except Exception:
+            note = None
+        if note:
+            forecasts[provider] = note
+    return forecasts
 
 
 def _request_arguments(execution_options, *, include_maximum=False):
@@ -176,15 +195,16 @@ def _command_for(candidate, execution_options) -> str:
              "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls",
              str(execution_options.get("request_budget", 1))]
     parts += _request_arguments(execution_options)
-    parts += ["--timeout", str(math.ceil(execution_options["timeout"])),
-              "--total-timeout", str(execution_options["total_timeout"])]
+    timeout = execution_options.get("provider_timeouts", {}).get(candidate.provider)
+    parts += ["--timeout", str(math.ceil(timeout or execution_options["timeout"])),
+              "--total-timeout", str(timeout or execution_options["total_timeout"])]
     if execution_options["readonly"]:
         parts.append("--readonly")
     return " ".join(parts)
 
 
 def _candidate_payload(item, execution_options) -> dict:
-    return {
+    payload = {
         "provider": item.provider,
         "model": item.model,
         "effort": item.effort,
@@ -195,6 +215,10 @@ def _candidate_payload(item, execution_options) -> dict:
         "command": _command_for(item, execution_options),
         **execution_options,
     }
+    timeout = payload.pop("provider_timeouts", {}).get(item.provider)
+    if timeout:
+        payload.update(timeout=timeout, total_timeout=timeout)
+    return payload
 
 
 def _restore_codex_reset(policy, result, not_tool) -> bool:
@@ -215,8 +239,10 @@ def _restore_codex_reset(policy, result, not_tool) -> bool:
         gate = quota_reason("codex", policy=policy)
         if not (_mark_reason(mark, now) == reason or (gate and gate in reason)) or not restore_quota("route"):
             return False
-        if mark is not None:
-            ledger.mark("codex", time.time(), "额度已由赠送重置恢复", only_if=mark)
+        # The reset restored the whole weekly pool, so marks on single models go too.
+        for name, held in ledger.active_marks().items():
+            if name == "codex" or name.startswith("codex:"):
+                ledger.mark(name, time.time(), "额度已由赠送重置恢复", only_if=held)
         return True
     except (ValueError, OSError):
         return False
@@ -289,6 +315,9 @@ def cmd_route(args) -> None:
             "escalate_tier": result.escalate_tier,
             "budget": budget,
         }
+        forecasts = weekly_forecasts(policy)
+        if forecasts:
+            payload["quota_warnings"] = list(forecasts.values())
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
@@ -311,6 +340,7 @@ def cmd_route(args) -> None:
     if result.skipped:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
+    lines.extend(f"  注意：{note}" for note in weekly_forecasts(policy).values())
     if not result.candidates:
         if result.escalate_tier is not None:
             lines.append("  没有可用候选：可以升一档，或等额度恢复、暂停结束后再试。")
@@ -345,7 +375,7 @@ def cmd_route(args) -> None:
     if outcome_req_args:
         outcome_hint += " " + " ".join(outcome_req_args)
     lines.append(
-        "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>；"
+        "派活遇到 429 / 额度用完：makewand mark <工具> <剩余时长>（只限某个模型时加 --model <模型>）；"
         + outcome_hint
     )
     print("\n".join(lines))
@@ -510,8 +540,11 @@ def cmd_mark(args) -> None:
         provider = _validate_provider(args.provider)
         seconds = parse_duration(args.duration)
         reason = getattr(args, "reason", None) or ""
+        model = getattr(args, "mark_model", None)
+        if model is not None and (not model.strip() or ":" in model):
+            raise ValueError(f"invalid model {model!r}")
         until = time.time() + seconds
-        OutcomeLedger().mark(provider, until, reason)
+        OutcomeLedger().mark(f"{provider}:{model.strip()}" if model else provider, until, reason)
         when = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
     except ValueError as error:
         _fail(f"错误：{error}")
@@ -519,7 +552,8 @@ def cmd_mark(args) -> None:
         _fail(f"错误：{_MAX_DURATION_HINT}")
     except OSError as error:
         _fail(f"错误：写入额度标记失败：{error}")
-    print(f"已记录：{provider} 约 {when} 前不再派活")
+    subject = f"{provider} 的 {model.strip()}" if model else provider
+    print(f"已记录：{subject} 约 {when} 前不再派活")
 
 
 def cmd_outcome(args) -> None:

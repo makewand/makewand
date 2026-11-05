@@ -4,7 +4,6 @@ Muse Code provider adapter (Meta subscription / Muse interactive coding agent).
 
 import os
 import re
-from datetime import datetime, timedelta
 from typing import Tuple, Optional, List
 from makewand.config import c, COLOR_PURPLE
 from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
@@ -23,8 +22,7 @@ def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
         reset_time = extract_reset_phrase(line)
         if reset_time:
             return True, f"Meta 订阅额度耗尽或频次受限 ({reset_time})", reset_time
-        iso_reset = (datetime.now() + timedelta(hours=2)).isoformat()
-        return True, "Meta 订阅额度耗尽或频次受限", iso_reset
+        return True, "Meta 订阅额度耗尽或频次受限", "待重置"
     return False, "", None
 
 def _is_dbus_systemd_available() -> bool:

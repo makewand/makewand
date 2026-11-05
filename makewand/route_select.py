@@ -340,8 +340,10 @@ def select(
             or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
         )
-        quota_reason = None if provider_reason else _quota_reason(
-            row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
+        # The quota gate comes first: a redeemable Codex reset is keyed on its reason.
+        quota_reason = None if provider_reason else (
+            _quota_reason(row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
+            or _model_mark_reason(marks, row.provider, _row_model(row), moment))
         reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
         if quota_reason:
             quota_models.setdefault(row.provider, set()).add(_row_model(row))
@@ -499,6 +501,19 @@ def _mark_reason(mark, now: float) -> Optional[str]:
     if text:
         return f"额度标记未过期：{text}"
     return "额度标记未过期"
+
+
+def _model_mark_reason(marks: Mapping, provider: str, model, now: float) -> Optional[str]:
+    """A mark stored as "provider:model" holds back that model and leaves its siblings alone."""
+    from makewand.model_quota import canonical_model, model_matches
+    prefix = provider + ":"
+    for name, mark in marks.items():
+        if name.startswith(prefix) and model_matches(
+                canonical_model(provider, name[len(prefix):]), canonical_model(provider, model)):
+            reason = _mark_reason(mark, now)
+            if reason:
+                return reason
+    return None
 
 
 def _quota_reason(provider: str, quota: Mapping, policy: Policy, model=None, info=None) -> Optional[str]:

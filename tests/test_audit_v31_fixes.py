@@ -243,7 +243,7 @@ class TestAuditV31Fixes(unittest.TestCase):
              patch("makewand.usage.record_engine_usage") as mock_usage:
             dispatch_task("claude", "test prompt", tier="standard")
             # The fake adapter reports no route (cli/api): the ledger then infers it (usage.dispatch_route).
-            mock_usage.assert_called_once_with("claude", tier="standard", success=True, task="test prompt", route=None)
+            mock_usage.assert_called_once_with("claude", tier="standard", success=True, task="test prompt", route=None, model=None)
 
     def test_p1_3_fail_and_cleanup_hard_reset_to_baseline(self):
         """P1-3: fail_and_cleanup in host mode resets hard to task_baseline when initial workspace is clean."""
