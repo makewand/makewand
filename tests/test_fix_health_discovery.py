@@ -31,8 +31,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import makewand.discovery as discovery
-from makewand.discovery import (_discover_local_agy_models, _price_signal, discover_available_models,
-                                export_routing_overrides, get_provider_model_tier, rank_models_for_tier,
+from makewand.discovery import (_discover_local_agy_models, _price_signal, discover_available_models, get_provider_model_tier, rank_models_for_tier,
                                 score_model_for_tier)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -447,13 +446,6 @@ class TestGrokCliCacheLayout(_TempHome):
                 models = discover_available_models()["grok"]
                 self.assertEqual(models["current_default"], "grok-4.7")
                 self.assertEqual(models["default_source"], "detected")
-
-    def test_routing_export_does_not_make_the_surcharged_variant_cheap(self):
-        self.write(".grok/models_cache.json", grok_cli_cache(GROK_FAST_FIRST))
-        with patch("makewand.config.is_provider_enabled", side_effect=lambda name: name == "grok"):
-            out = export_routing_overrides(config_dir=self.home / "cfg")
-        grok = json.loads(out.read_text(encoding="utf-8"))["models"]["grok"]
-        self.assertEqual(grok, {"cheap": "grok-4.6", "mid": "grok-4.7", "premium": "grok-4.7"})
 
     def test_fast_dispatch_does_not_pass_the_surcharged_variant(self):
         from makewand.providers import grok as grok_provider

@@ -47,20 +47,7 @@
     "budget"
   ],
   "native_go_commands": [
-    "serve",
-    "chat",
-    "new",
-    "preview",
-    "doctor",
-    "setup",
-    "token",
-    "audit",
-    "usage",
-    "user",
-    "state",
-    "quota",
-    "help",
-    "completion"
+    "quota"
   ],
   "python_value_flags": [
     "-C",
@@ -127,49 +114,20 @@
         "--max-lines": true,
         "--max-files": true
       }
-    },
-    "help": {
-      "engine": "go",
-      "max_args": 0,
-      "flags": {
-        "-h": false,
-        "--help": false
-      }
-    },
-    "completion bash": {
-      "engine": "go",
-      "max_args": 0,
-      "flags": {
-        "-h": false,
-        "--help": false
-      }
-    },
-    "completion fish": {
-      "engine": "go",
-      "max_args": 0,
-      "flags": {
-        "-h": false,
-        "--help": false,
-        "--no-descriptions": false
-      }
-    },
-    "completion powershell": {
-      "engine": "go",
-      "max_args": 0,
-      "flags": {
-        "-h": false,
-        "--help": false,
-        "--no-descriptions": false
-      }
-    },
-    "completion zsh": {
-      "engine": "go",
-      "max_args": 0,
-      "flags": {
-        "-h": false,
-        "--help": false,
-        "--no-descriptions": false
-      }
     }
-  }
+  },
+  "archived_commands": [
+    "serve",
+    "chat",
+    "new",
+    "preview",
+    "doctor",
+    "setup",
+    "token",
+    "audit",
+    "usage",
+    "user",
+    "state",
+    "completion"
+  ]
 }

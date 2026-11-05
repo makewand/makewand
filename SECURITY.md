@@ -17,6 +17,9 @@ When makewand runs a candidate's tests, builds, dependency installs, or a previe
 
 ### Dependency installs / 依赖安装
 
+The Go engine was removed from the main line on 2026-11-05 (tag `archive/pre-trim-20261105`). The rules in this section describe that tag and earlier releases.
+Go 引擎已于 2026-11-05 从主线移除（tag `archive/pre-trim-20261105`），本节规则描述该 tag 及更早版本。
+
 These rules apply to candidate verification by the Go engine (`internal/engine`).
 以下规则适用于 Go 引擎（`internal/engine`）的候选验证。
 

@@ -1,156 +1,105 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/makewand/makewand/internal/model"
+	"github.com/makewand/makewand/internal/quota"
 )
 
-func TestShouldUseHeadless(t *testing.T) {
-	tests := []struct {
-		name           string
-		prompt         string
-		printFlag      bool
-		interactiveTTY bool
-		want           bool
-	}{
-		{
-			name:           "no prompt never headless",
-			prompt:         "",
-			printFlag:      true,
-			interactiveTTY: false,
-			want:           false,
-		},
-		{
-			name:           "print flag forces headless",
-			prompt:         "hello",
-			printFlag:      true,
-			interactiveTTY: true,
-			want:           true,
-		},
-		{
-			name:           "non-tty prompt defaults to headless",
-			prompt:         "hello",
-			printFlag:      false,
-			interactiveTTY: false,
-			want:           true,
-		},
-		{
-			name:           "tty prompt stays interactive",
-			prompt:         "hello",
-			printFlag:      false,
-			interactiveTTY: true,
-			want:           false,
-		},
+func TestParseArgsAcceptsTheFormsItsCallersUse(t *testing.T) {
+	for _, args := range [][]string{
+		{"quota"},
+		{"quota", "--json"},
+		{"--repo-trust", "untrusted", "quota"},
+		{"quota", "--repo-trust=trusted", "--timeout", "5s"},
+	} {
+		opts, err := parseArgs(args)
+		if err != nil || !opts.quota {
+			t.Errorf("parseArgs(%v) = %+v, %v", args, opts, err)
+		}
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := shouldUseHeadless(tt.prompt, tt.printFlag, tt.interactiveTTY)
-			if got != tt.want {
-				t.Fatalf("shouldUseHeadless(%q, %v, %v) = %v, want %v", tt.prompt, tt.printFlag, tt.interactiveTTY, got, tt.want)
-			}
-		})
+	opts, err := parseArgs([]string{"--repo-trust=untrusted", "quota", "--json", "--timeout=2m"})
+	if err != nil || opts.repoTrust != quota.RepoTrustUntrusted || !opts.jsonOutput || opts.timeout != 2*time.Minute {
+		t.Errorf("parsed %+v, %v", opts, err)
 	}
 }
 
-func TestClassifyPromptTask(t *testing.T) {
-	tests := []struct {
-		prompt string
-		want   model.TaskType
-	}{
-		{prompt: "/review this", want: model.TaskReview},
-		{prompt: "please review.", want: model.TaskReview},
-		{prompt: "please fix this bug", want: model.TaskFix},
-		{prompt: "fix, please", want: model.TaskFix},
-		{prompt: "bug?", want: model.TaskFix},
-		{prompt: "explain rest api", want: model.TaskExplain},
-		{prompt: "plan this feature", want: model.TaskAnalyze},
-		{prompt: "write code", want: model.TaskCode},
-		{prompt: "checkout the repo", want: model.TaskCode},
-		{prompt: "design the api", want: model.TaskAnalyze},
-		{prompt: "how does this work", want: model.TaskExplain},
-		{prompt: "there is an error here", want: model.TaskFix},
-		{prompt: "handle errors gracefully", want: model.TaskCode},
-		{
-			prompt: "Implement RetryHTTP in retry.go and return only the complete content of retry.go. retry on client.Do error.",
-			want:   model.TaskCode,
-		},
-	}
-
-	for _, tt := range tests {
-		if got := classifyPromptTask(tt.prompt); got != tt.want {
-			t.Fatalf("classifyPromptTask(%q) = %v, want %v", tt.prompt, got, tt.want)
+func TestParseArgsRefusesAnythingElse(t *testing.T) {
+	for _, args := range [][]string{
+		{},
+		{"serve"},
+		{"chat"},
+		{"quota", "--timeout", "0s"},
+		{"quota", "--timeout"},
+		{"quota", "--repo-trust", "maybe"},
+	} {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%v) should fail", args)
 		}
 	}
 }
 
-func TestPromptTaskToBuildPhase(t *testing.T) {
-	tests := []struct {
-		task model.TaskType
-		want model.BuildPhase
-	}{
-		{task: model.TaskAnalyze, want: model.PhasePlan},
-		{task: model.TaskCode, want: model.PhaseCode},
-		{task: model.TaskReview, want: model.PhaseReview},
-		{task: model.TaskFix, want: model.PhaseFix},
+func TestVersionMatchesWhatTheInstallerChecks(t *testing.T) {
+	var out, errs bytes.Buffer
+	if code := run(context.Background(), []string{"--version"}, &out, &errs); code != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
 	}
+	if !strings.HasPrefix(out.String(), "makewand version ") {
+		t.Errorf("version output %q", out.String())
+	}
+}
 
-	for _, tt := range tests {
-		if got := promptTaskToBuildPhase(tt.task); got != tt.want {
-			t.Fatalf("promptTaskToBuildPhase(%v) = %v, want %v", tt.task, got, tt.want)
+func TestProviderEnabledHonorsDisable(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("MAKEWAND_CONFIG_DIR", dir)
+	if !providerEnabled("claude") {
+		t.Error("a missing config must leave providers on")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"enabled_providers":{"claude":false,"agy":false,"codex":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"claude": false, "gemini": false, "codex": true, "grok": true} {
+		if providerEnabled(name) != want {
+			t.Errorf("providerEnabled(%q) != %v", name, want)
 		}
 	}
-}
-
-func TestNewHeadlessTraceSinkUsesConfigDir(t *testing.T) {
-	cfgDir := t.TempDir()
-	t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
-
-	sink, path, err := newHeadlessTraceSink()
-	if err != nil {
-		t.Fatalf("newHeadlessTraceSink() error: %v", err)
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`not json`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	defer sink.Close()
-
-	want := filepath.Join(cfgDir, "trace.jsonl")
-	if path != want {
-		t.Fatalf("newHeadlessTraceSink() path = %q, want %q", path, want)
+	if !providerEnabled("claude") {
+		t.Error("a damaged config must leave providers on")
 	}
 }
 
-func TestHeadlessTraceSinkWritesEvent(t *testing.T) {
-	cfgDir := t.TempDir()
-	t.Setenv("MAKEWAND_CONFIG_DIR", cfgDir)
+func TestQuotaJSONKeepsTheFieldsPythonReads(t *testing.T) {
+	used := 37.0
+	snap := quota.NewQuotaSnapshotter(time.Hour, staticSource{quota.ProviderQuota{
+		Provider: "codex", WeeklyPct: &used, Authed: true, HasData: true, AccountRef: "a", IdentityKnown: true, PoolRef: "p",
+	}}).Refresh(context.Background())
+	var out bytes.Buffer
+	if err := printQuotaJSON(&out, snap); err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]map[string]any
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("%v: %s", err, out.String())
+	}
+	entry := decoded["codex"]
+	if entry["weekly_pct"] != 37.0 || entry["account_ref"] != "a" || entry["has_data"] != true || entry["band"] == nil {
+		t.Errorf("entry %v", entry)
+	}
+}
 
-	sink, path, err := newHeadlessTraceSink()
-	if err != nil {
-		t.Fatalf("newHeadlessTraceSink() error: %v", err)
-	}
+type staticSource struct{ q quota.ProviderQuota }
 
-	event := model.TraceEvent{
-		Timestamp: time.Now().UTC(),
-		Event:     "test_event",
-		Selected:  "gemini",
-	}
-	sink.Trace(event)
-	if err := sink.Close(); err != nil {
-		t.Fatalf("sink.Close() error: %v", err)
-	}
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%q) error: %v", path, err)
-	}
-	line := strings.TrimSpace(string(data))
-	if line == "" {
-		t.Fatal("trace file is empty")
-	}
-	if !strings.Contains(line, "\"event\":\"test_event\"") {
-		t.Fatalf("trace line missing event field: %s", line)
-	}
+func (s staticSource) Provider() string { return s.q.Provider }
+func (s staticSource) Read(context.Context) (quota.ProviderQuota, error) {
+	return s.q, nil
 }

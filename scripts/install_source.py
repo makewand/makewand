@@ -223,7 +223,7 @@ def _install_locked(source, root, binaries):
         native_version = subprocess.check_output([str(native), "--version"], cwd=stage, env=env, text=True).strip()
         if native_version != "makewand version " + version:
             raise RuntimeError(f"engine version mismatch: {native_version!r} / {python_version!r}")
-        for args in (("--version",), ("run", "--help"), ("serve", "--help"),
+        for args in (("--version",), ("run", "--help"), ("route", "--help"),
                      ("daemon", "--help"), ("sessions", "--help")):
             subprocess.run([sys.executable, "-I", "-B", str(stage / "bin/makewand"), *args],
                            cwd=stage, env=env, check=True, stdout=subprocess.DEVNULL)

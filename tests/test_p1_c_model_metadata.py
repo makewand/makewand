@@ -163,7 +163,7 @@ class ModelMetadataTests(unittest.TestCase):
     def test_models_human_and_json_show_metadata_and_unknown_quota(self):
         self.agy_catalog()
         self.claude_catalog()
-        with patch.object(cli, "export_routing_overrides"), contextlib.redirect_stdout(io.StringIO()) as output:
+        with contextlib.redirect_stdout(io.StringIO()) as output:
             cli.cmd_models(argparse.Namespace(json=False))
         for text in ("argon-99-pro", "默认不选", "缓存时间", "额度未知", "Opus", "score="):
             self.assertIn(text, output.getvalue())

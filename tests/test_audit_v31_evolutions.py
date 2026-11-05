@@ -22,7 +22,6 @@ from unittest.mock import patch, MagicMock
 from makewand.providers.api_client import apply_agentic_code_output, call_api_chat
 from makewand.providers.local import execute_local_task
 from makewand.ensemble import resolve_ensemble_providers, run_ensemble, FRONTIER_ENSEMBLE_PROVIDERS, ALL_ENSEMBLE_PROVIDERS
-from makewand.discovery import export_routing_overrides
 from makewand.cli import cmd_clean
 from makewand.orchestrator import run_pipeline, run_race, run_review, _run_pipeline_impl
 from makewand.task_dag import TaskDAG, TaskNode, execute_task_dag
@@ -200,52 +199,6 @@ class TestEffortForwarding(unittest.TestCase):
         self.assertTrue(ok, msg)
         self.assertTrue(mock_pipeline.called)
         self.assertEqual(mock_pipeline.call_args[1].get("effort"), "high")
-
-
-class TestPricingTableProtection(unittest.TestCase):
-    """Verify that export_routing_overrides outputs discovered.json, preserves routing.json and explicit costs."""
-
-    def test_unconfigured_model_costs_not_zeroed(self):
-        with tempfile.TemporaryDirectory() as td:
-            config_dir = Path(td)
-            exported = export_routing_overrides(config_dir)
-            self.assertIsNotNone(exported)
-            self.assertEqual(exported.name, "discovered.json")
-            data = json.loads(exported.read_text(encoding="utf-8"))
-            costs = data.get("costs", {})
-            # Crucial invariant: unconfigured models must NOT be forcefully populated with 0.0
-            self.assertEqual(len(costs), 0, "Unconfigured models were populated into costs map")
-
-    def test_user_routing_json_never_mutated(self):
-        with tempfile.TemporaryDirectory() as td:
-            config_dir = Path(td)
-            user_routing = config_dir / "routing.json"
-            initial_content = '{\n  "costs": {"custom": {"input": 4.5, "output": 18.0}}\n}'
-            user_routing.write_text(initial_content, encoding="utf-8")
-            exported = export_routing_overrides(config_dir)
-            self.assertIsNotNone(exported)
-            self.assertEqual(exported.name, "discovered.json")
-            # routing.json must not be touched or modified
-            self.assertEqual(user_routing.read_text(encoding="utf-8"), initial_content)
-
-    def test_explicit_zero_and_positive_costs_preserved(self):
-        with tempfile.TemporaryDirectory() as td:
-            config_dir = Path(td)
-            target = config_dir / "discovered.json"
-            initial = {
-                "costs": {
-                    "explicit-zero-model": {"input": 0.0, "output": 0.0},
-                    "positive-model": {"input": 3.0, "output": 12.0}
-                }
-            }
-            target.write_text(json.dumps(initial), encoding="utf-8")
-            exported = export_routing_overrides(config_dir)
-            data = json.loads(exported.read_text(encoding="utf-8"))
-            # Both explicit zero and positive costs must be preserved
-            self.assertIn("explicit-zero-model", data["costs"])
-            self.assertEqual(data["costs"]["explicit-zero-model"]["input"], 0.0)
-            self.assertIn("positive-model", data["costs"])
-            self.assertEqual(data["costs"]["positive-model"]["input"], 3.0)
 
 
 class TestCmdCleanEnhancement(unittest.TestCase):

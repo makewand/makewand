@@ -57,11 +57,6 @@ class DeadCodeTests(unittest.TestCase):
         self.assertFalse(hasattr(health, "cli_messages"))
         self.assertFalse(hasattr(health, "CLI_TRANSCRIPT_PROVIDERS"))
 
-    def test_the_go_regexp_comment_matches_router_cli_go(self):
-        source = inspect.getsource(health)
-        self.assertNotIn("regexp.MustCompile(`(?i)^(?:`", source)
-        self.assertIn("cliCatalogRegexp", source)
-
     def test_orchestrator_does_not_shadow_print(self):
         self.assertNotIn("print", vars(orch))
         self.assertTrue(callable(orch._print))

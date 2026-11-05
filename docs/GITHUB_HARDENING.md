@@ -22,12 +22,6 @@ Read back with `gh api` on 2026-10-21:
    - linear history required; force-push and deletion blocked;
    - conversation resolution not required.
 
-The Release workflow also needs the native Windows gate (`native-windows /
-verify`, which the Windows weekly workflow runs on Mondays and by hand). Pull
-requests do not run it, so a green `master` can still fail a release: run it by
-hand before tagging, see
-[the release checklist](RELEASE_STRATEGY.md#release-operator-checklist).
-
 ## Target baseline (recommended, not applied)
 
 Running the script sets the repository settings above and replaces the branch
@@ -69,9 +63,7 @@ Prerequisites:
 - Required checks must match the names GitHub reports exactly, or merges wait
   forever. CodeQL's job is `Analyze (${{ matrix.language }})`, reported as
   `Analyze (go)` and `Analyze (python)`; a job that calls a reusable workflow is
-  reported as `<caller job> / <job>`, e.g. `native-windows / verify`. CI's
-  `verify` therefore stays a plain job of `ci.yml`, which the Release workflow
-  calls.
+  reported as `<caller job> / <job>`, so CI's `verify` stays a plain job of `ci.yml`.
 - If CI job names change, update `scripts/github_hardening.sh` accordingly.
 - `CODEOWNERS` is defined at `.github/CODEOWNERS`.
 - Default profile is `auto`.

@@ -61,53 +61,31 @@ class _CliCase(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
 
-class TestNativeCommandDelegation(_CliCase):
-    def test_shared_globals_reach_native_commands_without_losing_values(self):
-        from makewand.command_contract import NATIVE_GO_COMMANDS, PYTHON_COMMANDS
+class TestArchivedCommands(_CliCase):
+    def test_archived_commands_are_refused_instead_of_becoming_a_prompt(self):
+        from makewand.command_contract import ARCHIVED_COMMANDS
         prefixes = [[], ["-C", "directory with spaces"], ["--cwd=directory with spaces"],
                     ["--repo-trust", "untrusted"], ["--debug", "--approval=safe"],
                     ["-Cdirectory with spaces"], ["--max-model-calls", "12"],
                     ["--call-budget-file=temporary-ledger.json"]]
-        for command in sorted(NATIVE_GO_COMMANDS - PYTHON_COMMANDS):
+        self.assertIn("serve", ARCHIVED_COMMANDS)
+        for command in sorted(ARCHIVED_COMMANDS):
             for prefix in prefixes:
-                with self.subTest(command=command, prefix=prefix), patch.object(cli, "delegate_to_go_server") as delegate:
-                    arguments = [*prefix, command, "--help"]
-                    code, _, err = self.run_main(*arguments)
-                    self.assertEqual(code, 0, err)
-                    delegate.assert_called_once_with(arguments)
-
-    def test_python_task_globals_are_rejected_before_native_execution(self):
-        from makewand.command_contract import PYTHON_BOOLEAN_FLAGS, PYTHON_VALUE_FLAGS, SHARED_VALUE_FLAGS
-        flags = [[flag] for flag in sorted(PYTHON_BOOLEAN_FLAGS)]
-        flags += [[flag, "value"] for flag in sorted(PYTHON_VALUE_FLAGS - SHARED_VALUE_FLAGS)]
-        flags += [["-ftask.txt"], ["-Ftask.txt"]]
-        for arguments in flags:
-            for before in (True, False):
-                argv = [*arguments, "serve", "--help"] if before else ["serve", *arguments, "--help"]
-                with self.subTest(argv=argv), patch.object(cli, "delegate_to_go_server") as delegate:
-                    code, _, err = self.run_main(*argv)
+                with self.subTest(command=command, prefix=prefix), \
+                        patch("makewand.orchestrator.dispatch_task", side_effect=AssertionError("dispatched")):
+                    code, _, err = self.run_main(*prefix, command, "--help")
                     self.assertEqual(code, cli.EXIT_USAGE_ERROR)
-                    self.assertIn("cannot be honored", err)
-                    delegate.assert_not_called()
+                    self.assertIn("已归档", err)
 
-    def test_python_command_ownership_and_literal_native_arguments_remain_intact(self):
-        self.assertIsNone(cli._plan_native_go_delegation(["-C", "/tmp", "repomap", "--help"]))
-        self.assertIsNone(cli._plan_native_go_delegation(["quota", "--json"]))
-        self.assertIsNone(cli._plan_native_go_delegation(["--cwd"]))
-        self.assertEqual(cli._plan_native_go_delegation(["new", "--", "--file"]), ["new", "--", "--file"])
-        self.assertEqual(cli._plan_native_go_delegation(["-C", "-f", "serve"]), ["-C", "-f", "serve"])
+    def test_a_prompt_that_merely_starts_with_an_archived_word_is_not_refused(self):
+        self.assertIsNone(cli._archived_command(["serve the app"]))
+        self.assertIsNone(cli._archived_command(["search", "serve"]))
+        self.assertIsNone(cli._archived_command(["-C", "serve"]))
 
-    def test_bundled_python_engine_finds_its_own_native_binary(self):
-        engine = self.root / "release/lib/makewand/python/makewand/cli.py"
-        engine.parent.mkdir(parents=True)
-        for name in ("makewand", "makewand.exe"):
-            with self.subTest(executable=name):
-                binary = self.root / "release" / name
-                binary.write_text("fixture")
-                binary.chmod(0o755)
-                with patch.object(cli, "__file__", str(engine)), patch("shutil.which", return_value=None):
-                    self.assertEqual(cli._find_go_binary(), str(binary))
-                binary.unlink()
+    def test_help_word_shows_help(self):
+        code, out, _ = self.run_main("help")
+        self.assertEqual(code, 0)
+        self.assertIn("usage:", out)
 
 
 class TestQuotaHonesty(_CliCase):
@@ -229,43 +207,6 @@ class TestModelsHonesty(_CliCase):
         self.assertEqual(models["grok"]["source"], "detected")
         self.assertEqual(models["grok"]["available"], ["grok-x-1"])
         self.assertEqual(models["claude"]["source"], "builtin")
-
-
-class TestGoDelegation(_CliCase):
-    """go-engine-tui-cmd#9."""
-
-    def fake_go_binary(self, version_line):
-        path = self.root / "makewand-server"
-        path.write_text(f"#!/bin/sh\necho '{version_line}'\n")
-        path.chmod(path.stat().st_mode | stat.S_IXUSR)
-        return str(path)
-
-    def test_installed_mode_never_uses_go_run(self):
-        env = {k: v for k, v in os.environ.items() if k != "MAKEWAND_DEV"}
-        with patch.dict(os.environ, env, clear=True), \
-             patch("makewand.cli._find_go_binary", return_value=None), \
-             patch("shutil.which", side_effect=lambda name: "/usr/bin/go" if name == "go" else None), \
-             patch("subprocess.run") as run:
-            code, _, err = self.run_main("chat", ".")
-        self.assertEqual(code, 1)
-        for call in run.call_args_list:
-            self.assertNotIn("run", call.args[0][:2], f"`go run` must not be used: {call}")
-        self.assertIn("MAKEWAND_DEV=1", err)
-
-    def test_version_mismatch_warns(self):
-        self.assertIn("版本不一致", cli.check_go_python_version(self.fake_go_binary("makewand version 0.0.1")))
-        self.assertIsNone(cli.check_go_python_version(self.fake_go_binary(f"makewand version {__version__}")))
-        self.assertIn("开发构建", cli.check_go_python_version(self.fake_go_binary("makewand version dev-abc123")))
-
-    def test_delegation_runs_binary_in_user_cwd_with_warning(self):
-        binary = self.fake_go_binary("makewand version 0.0.1")
-        with patch("makewand.cli._find_go_binary", return_value=binary), \
-             patch("subprocess.run", wraps=__import__("subprocess").run) as run:
-            code, _, err = self.run_main("chat", ".")
-        self.assertIn("版本不一致", err)
-        last = run.call_args_list[-1]
-        self.assertEqual(last.args[0], [binary, "chat", "."])
-        self.assertNotIn("cwd", last.kwargs)
 
 
 if __name__ == "__main__":
