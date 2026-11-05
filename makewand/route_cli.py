@@ -239,8 +239,10 @@ def _restore_codex_reset(policy, result, not_tool) -> bool:
         gate = quota_reason("codex", policy=policy)
         if not (_mark_reason(mark, now) == reason or (gate and gate in reason)) or not restore_quota("route"):
             return False
-        if mark is not None:
-            ledger.mark("codex", time.time(), "额度已由赠送重置恢复", only_if=mark)
+        # The reset restored the whole weekly pool, so marks on single models go too.
+        for name, held in ledger.active_marks().items():
+            if name == "codex" or name.startswith("codex:"):
+                ledger.mark(name, time.time(), "额度已由赠送重置恢复", only_if=held)
         return True
     except (ValueError, OSError):
         return False
