@@ -23,9 +23,9 @@ Read back with `gh api` on 2026-10-21:
    - conversation resolution not required.
 
 The Release workflow also needs the native Windows gate (`native-windows /
-verify`, which the Architecture runtime workflow runs on every push and pull
-request). Branch protection does not require it, so a green `master` can still
-fail a release: check it before tagging, see
+verify`, which the Windows weekly workflow runs on Mondays and by hand). Pull
+requests do not run it, so a green `master` can still fail a release: run it by
+hand before tagging, see
 [the release checklist](RELEASE_STRATEGY.md#release-operator-checklist).
 
 ## Target baseline (recommended, not applied)
@@ -33,8 +33,8 @@ fail a release: check it before tagging, see
 Running the script sets the repository settings above and replaces the branch
 protection with:
 
-- required status checks `verify` (CI), `Analyze (go)` (CodeQL) and
-  `native-windows / verify` (Architecture runtime), branches up to date;
+- required status checks `verify` (CI) and `Analyze (go)` (CodeQL), branches up
+  to date;
 - pull request required before merge, with a profile chosen by maintainer count:
   - `team`: 1 approval + CODEOWNERS review
   - `solo`: no mandatory approval count

@@ -15,11 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  native-windows:
-    permissions:
-      contents: read
-    uses: ./.github/workflows/native-windows.yml
-
   load-and-recovery:
     runs-on: ubuntu-latest
     timeout-minutes: 20

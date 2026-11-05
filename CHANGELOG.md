@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Windows 门禁改为每周、手动和发版时运行，不再跑在每个 PR 和 master 推送上。
 - `route` 和 `status` 在 Codex、Claude 周额度按目前速度会在重置前到线时给出预计时间。
 - `status` 显示额度标记和正在拒绝的模型；额度恢复后不再显示“达到保护阈值”和旧读数；推荐分工注明实际派发以 `route` 为准。
 - `route` 给 Codex 审查的默认时限从 5400 秒降到 1800 秒（两周内成功调用最长 692 秒），调用方指定 `--total-timeout` 时不变。
