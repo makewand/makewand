@@ -24,6 +24,10 @@ from makewand import accounting_files, account_leases, filelock, layered_budget,
 
 POLICY_NAME = "capacity-policy.json"
 STATE_NAME = "shared-capacity.json"
+WAIT_LOG_NAME = "capacity-waits.jsonl"
+WAIT_LOG_MAX_BYTES = 256 * 1024
+# Shorter than this is lock traffic, not a queue.
+WAIT_WORTH_RECORDING_SECONDS = 1.0
 MAX_BYTES = 16 * 1024 * 1024
 _tool = contextvars.ContextVar("makewand_capacity_tool", default=None)
 
@@ -378,6 +382,24 @@ def report_busy(error):
     print(f"makewand: waiting: {error}", file=sys.stderr)
 
 
+def record_wait(kind, engine, waited, admitted, detail=""):
+    """Log one wait or refusal, never raising.
+
+    The half-hourly snapshot cannot show how long anyone queued or who gave up,
+    so whether a provider's limit is too low could not be answered.
+    """
+    try:
+        if admitted and waited < WAIT_WORTH_RECORDING_SECONDS:
+            return
+        from makewand.cli_failure_log import append_bounded
+        entry = json.dumps({"ts": time.time(), "kind": kind, "engine": str(engine), "waited_seconds": round(waited, 1),
+                            "admitted": admitted, "detail": str(detail)[:400]}, ensure_ascii=False) + "\n"
+        append_bounded(Path(layered_budget.default_path()).with_name(WAIT_LOG_NAME), entry.encode("utf-8"),
+                       WAIT_LOG_MAX_BYTES)
+    except Exception:  # noqa: BLE001 - a log line never changes an admission
+        pass
+
+
 def tool_memory_available():
     if sys.platform != "linux":
         return True
@@ -522,11 +544,13 @@ def tool_scope(current_policy, deadline):
                 message = diagnostic(state, ticket, current_policy)
                 save(path, state)
             if time.monotonic() >= wait_until:
+                record_wait("tool", "tool", time.monotonic() - start, False, message)
                 raise ConcurrencyBusyError(message)
             if time.monotonic() >= next_report:
                 report_busy(message)
                 next_report = time.monotonic() + 15
             time.sleep(min(.1, max(0, wait_until - time.monotonic())))
+        record_wait("tool", "tool", time.monotonic() - start, True)
         token = _tool.set(identifier)
         stop = threading.Event()
 

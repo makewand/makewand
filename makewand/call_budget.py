@@ -231,13 +231,20 @@ def reserve(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=
     from makewand.providers.base import get_current_contestant_scope
     scope = get_current_contestant_scope()
     try:
-        return _reserve_wait(engine, tier, model, readonly, lease_id=lease_id, task_id=task_id,
+        reservation = _reserve_wait(engine, tier, model, readonly, lease_id=lease_id, task_id=task_id,
             stage=stage, account_ref=account_ref, api_policy=api_policy, budget_file=budget_file,
             max_model_calls=max_model_calls, deadline_monotonic=deadline_monotonic, pending=pending,
             capacity_policy=capacity_policy, ticket_id=ticket_id, wait_until=wait_until, scope=scope,
             working_directory=working_directory)
+    except (ConcurrencyBusyError, BudgetDeadlineError) as error:
+        if capacity_policy:
+            shared_capacity.record_wait("model", engine, time.monotonic() - now, False, error)
+        raise
     finally:
         shared_capacity.cancel(ticket_id, capacity_policy)
+    if capacity_policy:
+        shared_capacity.record_wait("model", engine, time.monotonic() - now, True)
+    return reservation
 
 
 def _reserve_wait(engine, tier, model, readonly, *, capacity_policy, ticket_id, wait_until, scope, working_directory, **kwargs):

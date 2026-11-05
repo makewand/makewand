@@ -77,41 +77,45 @@ def record(engine, code, stderr):
             return
         entry = (json.dumps({"ts": time.time(), "engine": str(engine), "exit_code": code, "stderr_tail": lines},
                             ensure_ascii=False) + "\n").encode("utf-8")
-        path = log_path()
-        if path.is_symlink():
-            return
-        # Reuse the accounting opener's identity, owner, hardlink and Windows
-        # DACL checks before writing diagnostics, including in an inherited
-        # broadly-readable Windows cache directory.
-        with accounting_files.pin(path, resolve_leaf=False) as files:
-            descriptor = files.open(files.name, create=True, writable=True)
-            try:
-                try:
-                    filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
-                except OSError:
-                    return  # another writer holds it: skip rather than wait
-                try:
-                    size = os.fstat(descriptor).st_size
-                    os.lseek(descriptor, max(0, size - 1), os.SEEK_SET)
-                    incomplete = size > 0 and os.read(descriptor, 1) != b"\n"
-                    trim = size + len(entry) > MAX_BYTES
-                    if trim or incomplete:
-                        os.lseek(descriptor, max(0, size - MAX_BYTES), os.SEEK_SET)
-                        kept = os.read(descriptor, min(size, MAX_BYTES))
-                        if trim:
-                            kept = kept[len(kept) // 2:]
-                            kept = kept[kept.find(b"\n") + 1:] if b"\n" in kept else b""
-                        # A partial last record must not swallow a new entry.
-                        kept = kept[:kept.rfind(b"\n") + 1]
-                        os.ftruncate(descriptor, 0)
-                        os.lseek(descriptor, 0, os.SEEK_SET)
-                        if kept:
-                            os.write(descriptor, kept)
-                    os.lseek(descriptor, 0, os.SEEK_END)
-                    os.write(descriptor, entry)
-                finally:
-                    filelock.flock(descriptor, filelock.LOCK_UN)
-            finally:
-                os.close(descriptor)
+        append_bounded(log_path(), entry, MAX_BYTES)
     except Exception:  # noqa: BLE001 - diagnostics only, never part of a result
         return
+
+
+def append_bounded(path, entry, max_bytes):
+    """Append one line to an owner-only log, cutting it back to its newest half past the cap."""
+    if path.is_symlink():
+        return
+    # Reuse the accounting opener's identity, owner, hardlink and Windows
+    # DACL checks before writing diagnostics, including in an inherited
+    # broadly-readable Windows cache directory.
+    with accounting_files.pin(path, resolve_leaf=False) as files:
+        descriptor = files.open(files.name, create=True, writable=True)
+        try:
+            try:
+                filelock.flock(descriptor, filelock.LOCK_EX | filelock.LOCK_NB)
+            except OSError:
+                return  # another writer holds it: skip rather than wait
+            try:
+                size = os.fstat(descriptor).st_size
+                os.lseek(descriptor, max(0, size - 1), os.SEEK_SET)
+                incomplete = size > 0 and os.read(descriptor, 1) != b"\n"
+                trim = size + len(entry) > max_bytes
+                if trim or incomplete:
+                    os.lseek(descriptor, max(0, size - max_bytes), os.SEEK_SET)
+                    kept = os.read(descriptor, min(size, max_bytes))
+                    if trim:
+                        kept = kept[len(kept) // 2:]
+                        kept = kept[kept.find(b"\n") + 1:] if b"\n" in kept else b""
+                    # A partial last record must not swallow a new entry.
+                    kept = kept[:kept.rfind(b"\n") + 1]
+                    os.ftruncate(descriptor, 0)
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    if kept:
+                        os.write(descriptor, kept)
+                os.lseek(descriptor, 0, os.SEEK_END)
+                os.write(descriptor, entry)
+            finally:
+                filelock.flock(descriptor, filelock.LOCK_UN)
+        finally:
+            os.close(descriptor)

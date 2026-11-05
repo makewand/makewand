@@ -9,6 +9,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 容量排队写入 `capacity-waits.jsonl`：等了 1 秒以上才入场的和最终被拒的，含当时谁占着名额。此前半小时采样看不出等了多久、谁放弃了。
+
 ## [4.0.0] - 2026-11-05
 
 破坏性版本：Go 的 TUI、server、引擎和 Python 流水线移除，见下。不再发布预编译包；用源码安装。

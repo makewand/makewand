@@ -126,6 +126,41 @@ class SharedCapacityTests(unittest.TestCase):
                 worker.kill()
                 worker.wait(timeout=5)
 
+    def _waits(self):
+        path = self.root / capacity.WAIT_LOG_NAME
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_a_refused_call_is_logged_with_what_held_the_slot(self):
+        holder = budget.reserve("codex", "fast", task_id="holder", working_directory=REPO)
+        self.addCleanup(budget.complete, holder, True, 0)
+        with self.assertRaises(budget.ConcurrencyBusyError):
+            budget.reserve("codex", "fast", task_id="waiter", working_directory=self.root)
+        row = self._waits()[-1]
+        self.assertEqual((row["kind"], row["engine"], row["admitted"]), ("model", "codex", False))
+        self.assertIn("occupied", row["detail"])
+
+    def test_a_call_admitted_at_once_is_not_logged(self):
+        budget.complete(budget.reserve("codex", "fast", task_id="first", working_directory=REPO), True, 0)
+        self.assertEqual(self._waits(), [])
+
+    def test_a_call_admitted_after_waiting_is_logged(self):
+        with patch.object(capacity, "WAIT_WORTH_RECORDING_SECONDS", 0):
+            budget.complete(budget.reserve("codex", "fast", task_id="first", working_directory=REPO), True, 0)
+        row = self._waits()[-1]
+        self.assertEqual((row["kind"], row["engine"], row["admitted"]), ("model", "codex", True))
+
+    def test_a_failed_log_write_changes_nothing(self):
+        with patch("makewand.cli_failure_log.append_bounded", side_effect=OSError("full")), \
+                patch.object(capacity, "WAIT_WORTH_RECORDING_SECONDS", 0):
+            budget.complete(budget.reserve("codex", "fast", task_id="first", working_directory=REPO), True, 0)
+
+    def test_the_tool_pool_logs_waits_too(self):
+        with patch.object(capacity, "WAIT_WORTH_RECORDING_SECONDS", 0), \
+                capacity.tool_scope(capacity.policy(), time.monotonic() + 5):
+            pass
+        row = self._waits()[-1]
+        self.assertEqual((row["kind"], row["admitted"]), ("tool", True))
+
     def test_queue_wait_never_spends_and_reserves_execution_time(self):
         a = self.reserve("a", "codex")
         os.environ["MAKEWAND_LEASE_WAIT_SECONDS"] = "300"
