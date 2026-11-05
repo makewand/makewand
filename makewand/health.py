@@ -373,8 +373,8 @@ def extract_reset_phrase(text: str) -> Optional[str]:
 # from a single IP are now rejected") are task content and never disable a
 # provider.
 #
-# The catalog is data, cli_message_catalog.json next to this module, which
-# router/cli.go mirrors byte for byte; its "_doc" describes the format. It
+# The catalog is data, cli_message_catalog.json next to this module; its "_doc"
+# describes the format. It
 # holds what each CLI really prints, taken from the strings of the installed
 # binaries and bundles (Claude Code 2.1.296, codex-linux-x64 0.162.1, Grok
 # Build 1.0.50, Muse Code 1.4.6, agy 1.3.2, Gemini CLI 0.63.0), plus the short
@@ -392,12 +392,8 @@ def extract_reset_phrase(text: str) -> Optional[str]:
 #                   (gemini --output-format json): each is read as one line
 #   kinds           quota, rate, overload, auth and region patterns; a
 #                   "<kind>.marked" pattern counts only behind an error marker
-# Every pattern is RE2 compatible and matches at the start of normalize_cli_line()
-# text, case-insensitively for ASCII letters only: Python compiles it with
-# re.IGNORECASE | re.ASCII (cli_catalog_regex), Go with cliCatalogRegexp in
-# router/cli.go, which anchors it (`^(?:` + p + `)`) and spells out both cases of
-# each ASCII letter instead of using (?i), whose Unicode folding (the Kelvin sign
-# for k, the long s for s) Python's re.ASCII does not do.
+# Every pattern matches at the start of normalize_cli_line() text, case-insensitively
+# for ASCII letters only: it is compiled with re.IGNORECASE | re.ASCII (cli_catalog_regex).
 # ---------------------------------------------------------------------------
 CLI_MESSAGE_CATALOG_FILE = Path(__file__).with_name("cli_message_catalog.json")
 

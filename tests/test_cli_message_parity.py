@@ -1,18 +1,10 @@
 """
-Provider CLI messages: the Go router and makewand/health.py reach the same
-verdict on the same CLI output.
+Provider CLI messages: makewand/health.py's verdict on real CLI output.
 
-Both read one catalog, makewand/cli_message_catalog.json: router/cli.go embeds
-the byte-identical copy router/cli_message_catalog.json and ports
-find_cli_messages (findCLIMessages). tests/testdata/cli_message_parity.json is
-the shared corpus with what health.py finds in each case; this test checks
-health.py against it, router/cli_message_parity_test.go checks the Go port
-against the same file.
+tests/testdata/cli_message_parity.json is the corpus with what health.py finds
+in each case. After a change to makewand/cli_message_catalog.json or to
+health.py's line selection, regenerate the expectations:
 
-After a change to the catalog or to health.py's line selection, copy the
-catalog to router/ and regenerate the expectations:
-
-    cp makewand/cli_message_catalog.json router/cli_message_catalog.json
     UPDATE_CLI_PARITY=1 python3 -m pytest tests/test_cli_message_parity.py
 """
 
@@ -31,7 +23,6 @@ import makewand.health as health
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CATALOG_FILE = REPO_ROOT / "makewand" / "cli_message_catalog.json"
-GO_CATALOG_FILE = REPO_ROOT / "router" / "cli_message_catalog.json"
 CORPUS_FILE = Path(__file__).resolve().parent / "testdata" / "cli_message_parity.json"
 UPDATE_ENV = "UPDATE_CLI_PARITY"  # not MAKEWAND_*: _isolation scrubs those
 MODES = ("merged", "stderr", "stdout", "apart")
@@ -172,11 +163,6 @@ class TestCLIMessageParityCorpus(unittest.TestCase):
         if os.environ.get(UPDATE_ENV) == "1":
             regenerate()
         cls.corpus = json.loads(CORPUS_FILE.read_text(encoding="utf-8"))
-
-    def test_go_router_embeds_the_catalog_byte_for_byte(self):
-        self.assertTrue(GO_CATALOG_FILE.is_file(), f"{GO_CATALOG_FILE} is missing")
-        self.assertEqual(GO_CATALOG_FILE.read_bytes(), CATALOG_FILE.read_bytes(),
-                         "router/cli_message_catalog.json must be a copy of makewand/cli_message_catalog.json")
 
     def test_corpus_expectations_come_from_this_catalog(self):
         self.assertEqual(self.corpus["catalog_sha256"], catalog_sha256(),

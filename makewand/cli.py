@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 from makewand import __version__
 from makewand.command_contract import (
-    PYTHON_COMMANDS, NATIVE_GO_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS,
+    PYTHON_COMMANDS, ARCHIVED_COMMANDS, PYTHON_VALUE_FLAGS, PYTHON_BOOLEAN_FLAGS, SHARED_VALUE_FLAGS,
     WORKER_QUERY_COMMANDS, WORKER_STATIC_ARGS,
 )
 from makewand.config import (
@@ -30,7 +30,7 @@ from makewand.config import (
     API_ONLY_ENGINES,
 )
 from makewand.health import get_or_update_status
-from makewand.discovery import discover_available_models, export_routing_overrides
+from makewand.discovery import discover_available_models
 from makewand.execution_contract import (
     EXIT_PASSED, EXIT_FAILED, EXIT_UNVERIFIED, EXIT_USAGE_ERROR, EXIT_APPLY_CONFLICT,
 )
@@ -196,11 +196,6 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
 def _status_cache(args):
     import json
     from makewand.health import ProbePolicyError
-    if getattr(args, "probe", False):
-        try:
-            export_routing_overrides()
-        except Exception:
-            pass
     try:
         return get_or_update_status(force_probe=getattr(args, "probe", False),
             repo_trust=getattr(args, "repo_trust", "trusted"), cwd=getattr(args, "cwd", None))
@@ -564,11 +559,6 @@ def cmd_models(args):
     print(c("\n============================================================", COLOR_BOLD))
     print(c("       Makewand 多模型生态与动态发现矩阵 (Model Discovery)", COLOR_BOLD + COLOR_CYAN))
     print(c("============================================================\n", COLOR_BOLD))
-
-    try:
-        export_routing_overrides()
-    except Exception:
-        pass
 
     models = discover_available_models()
 
@@ -1214,55 +1204,6 @@ def _find_go_binary() -> Optional[str]:
     return next((str(c) for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
 
 
-def _build_dev_go_binary() -> Optional[str]:
-    """MAKEWAND_DEV=1 only: build the source tree into a cache binary (no `go run` in the user's cwd)."""
-    import shutil
-    import subprocess
-    root = Path(__file__).resolve().parent.parent
-    if not shutil.which("go") or not (root / "cmd" / "makewand").is_dir():
-        return None
-    cache_root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "makewand"
-    try:
-        cache_root.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return None
-    target = cache_root / "makewand-dev"
-    print(c(f"ℹ️ MAKEWAND_DEV=1：从源码构建 Go 组件 ({root}) ...", COLOR_YELLOW), file=sys.stderr)
-    build = subprocess.run(
-        ["go", "build", "-ldflags", f"-X github.com/makewand/makewand/internal/buildinfo.Version={__version__}",
-         "-o", str(target), "./cmd/makewand"],
-        cwd=str(root),
-    )
-    return str(target) if build.returncode == 0 and target.is_file() else None
-
-
-def delegate_to_go_server(args_list: List[str]):
-    """
-    Delegates server/TUI commands to the compiled Go makewand binary.
-
-    Installed use never compiles or `go run`s the source tree: that path used to
-    run with cwd = the makewand source root, so relative paths (e.g. `chat .`)
-    silently pointed at the wrong directory. Developers can opt in with
-    MAKEWAND_DEV=1, which builds a cache binary and runs it in the user's cwd.
-    """
-    import subprocess
-    bin_path = _find_go_binary()
-    if not bin_path and os.environ.get("MAKEWAND_DEV") == "1" and os.environ.get(PROVIDER_WORKER_ENV) != "1":
-        bin_path = _build_dev_go_binary()
-
-    if bin_path:
-        warning = check_go_python_version(bin_path)
-        if warning:
-            print(c(warning, COLOR_YELLOW), file=sys.stderr)
-        ret = subprocess.run([bin_path] + args_list)
-        sys.exit(ret.returncode)
-
-    print(f"❌ 命令 '{args_list[0]}' 为 Makewand 服务端/远程扩展组件，需要 Go 编译产物支持。", file=sys.stderr)
-    print("   请重新运行 scripts/install.sh，或在源码根目录运行: go build -o bin/makewand-server ./cmd/makewand", file=sys.stderr)
-    print("   (开发者可设置 MAKEWAND_DEV=1 让 makewand 自动从源码构建)", file=sys.stderr)
-    sys.exit(1)
-
-
 def _resolve_cli_prompt(args, original_cwd: Optional[str] = None, required: bool = True) -> str:
     """
     Resolves the task prompt from positional argument, file flag (-f/-F/--file/--prompt-file),
@@ -1319,13 +1260,10 @@ def _resolve_cli_prompt(args, original_cwd: Optional[str] = None, required: bool
     return ""
 
 
-def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
-    """Locate native commands after shared globals, preserving literal argv."""
-    native_commands = NATIVE_GO_COMMANDS - PYTHON_COMMANDS
-    neutral_values = {"-C", "--cwd", "--repo-trust", "--approval"} | SHARED_VALUE_FLAGS
-    neutral_booleans = {"--debug"}
-    value_flags = neutral_values | PYTHON_VALUE_FLAGS
-    boolean_flags = neutral_booleans | PYTHON_BOOLEAN_FLAGS
+def _archived_command(argv: List[str]) -> Optional[str]:
+    """The archived command argv names, skipping the shared global flags before it."""
+    value_flags = {"-C", "--cwd", "--repo-trust", "--approval"} | SHARED_VALUE_FLAGS | PYTHON_VALUE_FLAGS
+    boolean_flags = {"--debug"} | PYTHON_BOOLEAN_FLAGS
     index = 0
     while index < len(argv):
         argument = argv[index]
@@ -1338,29 +1276,13 @@ def _plan_native_go_delegation(argv: List[str]) -> Optional[List[str]]:
             index += 1
         else:
             break
-    if index >= len(argv) or argv[index] not in native_commands:
-        return None
-    command = argv[index]
-    task_flags = (PYTHON_VALUE_FLAGS - neutral_values) | PYTHON_BOOLEAN_FLAGS
-    position = 0
-    while position < len(argv):
-        argument = argv[position]
-        if argument == "--":
-            break
-        flag, equals, _ = argument.partition("=")
-        if len(argument) > 2 and argument[:2] in {"-f", "-F"}:
-            flag = argument[:2]
-        if flag in task_flags:
-            raise ValueError(f"{flag} applies to Python model tasks and cannot be honored by native Go command {command!r}")
-        position += 2 if flag in neutral_values and not equals else 1
-    return list(argv)
+    return argv[index] if index < len(argv) and argv[index] in ARCHIVED_COMMANDS else None
 
 
 # Set by makewand in the environment of every provider CLI it launches.
 from makewand.sandbox import PROVIDER_WORKER_ENV  # noqa: E402
 # Complete audited paths, shared with Go through command_contract.json.
 WORKER_SAFE_SUBCOMMANDS = frozenset(path for path, rule in WORKER_QUERY_COMMANDS.items() if rule["engine"] == "python")
-GO_WORKER_SAFE_COMMANDS = frozenset(path for path, rule in WORKER_QUERY_COMMANDS.items() if rule["engine"] == "go")
 
 
 def _worker_query_matches(argv: List[str], path: str, rule: Dict[str, Any]) -> bool:
@@ -1434,17 +1356,13 @@ def _main():
     original_cwd = os.getcwd()
     inherited_budget_file = os.environ.get("MAKEWAND_CALL_BUDGET_FILE")
     inherited_maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
-    try:
-        native_argv = _plan_native_go_delegation(sys.argv[1:])
-    except ValueError as error:
-        print(f"makewand: error: {error}", file=sys.stderr)
+    archived = _archived_command(sys.argv[1:])
+    if archived:
+        # Without this an unknown word would reach the parser as a task prompt.
+        print(f"makewand: {archived} 已归档，只保留在 tag archive/pre-trim-20261105。", file=sys.stderr)
         sys.exit(EXIT_USAGE_ERROR)
-    if native_argv is not None:
-        refusal = _provider_worker_refusal(next((a for a in native_argv if a in NATIVE_GO_COMMANDS), None), native_argv)
-        if refusal:
-            print(c(refusal, COLOR_RED), file=sys.stderr)
-            sys.exit(EXIT_USAGE_ERROR)
-        return delegate_to_go_server(native_argv)
+    if sys.argv[1:] == ["help"]:
+        sys.argv[1:] = ["--help"]
 
     common_parser = argparse.ArgumentParser(add_help=False)
     common_parser.add_argument("-C", "--cwd", dest="cwd", default=None, help="Target working directory (default: current directory)")

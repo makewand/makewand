@@ -184,26 +184,5 @@ class TestUnsafeHostExecGate(HostExecCase):
             self.assertTrue(sandbox.is_unsafe_host_exec_authorized())
 
 
-class TestGoAlignment(unittest.TestCase):
-    """The acknowledgment and audit log must stay interchangeable with the Go engine."""
-
-    def test_keys_version_and_audit_file_match_go_sources(self):
-        cfg_go = (REPO_ROOT / "internal" / "config" / "config.go").read_text(encoding="utf-8")
-        hostexec_go = (REPO_ROOT / "cmd" / "makewand" / "hostexec.go").read_text(encoding="utf-8")
-        for key in (sandbox.ACK_VERSION_KEY, sandbox.ACK_AT_KEY, sandbox.ACK_HOST_KEY):
-            self.assertIn(f'json:"{key},omitempty"', cfg_go)
-        m = re.search(r"UnsafeHostExecAckCurrentVersion\s*=\s*(\d+)", cfg_go)
-        self.assertIsNotNone(m)
-        self.assertEqual(int(m.group(1)), sandbox.UNSAFE_HOST_EXEC_ACK_CURRENT_VERSION)
-        m = re.search(r'unsafeHostExecAuditFile\s*=\s*"([^"]+)"', hostexec_go)
-        self.assertEqual(m.group(1), sandbox.UNSAFE_HOST_EXEC_AUDIT_FILE)
-        for field in ("time", "context", "command", "args", "dir", "source"):
-            self.assertRegex(hostexec_go, rf'json:"{field}(,omitempty)?"')
-
-    def test_audit_file_lives_in_config_dir(self):
-        with tempfile.TemporaryDirectory() as tmp, patch.object(mw_config, "CONFIG_DIR", Path(tmp)):
-            self.assertEqual(sandbox.unsafe_host_exec_audit_path(), Path(tmp) / "unsafe_exec_audit.jsonl")
-
-
 if __name__ == "__main__":
     unittest.main()

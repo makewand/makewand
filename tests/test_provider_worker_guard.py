@@ -49,7 +49,6 @@ class TestProviderWorkerGuard(unittest.TestCase):
 
     def test_safe_commands_allowed_inside_worker(self):
         self.assertEqual(cli.WORKER_SAFE_SUBCOMMANDS, {"search", "repomap"})
-        self.assertFalse({"state", "token", "user", "quota", "usage", "audit"} & cli.GO_WORKER_SAFE_COMMANDS)
 
     def test_shared_go_python_policy(self):
         cases = json.loads((Path(__file__).parent / "testdata/provider_worker_policy.json").read_text())
@@ -58,41 +57,6 @@ class TestProviderWorkerGuard(unittest.TestCase):
                 with self.subTest(argv=case["argv"]):
                     self.assertEqual(cli._provider_worker_refusal(None, case["argv"]) is None,
                                      case["allowed"])
-        result = subprocess.run([sys.executable, "-I", "scripts/generate_cli_contract.py", "--check"],
-                                cwd=Path(__file__).parent.parent, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_delegation_checks_full_path_before_go_launch(self):
-        cases = json.loads((Path(__file__).parent / "testdata/provider_worker_policy.json").read_text())
-        for case in cases:
-            if case["allowed"]:
-                continue
-            with self.subTest(argv=case["argv"]), patch.dict(os.environ, {cli.PROVIDER_WORKER_ENV: "1"}), \
-                    patch.object(sys, "argv", ["makewand", *case["argv"]]), \
-                    patch.object(cli, "delegate_to_go_server") as delegate, \
-                    contextlib.redirect_stderr(io.StringIO()) as stderr:
-                with self.assertRaises(SystemExit) as raised:
-                    cli.main()
-                self.assertEqual(raised.exception.code, 2)
-                self.assertIn("只读", stderr.getvalue())
-                delegate.assert_not_called()
-
-    def test_static_queries_delegate_with_literal_arguments(self):
-        for argv in (["help"], ["completion", "bash"], ["completion", "fish", "--no-descriptions"]):
-            with self.subTest(argv=argv), patch.dict(os.environ, {cli.PROVIDER_WORKER_ENV: "1"}), \
-                    patch.object(sys, "argv", ["makewand", *argv]), \
-                    patch.object(cli, "delegate_to_go_server", return_value=0) as delegate:
-                self.assertEqual(cli.main(), 0)
-                delegate.assert_called_once_with(argv)
-
-    def test_worker_delegation_never_builds_a_dev_cache(self):
-        with patch.dict(os.environ, {cli.PROVIDER_WORKER_ENV: "1", "MAKEWAND_DEV": "1"}), \
-                patch.object(cli, "_find_go_binary", return_value=None), \
-                patch.object(cli, "_build_dev_go_binary") as build, \
-                contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                cli.delegate_to_go_server(["completion", "bash"])
-            build.assert_not_called()
 
     def test_repository_queries_have_no_config_budget_or_daemon_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -8,6 +8,7 @@ if _CONTRACT.get("schema") != 1:
 
 PYTHON_COMMANDS = frozenset(_CONTRACT["python_commands"])
 NATIVE_GO_COMMANDS = frozenset(_CONTRACT["native_go_commands"])
+ARCHIVED_COMMANDS = frozenset(_CONTRACT["archived_commands"])
 DELEGATED_PYTHON_COMMANDS = PYTHON_COMMANDS - NATIVE_GO_COMMANDS
 PYTHON_VALUE_FLAGS = frozenset(_CONTRACT["python_value_flags"])
 SHARED_VALUE_FLAGS = frozenset(_CONTRACT["shared_value_flags"])

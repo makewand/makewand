@@ -417,15 +417,5 @@ class TestCatalogIsOneMirrorableDataFile(unittest.TestCase):
                 self.assertIsNone(re.search(r"\(\?[=!]|\(\?<[=!]|\(\?P=|\(\?\(|\\[1-9]|\(\?>|[*+?}]\+|\\Z", pattern))
                 health.cli_catalog_regex(pattern)
 
-    def test_the_package_ships_the_catalog(self):
-        with tempfile.TemporaryDirectory(prefix="mw-stage-") as out:
-            proc = subprocess.run([sys.executable, "-I", str(REPO_ROOT / "scripts" / "stage_python_engine.py"),
-                                   str(Path(out) / "bundle"), "0.0.0-test"], capture_output=True, text=True,
-                                  timeout=120)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            staged = Path(out) / "bundle" / "lib" / "makewand" / "python" / "makewand" / "cli_message_catalog.json"
-            self.assertEqual(staged.read_bytes(), CATALOG_FILE.read_bytes())
-
-
 if __name__ == "__main__":
     unittest.main()

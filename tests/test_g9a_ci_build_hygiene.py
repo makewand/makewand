@@ -2,7 +2,6 @@
 
 - the Makefile offers CI-equivalent `lint` / `vuln` targets pinned to the go.mod
   toolchain (a newer local Go made prebuilt analyzers panic), and
-  `make prelaunch` runs what docs/PRELAUNCH.md promises;
 - .golangci.yml carries no exclusions for paths that do not exist;
 - .gitignore changes never hide tracked files and cover generated artifacts.
 """
@@ -57,45 +56,6 @@ class MakefileTests(unittest.TestCase):
         out = self._dry_run("test")
         self.assertIn("bash scripts/test_check_secrets.sh", out)
         self.assertIn("bash scripts/check_version.sh", out)
-
-    def test_prelaunch_runs_what_the_docs_promise(self):
-        out = self._dry_run("prelaunch")
-        for command in ("./scripts/check_secrets.sh", "bash scripts/test_check_secrets.sh",
-                        "bash scripts/check_version.sh", "bash -n", "gofmt -l",
-                        "golangci-lint run ./...", "bash ./scripts/prelaunch_gate.sh",
-                        "scripts/test_race.sh", "govulncheck ./..."):
-            with self.subTest(command=command):
-                self.assertIn(command, out)
-        gate = (ROOT / "scripts" / "prelaunch_gate.sh").read_text(encoding="utf-8")
-        self.assertIn("doctor --strict", gate)
-        docs = (ROOT / "docs" / "PRELAUNCH.md").read_text(encoding="utf-8")
-        for mention in ("prelaunch_gate.sh", "doctor --strict", "make lint", "make vuln",
-                        "check_secrets.sh", "check_version.sh", "test_race.sh", "MAKEWAND_LIVE_SMOKE"):
-            with self.subTest(doc_mention=mention):
-                self.assertIn(mention, docs)
-        # The old checklist promised a vet scope that `make prelaunch` never ran.
-        self.assertNotIn("go vet ./cmd/... ./internal/... ./router", docs)
-
-    def test_prelaunch_runs_every_ci_benchmark_and_python_check(self):
-        # docs/PRELAUNCH.md promises every CI verify check; the gate ran one of
-        # the three offline benchmark scripts.
-        ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        gate = (ROOT / "scripts" / "prelaunch_gate.sh").read_text(encoding="utf-8")
-        harness = ci.split("- name: Offline benchmark harness", 1)[1].split("- name:", 1)[0]
-        commands = re.findall(r"python3 -I benchmarks/\S+\.py", harness)
-        self.assertEqual(len(commands), 3)
-        for command in (*commands, "python3 -I -m pytest -q -p no:cacheprovider tests",
-                        "bash dispatch/test.sh", "python3 -I scripts/test_installation.py"):
-            with self.subTest(command=command):
-                self.assertIn(command, gate)
-
-    def test_prelaunch_uses_a_private_go_build_cache(self):
-        # A fixed /tmp/makewand-gocache is shared with every local user, who
-        # could plant build results there before the gate runs.
-        gate = (ROOT / "scripts" / "prelaunch_gate.sh").read_text(encoding="utf-8")
-        self.assertNotRegex(gate, r"GOCACHE=[\"']?/tmp")
-        self.assertIn('GOCACHE="$(go env GOCACHE)"', gate)
-
 
 class RepositoryHygieneTests(unittest.TestCase):
     def test_golangci_exclusions_point_at_existing_paths(self):

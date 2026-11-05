@@ -10,7 +10,7 @@ Briefly explain the change and why it is needed.
 
 - [ ] `go test ./...`
 - [ ] `go vet ./...`
-- [ ] `make prelaunch` (or explain why not run)
+- [ ] `make test` (or explain why not run)
 
 ## Release impact
 

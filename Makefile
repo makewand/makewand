@@ -1,6 +1,6 @@
 .PHONY: all install test test-py test-go test-dispatch test-install test-benchmark test-scripts \
-	check-secrets check-version check-shell fmt-check lint vuln race prelaunch probe status clean \
-	test-architecture drill-long
+	check-secrets check-version check-shell fmt-check lint vuln race probe status clean
+
 
 # Go-based analyzers must run under the toolchain CI uses (actions/setup-go reads
 # go.mod). A prebuilt golangci-lint/govulncheck built with go.mod's Go panics or
@@ -47,22 +47,10 @@ test-benchmark:
 	python3 -I benchmarks/test_deep_config_acceptance_v4.py
 	python3 -I benchmarks/test_analyze_results.py
 
-test-architecture:
-	MAKEWAND_REQUIRE_BWRAP=1 go test ./internal/engine -run 'TrustedAcceptance|^TestApply|^TestPendingApproval' -count=1
-	go test ./internal/tui -run '^TestPendingApproval' -count=1
-	go test ./internal/processjob -count=1
-	python3 -I scripts/test_python.py test_candidate_recovery
-	go run ./cmd/server-drill --output benchmarks/results/architecture/server-short.json --requests 400 --concurrency 32 --tenants 4 --router-calls 100000
-
-drill-long:
-	go run ./cmd/server-drill --output benchmarks/results/architecture/server-long.json --requests 10000 --concurrency 64 --tenants 10 --router-calls 100000
-
 # Release-tooling self-tests: secret scanner regression corpus + version consistency.
 test-scripts:
 	bash scripts/test_check_secrets.sh
 	bash scripts/check_version.sh
-	python3 -I scripts/generate_cli_contract.py --check
-	python3 -I scripts/check_execution_contract.py
 
 test: test-py test-go test-dispatch test-install test-benchmark test-scripts
 
@@ -104,13 +92,6 @@ vuln:
 race:
 	bash ./scripts/test_race.sh
 
-# Release gate = every CI `verify` check plus the operator-only doctor check.
-# See docs/PRELAUNCH.md. MAKEWAND_LIVE_SMOKE=1 / MAKEWAND_DOCTOR_MODES are
-# honoured by scripts/prelaunch_gate.sh.
-prelaunch: check-secrets test-scripts check-shell fmt-check lint
-	bash ./scripts/prelaunch_gate.sh
-	$(MAKE) race vuln
-	@echo "Prelaunch checks passed successfully!"
 
 probe:
 	./bin/makewand probe

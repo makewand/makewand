@@ -7,11 +7,8 @@ on:
   pull_request:
     branches:
       - master
-  # The Release workflow runs this verify job as its test job, so a tag is held
-  # to every check a pull request must pass. Branch protection requires the
-  # check named "verify": keep the job here rather than moving it into another
-  # reusable workflow, which would rename the check to "<caller> / verify".
-  workflow_call:
+  # Branch protection requires the check named "verify": keep the job here
+  # rather than moving it into a reusable workflow, which would rename it.
 
 permissions:
   contents: read
@@ -65,21 +62,13 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Shared command contract
-        run: python3 -I scripts/generate_cli_contract.py --check
-
-      - name: Shared execution contract
-        run: python3 -I scripts/check_execution_contract.py
-
       - name: Install E2E dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          # bubblewrap so the live sandbox isolation test (verify_isolation_live_test.go)
-          # actually runs instead of skipping — the generation/verification trust
-          # boundary is security-critical and must be exercised end-to-end in CI.
-          sudo apt-get install -y expect bubblewrap ripgrep
+          # bubblewrap so the sandbox tests actually run instead of skipping.
+          sudo apt-get install -y bubblewrap ripgrep
           rg --version
 
       - name: Allow unprivileged user namespaces for bubblewrap
@@ -99,8 +88,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # First the minimal network-namespace check, then the exact probe the
-          # product uses (internal/engine/verify_isolation.go).
+          # First the minimal network-namespace check, then the probe the sandbox uses.
           if out="$(bwrap --unshare-net --ro-bind / / true 2>&1)" \
             && out="$(bwrap --ro-bind / / --unshare-pid --unshare-net true 2>&1)"; then
             echo "bubblewrap OK: $(bwrap --version)"
@@ -130,22 +118,8 @@ jobs:
             exit 1
           fi
 
-      - name: Live sandbox smoke (bubblewrap required, not cached)
-        # The verification/generation trust boundary is security-critical, so the
-        # real bwrap sandbox must be exercised on every run — not silently skipped
-        # if bubblewrap is missing or broken. MAKEWAND_REQUIRE_BWRAP=1 turns an
-        # unavailable sandbox into a hard failure; -count=1 defeats the test cache.
-        env:
-          MAKEWAND_REQUIRE_BWRAP: "1"
-        run: go test ./internal/engine -run '^TestEvaluateCandidateFiles_LiveBwrapIsolation$' -count=1 -v
-
       - name: Run tests
         run: bash ./scripts/test_gate.sh
-
-      - name: Independent trusted acceptance (real sandbox required)
-        env:
-          MAKEWAND_REQUIRE_BWRAP: "1"
-        run: go test ./internal/engine -run 'TrustedAcceptance' -count=1 -v
 
       - name: Setup Python
         uses: actions/setup-python@v5

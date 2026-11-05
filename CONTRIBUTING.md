@@ -9,14 +9,17 @@ security, recovery and compatibility fixes only. The day-to-day core is dispatch
 (`makewand <provider>` / `review`), `route`, the call budget and outcome ledgers,
 `mark` and the sandbox.
 
+The Go TUI, the multi-tenant server suite, the Go engine and router, native
+release packaging and the Windows gate were removed from the main line on
+2026-11-05. They stay in the tag `archive/pre-trim-20261105`. The Go code left
+here is the `makewand-server quota` reader in `internal/quota`.
+
 These components are **frozen** (2026-10-27): they keep their code and tests,
 but only defects that lose data or break security are fixed; ordinary bugs,
 features and refactors are not taken.
 
-- Multi-tenant server suite: `server*` packages, the `serve` command and `cmd/server-drill`
-- Terminal UI: `internal/tui`
 - Race / ensemble / merge / DAG: `race`, `ensemble`, `merge`, `makewand/ensemble.py`, `makewand/merger.py`, `makewand/task_dag.py`
-- Website `site/` and the Homebrew/Scoop channels (`scripts/publish_homebrew_tap.sh`, `scripts/publish_scoop_bucket.sh`)
+- Website `site/`
 - `benchmarks/`
 
 ## Development setup
@@ -34,23 +37,8 @@ go build -trimpath -o build/makewand ./cmd/makewand
 Run these before opening a PR:
 
 ```bash
-go test ./...
+make test
 go vet ./...
-make prelaunch
-```
-
-Optional live probe (requires credentials/network):
-
-```bash
-MAKEWAND_LIVE_SMOKE=1 MAKEWAND_DOCTOR_MODES=balanced,power make prelaunch
-```
-
-`go test ./...` connects to nothing outside this host. Test steps that reach
-the internet (the dependency-install network's DNS and public egress checks, a
-real `npm install` against its registry) run only when asked:
-
-```bash
-MAKEWAND_TEST_LIVE_NETWORK=1 go test ./internal/engine -run 'DepsNet|TestFullBuildPipeline'
 ```
 
 ## Commit and PR guidance

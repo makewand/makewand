@@ -263,67 +263,19 @@ class InstallationTests(unittest.TestCase):
             self.assertFalse((binaries / "makewand").is_symlink())
             self.assertEqual(before, hashlib.sha256((app / "bin" / "makewand").read_bytes()).hexdigest())
             for args in (("--version",), ("--help",), ("review", "--repo-trust", "untrusted", "--help"),
-                         ("-C", str(hostile), "serve", "--help"),
-                         ("--max-model-calls", "1", "serve", "--help"),
-                         ("serve", "--call-budget-file", str(temp / "unused-budget.json"), "--help"),
-                         ("--cwd=" + str(hostile), "--repo-trust", "untrusted", "chat", "--help")):
+                         ("-C", str(hostile), "route", "--help"),
+                         ("--cwd=" + str(hostile), "--repo-trust", "untrusted", "status", "--help")):
                 subprocess.run([str(binaries / "makewand"), *args], cwd=hostile, env=env,
                                check=True, capture_output=True, text=True)
-            for args in (("--daemon", "serve", "--help"), ("serve", "--workflow", "race", "--help")):
-                rejected = subprocess.run([str(binaries / "makewand"), *args], cwd=hostile, env=env,
-                                          capture_output=True, text=True)
-                self.assertEqual(rejected.returncode, 2)
-                self.assertIn("cannot be honored", rejected.stderr)
+            rejected = subprocess.run([str(binaries / "makewand"), "serve", "--help"], cwd=hostile, env=env,
+                                      capture_output=True, text=True)
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("已归档", rejected.stderr)
             self.assertFalse(marker.exists())
             config = json.loads((temp / "config" / "config.json").read_text())
             self.assertIs(config["enabled_providers"]["local"], False)
             check = "import sys; sys.path.insert(0, sys.argv[1]); from makewand.config import is_provider_enabled; assert not is_provider_enabled('local')"
             subprocess.run(["python3", "-I", "-c", check, str(app)], cwd=hostile, env=env, check=True)
-
-    def test_release_bundle_from_clean_extraction(self):
-        with tempfile.TemporaryDirectory(prefix="makewand-release-") as directory:
-            temp = Path(directory)
-            bundle = temp / "staged" / "makewand"
-            bundle.mkdir(parents=True)
-            frozen = temp / "frozen-source"
-            frozen.mkdir()
-            installer = installer_module()
-            expected_inputs = installer.freeze_source(ROOT, frozen)
-            executable = "makewand.exe" if os.name == "nt" else "makewand"
-            version = "v0.0.0-contract"
-            subprocess.run(["go", "build", "-trimpath", "-buildvcs=false", "-ldflags",
-                            f"-X github.com/makewand/makewand/internal/buildinfo.Version={version}",
-                            "-o", str(bundle / executable), "./cmd/makewand"], cwd=frozen,
-                           env=dict(os.environ, GOWORK="off"), check=True)
-            installer.verify_frozen_source(frozen, expected_inputs)
-            (frozen / "scripts").mkdir(exist_ok=True)
-            shutil.copy2(ROOT / "scripts/stage_python_engine.py", frozen / "scripts/stage_python_engine.py")
-            subprocess.run(["python3", "-I", str(frozen / "scripts/stage_python_engine.py"), str(bundle), version], check=True)
-            archive = shutil.make_archive(str(temp / "release"), "gztar", bundle.parent, bundle.name)
-            extracted = temp / "extracted"
-            import tarfile
-            with tarfile.open(archive) as packed:
-                if hasattr(tarfile, "data_filter"):
-                    packed.extractall(extracted, filter="data")
-                else:
-                    packed.extractall(extracted)
-            shutil.rmtree(bundle.parent)
-            subprocess.run([find_bash(), str(ROOT / "scripts" / "release_contract.sh"),
-                            str(extracted / "makewand" / executable), version], check=True)
-            if os.name != "nt":
-                # Homebrew retains both engines under libexec and exposes a bin entry.
-                prefix = temp / "prefix"
-                (prefix / "bin").mkdir(parents=True)
-                shutil.copytree(extracted / "makewand", prefix / "libexec")
-                (prefix / "bin" / "makewand").symlink_to(prefix / "libexec" / executable)
-                subprocess.run([str(prefix / "bin" / "makewand"), "run", "--help"],
-                               cwd=temp, check=True, capture_output=True)
-            # Incomplete artifacts must fail even if the developer has another install.
-            shutil.rmtree(extracted / "makewand" / "lib")
-            result = subprocess.run([find_bash(), str(ROOT / "scripts" / "release_contract.sh"),
-                                     str(extracted / "makewand" / executable), version], capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

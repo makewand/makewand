@@ -5,7 +5,7 @@ Validates:
 2. 'pro' family keyword ranks native Gemini models accurately for deep tier.
 3. Foreign proxy models (Claude/GPT) never hijack native AGY tier resolution.
 4. CLI effort dialect translation normalizes 'max'/'high'/'medium'/'low' appropriately per provider.
-5. export_routing_overrides dynamically syncs modern models without hardcoding.
+5. (removed with the Go router) discovered.json export.
 """
 
 import sys
