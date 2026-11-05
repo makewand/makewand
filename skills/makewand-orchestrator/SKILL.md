@@ -54,8 +54,8 @@ makewand outcome codex 3 review pass --candidate-verdict fail --candidate-hash <
 
 ## 权限与交付
 
-用户授权和偏好优先；不要为已授权动作反复确认。`MAKEWAND_UNSAFE_HOST_EXEC`、`apply --force`、`--allow-collision`、`--boost`、`--retry-approved` 和提高请求额度只可在用户授权范围内使用，不绕过沙箱或额度保护。不可信仓库用 `--repo-trust untrusted`。
+用户授权和偏好优先；不要为已授权动作反复确认。`MAKEWAND_UNSAFE_HOST_EXEC`、`--retry-approved` 和提高请求额度只可在用户授权范围内使用，不绕过沙箱或额度保护。不可信仓库用 `--repo-trust untrusted`。
 
-若报告隔离交付，只生成了补丁，应明确尚未应用；应用属于用户既有授权时继续完成，否则展示具体补丁后再询问。race 选择不明确时展示候选再请用户决定。最后一句说明用了谁、档位、实际调用次数、裁决及父方核实情况。
+最后一句说明用了谁、档位、实际调用次数、裁决及父方核实情况。
 
 如果 `MAKEWAND_PROVIDER_WORKER=1` 或自身任务来自 Makewand：直接完成任务，禁止再次派发或调用管理命令。只允许 worker 白名单内的静态查询；不要移除环境变量、换路径或绕过祖先进程检查。

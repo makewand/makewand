@@ -245,8 +245,7 @@ def candidates(
 ) -> tuple:
     """Return the ordered candidates for ``tier``.
 
-    ``catalog`` defaults to the built-in slim table. Pass the dict from
-    ``load_catalog`` to read an override. That path is unchanged.
+    ``catalog`` defaults to the built-in slim table.
 
     ``full=True`` returns this tier of ``build_full_catalog(discovered)``
     instead. The slim ``catalog`` override is not applied. Legacy rows are
@@ -264,20 +263,6 @@ def candidates(
     except (KeyError, TypeError) as error:
         raise ValueError(f"invalid tier {tier!r}; legal values: {_legal(str(item) for item in TIERS)}") from error
     return tuple(rows)
-
-
-def load_catalog(path: Optional[Union[str, Path]] = None) -> dict:
-    """Return the tier table, with tiers listed in ``path`` replaced.
-
-    ``path`` None returns the built-in table. A missing file, invalid JSON, or
-    a candidate that does not match the schema raises ValueError. The returned
-    dict is a new mapping; mutating it does not change later calls.
-    """
-    catalog = {tier: _BUILTIN[tier] for tier in TIERS}
-    if path is None:
-        return catalog
-    catalog.update(_read_overrides(path))
-    return catalog
 
 
 def starting_tier(task_type: str, difficulty: str, risk: str = "low") -> int:
@@ -309,86 +294,6 @@ def escalate(tier: int) -> Optional[int]:
     if tier == 3:
         return None
     return tier + 1
-
-
-def _read_overrides(path: Union[str, Path]) -> dict:
-    file_path = Path(path)
-    where = f"routing catalog: {file_path}"
-    try:
-        text = file_path.read_text(encoding="utf-8")
-    except FileNotFoundError as error:
-        raise ValueError(f"{where}: file not found") from error
-    except IsADirectoryError as error:
-        raise ValueError(f"{where}: not a file") from error
-    except UnicodeError as error:
-        raise ValueError(f"{where}: not valid UTF-8: {error}") from error
-    except OSError as error:
-        raise ValueError(f"{where}: cannot read file: {error}") from error
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{where}: invalid JSON: {error}") from error
-    if not isinstance(data, dict):
-        raise ValueError(f"{where}: must be a JSON object; legal tier keys: {_legal(_TIER_KEYS)}")
-
-    unknown = [key for key in data if key not in _TIER_KEYS]
-    if unknown:
-        raise ValueError(
-            f"{where}: unknown tier {unknown[0]!r}; legal values: {_legal(_TIER_KEYS)}"
-        )
-
-    overrides = {}
-    for key, raw_rows in data.items():
-        tier = int(key)
-        if not isinstance(raw_rows, list) or not raw_rows:
-            raise ValueError(
-                f"{where}: tier {key!r} must be a non-empty list of candidates"
-            )
-        parsed = []
-        for index, item in enumerate(raw_rows):
-            parsed.append(_parse_candidate(item, f"{where}: tier {key} candidate {index}"))
-        overrides[tier] = tuple(parsed)
-    return overrides
-
-
-def _parse_candidate(item, where: str) -> TierCandidate:
-    if not isinstance(item, dict):
-        raise ValueError(f"{where}: candidate must be a JSON object with provider, args and label")
-    missing = [key for key in _CANDIDATE_KEYS if key not in item]
-    extra = [key for key in item if key not in _CANDIDATE_KEYS]
-    if missing or extra:
-        detail = []
-        if missing:
-            detail.append("missing " + ", ".join(missing))
-        if extra:
-            detail.append("unknown " + ", ".join(extra))
-        raise ValueError(
-            f"{where}: candidate keys must be provider, args, label ({'; '.join(detail)})"
-        )
-
-    provider = item["provider"]
-    if not isinstance(provider, str) or provider.strip().lower() not in PROVIDER_FAMILIES:
-        raise ValueError(
-            f"{where}: invalid provider {provider!r}; legal values: {_legal(PROVIDER_FAMILIES)}"
-        )
-    provider = provider.strip().lower()
-
-    args = item["args"]
-    if (
-        not isinstance(args, list)
-        or not args
-        or any(not isinstance(part, str) or part == "" for part in args)
-    ):
-        raise ValueError(f"{where}: args must be a non-empty list of strings")
-
-    label = item["label"]
-    if not isinstance(label, str) or label.strip() == "":
-        raise ValueError(f"{where}: label must be a non-empty string")
-
-    candidate = TierCandidate(provider, tuple(args), label)
-    _reject_agy_credits(candidate, where)
-    return candidate
 
 
 # Effort bands used by the tier table. Order is also the canonical listing order.

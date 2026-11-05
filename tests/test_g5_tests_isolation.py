@@ -33,7 +33,6 @@ from unittest.mock import patch
 
 import makewand.config as config
 import makewand.health as health
-import makewand.memory as memory
 import makewand.usage as usage
 
 REPO_ROOT = _isolation.REPO_ROOT
@@ -75,24 +74,6 @@ class TestProcessIsolation(unittest.TestCase):
         self.assertTrue(_inside(Path.home(), ISO.root))
         self.assertFalse(_inside(ISO.root, REAL_HOME))
 
-    def test_config_and_derived_state_paths_are_redirected(self):
-        paths = {f"config.{name}": getattr(config, name)
-                 for name in _isolation.CONFIG_PATH_NAMES if hasattr(config, name)}
-        paths.update({
-            "memory.PATTERNS_FILE": memory.PATTERNS_FILE,
-            "memory.PATTERNS_LOCK": memory.PATTERNS_LOCK,
-            "usage.USAGE_WINDOW_FILE": usage.USAGE_WINDOW_FILE,
-            "usage.active_file": usage._get_active_usage_file(),
-            "health.STATUS_CACHE_FILE": health.STATUS_CACHE_FILE,
-            "health.LEGACY_TRIO_CACHE": health.LEGACY_TRIO_CACHE,
-        })
-        real_state = (REAL_HOME / ".config" / "makewand", REAL_HOME / ".gemini",
-                      Path("/tmp/makewand_test_usage.json"))
-        for label, value in paths.items():
-            with self.subTest(path=label):
-                self.assertTrue(_inside(value, ISO.root), f"{label}={value}")
-                for forbidden in real_state:
-                    self.assertFalse(_inside(value, forbidden), f"{label}={value}")
 
     def test_credentials_and_policy_switches_are_scrubbed(self):
         leaked = [key for key in os.environ
@@ -196,12 +177,12 @@ class TestLateActivation(unittest.TestCase):
             code = (
                 "import sys, json\n"
                 f"sys.path[:0] = [{str(REPO_ROOT)!r}, {str(TESTS_DIR)!r}]\n"
-                "import makewand.config, makewand.health, makewand.memory, makewand.usage\n"
+                "import makewand.config, makewand.health, makewand.usage\n"
                 "import _isolation\n"
-                "import makewand.config as c, makewand.health as h, makewand.memory as m, makewand.usage as u\n"
+                "import makewand.config as c, makewand.health as h, makewand.usage as u\n"
                 "print(json.dumps({'root': str(_isolation.state().root), 'paths': [str(p) for p in (\n"
                 "  c.CONFIG_DIR, c.CONFIG_FILE, c.CANDIDATES_DIR, c.LEGACY_TRIO_CACHE, h.STATUS_CACHE_FILE,\n"
-                "  h.LEGACY_TRIO_CACHE, h.STATUS_LOCK_FILE, m.PATTERNS_FILE, u.USAGE_WINDOW_FILE)]}))\n"
+                "  h.LEGACY_TRIO_CACHE, h.STATUS_LOCK_FILE, u.USAGE_WINDOW_FILE)]}))\n"
             )
             env = {"HOME": str(fake_home), "PATH": os.environ["PATH"], "TMPDIR": tmp, "LANG": "C.UTF-8"}
             proc = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True,

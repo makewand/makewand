@@ -1622,11 +1622,6 @@ def probe_model(
     return {"status": "unknown", "reason": "Unknown model", "resets_at": None, "updated_at": now, "mode": "none"}
 
 
-def check_grok_health(*args, **kwargs) -> Dict[str, Any]:
-    """Helper alias to probe Grok health status."""
-    return probe_model("grok", *args, **kwargs)
-
-
 PROBE_REUSE_SECONDS = 120
 # Joins a kept failure verdict's reason and what the latest probe saw.
 _PROBE_NOTE_MARK = " · 最近一次探活"

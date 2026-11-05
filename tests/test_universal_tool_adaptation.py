@@ -36,10 +36,7 @@ from makewand.config import (
     is_provider_enabled,
     set_provider_enabled
 )
-from makewand.orchestrator import (
-    select_optimal_engine_pair,
-    dispatch_task
-)
+from makewand.orchestrator import dispatch_task
 
 class TestUniversalToolAdaptation(unittest.TestCase):
 
@@ -108,37 +105,6 @@ class TestUniversalToolAdaptation(unittest.TestCase):
             active = get_active_providers()
             self.assertNotIn("claude", active)
 
-    def test_single_tool_mode_resilience(self):
-        """Tests that N=1 triggers resilient single-tool mode (self-critique) without failing."""
-        with patch("makewand.config.get_active_providers") as mock_active, \
-             patch("makewand.orchestrator.get_or_update_status") as mock_status:
-
-            mock_active.return_value = ["claude"]
-            mock_status.return_value = {"claude": {"status": "healthy"}}
-
-            coders, reviewers, meta = select_optimal_engine_pair("Write a quicksort function")
-            self.assertEqual(coders[0], "claude")
-            self.assertEqual(reviewers[0], "claude")
-            self.assertTrue(meta["single_tool_mode"])
-            self.assertIn("单工具实现 + 独立沙箱自审闭条模式" if "单工具实现 + 独立沙箱自审闭条模式" in " ".join(meta["reasons"]) else "单工具", " ".join(meta["reasons"]))
-
-    def test_multi_tool_cross_model_orchestration(self):
-        """Tests that N>=2 pairs different models for cross-model red-team review."""
-        with patch("makewand.config.get_active_providers") as mock_active, \
-             patch("makewand.orchestrator.get_or_update_status") as mock_status:
-
-            mock_active.return_value = ["claude", "codex", "agy"]
-            mock_status.return_value = {
-                "claude": {"status": "healthy"},
-                "codex": {"status": "healthy"},
-                "agy": {"status": "healthy"}
-            }
-
-            coders, reviewers, meta = select_optimal_engine_pair("Refactor user model and write tests")
-            self.assertFalse(meta["single_tool_mode"])
-            self.assertNotEqual(coders[0], reviewers[0], "Coder and Reviewer must be different in multi-tool mode")
-            self.assertIn(coders[0], ["claude", "codex", "agy"])
-            self.assertIn(reviewers[0], ["claude", "codex", "agy"])
 
     def test_dispatch_task_aider(self):
         """Tests dispatching tasks to Aider CLI."""
@@ -281,47 +247,6 @@ class TestUniversalToolAdaptation(unittest.TestCase):
                 import shutil
                 shutil.rmtree(external_dir, ignore_errors=True)
 
-    def test_local_only_and_provider_override(self):
-        """Tests local_only and forced_engine routing behavior."""
-        import tempfile
-        from makewand.orchestrator import _run_pipeline_impl
-        with patch("makewand.orchestrator.dispatch_task") as mock_dispatch, \
-             patch("makewand.orchestrator.PipelineWorkspaceGuard.acquire_workspace_lock", return_value=None), \
-             tempfile.TemporaryDirectory() as workspace:
-            mock_dispatch.return_value = (True, "mock explanation", None)
-            # A temporary cwd: the pipeline must never default to the checkout under test.
-            ok = _run_pipeline_impl("只解释原理，不用修改文件", cwd=workspace, local_only=True)
-            self.assertTrue(ok)
-            mock_dispatch.assert_called()
-            args, kwargs = mock_dispatch.call_args
-            self.assertEqual(args[0], "local")
-
-    def test_execute_agentic_tool_batch(self):
-        """Tests executing a batch of tool actions (write_file, read_file, run_command)."""
-        import tempfile
-        from makewand.providers.api_client import execute_agentic_tool_batch
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            actions = [
-                {"action": "write_file", "path": "pkg/mod.py", "content": "x = 42\n"},
-                {"action": "read_file", "path": "pkg/mod.py"},
-                {"action": "run_command", "cmd": "echo batch_command_success"},
-            ]
-            results = execute_agentic_tool_batch(actions, tmp_dir)
-            self.assertEqual(len(results), 3)
-
-            # 1. write_file result
-            self.assertEqual(results[0]["status"], "ok")
-            self.assertEqual(results[0]["path"], "pkg/mod.py")
-            self.assertTrue((Path(tmp_dir) / "pkg" / "mod.py").exists())
-
-            # 2. read_file result
-            self.assertEqual(results[1]["status"], "ok")
-            self.assertEqual(results[1]["content"], "x = 42\n")
-
-            # 3. run_command result
-            self.assertEqual(results[2]["status"], "ok")
-            self.assertIn("batch_command_success", results[2]["stdout"])
 
     def test_apply_agentic_code_output_tool_batch(self):
         """Tests parsing tool batch JSON block inside apply_agentic_code_output."""

@@ -119,9 +119,6 @@ def unload_local_model(model_name: str) -> None:
     except Exception:
         pass
 
-def parse_local_quota(output: str) -> Tuple[bool, str, Optional[str]]:
-    """Local models are 100% free and have no commercial rate limits."""
-    return False, "", None
 
 
 # Ollama silently drops the start of a prompt that does not fit the model's context
@@ -444,7 +441,7 @@ def execute_local_task(
     ever spawns its own inference child, lower *its* priority via preexec_fn.)
 
     The endpoint is a chat completion API: it returns text and never edits files.
-    Callers that need file changes must verify the diff (run_pipeline/run_race do).
+    Callers that need file changes must verify the diff.
     A read-only dispatch (review, judging, question) must rest on the whole prompt:
     it runs on Ollama's native API with a sufficient context window, or on an
     OpenAI-compatible-only endpoint with its reported prompt token count checked,

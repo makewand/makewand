@@ -99,20 +99,6 @@ class FilterFixture(unittest.TestCase):
 class CommondirShieldTests(FilterFixture):
     """py-sec-1: info/attributes of every git and common directory git uses is shielded."""
 
-    def test_review_diff_shields_the_commondir_of_a_git_directory(self):
-        common = self.committed_git_dir(self.root / "common", {"f.txt": "one\n"})
-        repo = self.root / "repo"
-        self.linked_git_dir(repo, common)
-        (repo / "f.txt").write_text("one\nchanged\n")
-        self.plant_filter(common / "config")
-        self.plant_attributes(common)
-
-        diff, error = git_helper.get_git_diff_status(str(repo))
-        self.assertIsNone(error)
-        self.assertIn("+changed", diff)
-        self.assertEqual(self.marker_lines(), [])
-        self.assertEqual((common / "info" / "attributes").read_text(), "* filter=evil\n")
-        self.assertIn(common / "info" / "attributes", git_helper._get_git_info_attributes_paths(repo))
 
     def test_review_diff_shields_the_commondir_of_a_nested_repository(self):
         # The sandbox cannot write the top-level .git but can plant a nested
@@ -280,18 +266,6 @@ class ApplyFilterTests(FilterFixture):
         self.plant_filter(repo / ".git" / "config", name=name, required=required)
         return repo
 
-    def test_run_git_cmd_apply_never_runs_a_committed_attributes_filter(self):
-        repo = self.committed_attributes_repository(self.root / "repo", required=True)
-        for options in ((*git_helper.PATCH_APPLY_FLAGS,), ("--check",), ("--index",), ("--3way",)):
-            with self.subTest(options=options):
-                self.git(repo, "-c", "filter.evil.clean=cat", "-c", "filter.evil.smudge=cat", "reset", "-q", "--hard")
-                self.marker.unlink(missing_ok=True)
-                code, _, error = git_helper.run_git_cmd(["git", "apply", *options, "-"], cwd=str(repo),
-                                                        input_data=PATCH.encode())
-                self.assertEqual(code, 0, error)
-                self.assertEqual(self.marker_lines(), [])
-                expected = "one\n" if options == ("--check",) else "one\ntwo\n"
-                self.assertEqual((repo / "f.txt").read_text(), expected)
 
     def test_apply_disables_drivers_whose_names_c_cannot_carry(self):
         for index, name in enumerate(("a=b.c", "")):

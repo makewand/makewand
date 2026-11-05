@@ -280,31 +280,6 @@ class RaceCancellationScope:
                     pass
 
 
-@contextmanager
-def contestant_scope(scope_id: str):
-    """Context manager binding a contestant thread to a cancellation scope."""
-    scope = RaceCancellationScope(scope_id)
-    _scope_local.current = scope
-    with _scopes_lock:
-        _active_scopes[scope_id] = scope
-    try:
-        yield scope
-    finally:
-        _scope_local.current = None
-        with _scopes_lock:
-            _active_scopes.pop(scope_id, None)
-
-
-def cancel_contestant(scope_id: str) -> bool:
-    """Immediately send SIGTERM / cancellation to the contestant registered under scope_id."""
-    with _scopes_lock:
-        scope = _active_scopes.get(scope_id)
-    if scope:
-        scope.cancel()
-        return True
-    return False
-
-
 def get_current_contestant_scope() -> Optional[RaceCancellationScope]:
     return getattr(_scope_local, "current", None)
 

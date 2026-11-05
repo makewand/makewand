@@ -184,25 +184,6 @@ def _atomic_write_json(path: Path, value: dict) -> None:
         except FileNotFoundError:
             pass
 
-def save_api_key(provider: str, api_key: str, base_url: str = None, model: str = None) -> bool:
-    """Saves API configuration for a provider into api_keys.json."""
-    try:
-        # Saving is stricter than optional-source reads: never replace an
-        # unreadable old credentials document with an empty fallback.
-        keys = _load_json_object(API_KEYS_FILE)
-        p = provider.lower().strip()
-        fields = keys.get(p)
-        keys[p] = dict(fields) if isinstance(fields, dict) else {}
-        keys[p]["api_key"] = api_key
-        if base_url:
-            keys[p]["base_url"] = base_url
-        if model:
-            keys[p]["model"] = model
-        ensure_config_dir()
-        _atomic_write_json(API_KEYS_FILE, keys)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
 
 def _provider_aliases(provider: str) -> list:
     """Alias order is stable; a canonical entry wins conflicting aliases."""

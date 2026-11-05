@@ -11,7 +11,7 @@ import shlex
 import shutil
 from unittest.mock import patch
 
-from makewand import delivery, git_helper
+from makewand import git_helper
 from makewand.providers.api_client import apply_agentic_code_output
 
 
@@ -60,62 +60,6 @@ class ParentGitTests(FilterFixture):
         self.assertEqual(self.marker_lines(), [])
 
 
-class PlainWorkspaceGitTests(FilterFixture):
-    def workspace(self):
-        work = self.root / "plain"
-        binary = work / "bin" / "git"
-        binary.parent.mkdir(parents=True)
-        real_git = shutil.which("git")
-        self.assertIsNotNone(real_git)
-        binary.write_text("#!/bin/sh\necho workspace-git >> " + shlex.quote(str(self.marker))
-                          + "\nexec " + shlex.quote(real_git) + ' "$@"\n')
-        binary.chmod(0o755)
-        (work / ".gitignore").write_text("*.log\n")
-        (work / "app.py").write_text("print(1)\n")
-        (work / "private.log").write_text("excluded\n")
-        return work, binary
-
-    def test_plain_directory_probes_exclude_original_workspace_and_aliases(self):
-        work, binary = self.workspace()
-        alias = self.root / "outside-alias"
-        alias.symlink_to(binary.parent, target_is_directory=True)
-        for path in (binary.parent, alias):
-            with self.subTest(path=path), \
-                    patch.dict(os.environ, {"PATH": str(path) + os.pathsep + os.environ["PATH"]}), \
-                    patch.object(git_helper, "_RESOLVED_GIT_BINARY", None):
-                self.assertEqual(git_helper.list_workspace_copy_paths(work),
-                                 [".gitignore", "app.py", "bin/git"])
-                self.assertEqual(git_helper.list_workspace_ignored_paths(work), {"private.log"})
-                self.assertEqual(self.marker_lines(), [])
-
-    def test_plain_directory_probe_refuses_previously_cached_workspace_git(self):
-        work, binary = self.workspace()
-        with patch.object(git_helper, "_RESOLVED_GIT_BINARY", str(binary)):
-            with self.assertRaises(OSError):
-                git_helper.list_workspace_copy_paths(work)
-            self.assertIsNone(git_helper.list_workspace_ignored_paths(work))
-        self.assertEqual(self.marker_lines(), [])
-
-    def test_each_probe_command_rechecks_original_workspace_after_cache_change(self):
-        work, binary = self.workspace()
-        original = git_helper.run_git_cmd
-        calls = 0
-
-        def change_cache(command, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                git_helper._RESOLVED_GIT_BINARY = str(binary)
-            return original(command, **kwargs)
-
-        with patch.object(git_helper, "_RESOLVED_GIT_BINARY", None), \
-                patch.object(git_helper, "run_git_cmd", side_effect=change_cache):
-            with self.assertRaises(OSError):
-                git_helper.list_workspace_copy_paths(work)
-        self.assertEqual(calls, 2)
-        self.assertEqual(self.marker_lines(), [])
-
-
 class DefaultMergeTests(FilterFixture):
     def merge_fixture(self, theirs):
         repo = self.repository(self.root / "repo", {"f.txt": "base\nsecond\nthird\n"})
@@ -148,10 +92,3 @@ class DefaultMergeTests(FilterFixture):
         self.assertEqual(self.marker_lines(), [])
         self.assertEqual((repo / "f.txt").read_text(), "ours\nsecond\ntheirs\n")
 
-    def test_standalone_delivery_selects_a_default_outside_all_custom_names(self):
-        repo, _ = self.merge_fixture("theirs\nsecond\nthird\n")
-        env = delivery._apply_environment(str(repo))
-        values = {env["GIT_CONFIG_KEY_" + str(i)]: env["GIT_CONFIG_VALUE_" + str(i)]
-                  for i in range(int(env["GIT_CONFIG_COUNT"]))}
-        self.assertEqual(values["merge.default"], "makewand_builtin_text_2")
-        self.assertEqual(self.marker_lines(), [])

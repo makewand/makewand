@@ -102,28 +102,6 @@ def _load_raw_usage_records(max_age_days: float = 7.0) -> List[Dict[str, Any]]:
 
     return valid_records
 
-def _save_raw_usage_records(records: List[Dict[str, Any]]) -> None:
-    ensure_config_dir()
-    uf = _get_active_usage_file()
-    lock_file = _get_lock_file()
-    tmp_file = uf.parent / f".{uf.stem}_{os.getpid()}_{datetime.now().timestamp()}_{uuid.uuid4().hex[:8]}.tmp"
-    try:
-        with open(lock_file, "a+", encoding="utf-8") as lock_f:
-            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-            try:
-                with open(tmp_file, "w", encoding="utf-8") as f:
-                    json.dump(records, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_file, uf)
-            finally:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        if tmp_file.exists():
-            try:
-                tmp_file.unlink()
-            except Exception:
-                pass
 
 # Routes a dispatch can take: the provider's own CLI, or its cloud API (the
 # adapters relay to the API key when the subscription is limited, the login is

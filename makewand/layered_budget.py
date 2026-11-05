@@ -25,7 +25,7 @@ DEFAULT_MACHINE = 1000
 DEFAULT_PROJECT = 200
 CLOCK_SLACK = 300
 TIMEZONE_ENV = "MAKEWAND_BUDGET_TIMEZONE"
-# reserve_capacity refuses longer holds; a hold without created_at counts as this long.
+# A hold without created_at counts as this long.
 MAX_HOLD_SECONDS = 86400
 _REPAIR_HINT = "repair: makewand budget clock --repair"
 _warned = set()

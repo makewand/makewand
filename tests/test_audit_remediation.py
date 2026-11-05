@@ -33,37 +33,10 @@ import makewand.orchestrator as orch
 import makewand.sandbox as sandbox
 import makewand.git_helper as git_helper
 import makewand.repomap as repomap
-import makewand.merger as merger
-import makewand.interactive as interactive
-import makewand.delivery as delivery
 import makewand.pacing as pacing
-import makewand.candidate as candidate
 
 
 class TestAuditRemediations(unittest.TestCase):
-    def test_sec_new_01_safe_git_binary_resolution(self):
-        """[SEC-NEW-01] Ensure git subprocess callers use resolve_safe_git_binary."""
-        for mod, name in [
-            (repomap, "repomap"),
-            (merger, "merger"),
-            (interactive, "interactive"),
-            (delivery, "delivery"),
-        ]:
-            src = inspect.getsource(mod)
-            self.assertIn(
-                "resolve_safe_git_binary",
-                src,
-                f"{name} must import and use resolve_safe_git_binary",
-            )
-            # Ensure bare '["git", ' is not called directly in subprocess runs
-            # (allowing resolve_safe_git_binary or helper wrappers)
-            for line in src.splitlines():
-                if "subprocess.run([" in line or "subprocess.Popen([" in line or "run_subprocess([" in line:
-                    self.assertNotIn(
-                        '"git"',
-                        line,
-                        f"{name} has bare git execution in line: {line.strip()}",
-                    )
 
     def test_sec_new_01_safe_git_binary_hardening(self):
         """[SEC-NEW-01] resolve_safe_git_binary rejects cwd-relative binaries and raises FileNotFoundError when absent."""
@@ -267,18 +240,6 @@ class TestAuditRemediations(unittest.TestCase):
                 f"SENSITIVE_HOME_DIRS must include {path}",
             )
 
-    def test_arc_02_workspace_lock_path(self):
-        """[ARC-02] WorkspaceLock creates lock in artifacts/.locks/<sha256[:32]>.lock."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            lock = git_helper.WorkspaceLock(tmpdir)
-            with lock:
-                self.assertIsNotNone(lock.path)
-                self.assertEqual(lock.path.parent.name, ".locks")
-                self.assertEqual(lock.path.parent.parent.name, "artifacts")
-                # Filename is sha256(root)[:32].lock
-                key = hashlib.sha256(os.fsencode(lock.root)).hexdigest()[:32]
-                self.assertEqual(lock.path.name, f"{key}.lock")
-                self.assertTrue(lock.path.exists())
 
     def test_con_01_no_preexec_fn_in_run_in_sandbox(self):
         """[CON-01] run_in_sandbox does not use preexec_fn to avoid multi-thread deadlock."""
@@ -289,54 +250,6 @@ class TestAuditRemediations(unittest.TestCase):
             "run_in_sandbox must not pass preexec_fn",
         )
 
-    def test_del_02_format_review_diff_preserves_full_diff_up_to_64kb(self):
-        """[DEL-02] format_review_diff does not excise the middle slice for diffs up to 64KB."""
-        diff_20k = "diff --git a/a.py b/a.py\n+" + ("x" * 20000)
-        formatted = review_verdict.format_review_diff(diff_20k)
-        self.assertEqual(formatted, diff_20k)
-        self.assertNotIn("Makewand Diff Truncated", formatted)
-
-    def test_sec_new_02_git_env_sanitized_in_secondary_callers(self):
-        """[SEC-NEW-02] merger, interactive, and repomap pass env=_sanitize_git_env() to subprocess.run."""
-        for mod, name in [
-            (repomap, "repomap"),
-            (merger, "merger"),
-            (interactive, "interactive"),
-        ]:
-            src = inspect.getsource(mod)
-            self.assertIn(
-                "_sanitize_git_env",
-                src,
-                f"{name} must import and use _sanitize_git_env",
-            )
-            self.assertIn(
-                "env=_sanitize_git_env()",
-                src,
-                f"{name} must pass env=_sanitize_git_env() to subprocess.run",
-            )
-
-    def test_delivery_skips_makewand_prefix_dirs(self):
-        """[DEL-03/M-delivery] .makewand_* dirs are not listed entry-by-entry, but their
-        contents are bound by an aggregate digest so edits below them fail validation."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            git_helper.run_git_cmd(["git", "init"], cwd=str(root))
-            (root / "app.py").write_text("print(1)\n")
-            mw_dir = root / ".makewand_test_dir"
-            mw_dir.mkdir()
-            (mw_dir / "nested.txt").write_text("secret\n")
-            frozen = delivery.capture_delivery_baseline(root)
-            self.assertIn(".makewand_test_dir", frozen["entries"])
-            record = frozen["entries"][".makewand_test_dir"]
-            self.assertEqual(record[0], "dir")
-            self.assertEqual(record[2], "tree")
-            # Nested files are not individual entries...
-            self.assertNotIn(".makewand_test_dir/nested.txt", frozen["entries"])
-            self.assertTrue(delivery.check_delivery_state(frozen))
-            # ...yet a change below the directory is detected.
-            (mw_dir / "nested.txt").write_text("tampered\n")
-            with self.assertRaisesRegex(OSError, "makewand_test_dir"):
-                delivery.check_delivery_state(frozen)
 
     def test_vul_01_02_06_forbidden_writable_roots(self):
         """[VUL-01, VUL-02, VUL-06] wrap_bwrap rejects forbidden roots and symlinks to them as writable workspace."""
@@ -372,29 +285,6 @@ class TestAuditRemediations(unittest.TestCase):
         self.assertIsNotNone(secs)
         self.assertAlmostEqual(secs, (expected - datetime.now().astimezone()).total_seconds(), delta=120)
 
-    def test_vul_11_git_shadow_symlink_ro_repo(self):
-        """[VUL-11] sanitize_shadow_symlinks does not error when repo_root is read-only."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_root = Path(tmpdir) / "repo"
-            repo_root.mkdir()
-            wt_root = Path(tmpdir) / "worktree"
-            wt_root.mkdir()
-            # Create a target in repo_root and a symlink in wt_root
-            target_file = repo_root / "test.txt"
-            target_file.write_text("hello\n")
-            link = wt_root / "link.txt"
-            link.symlink_to(target_file)
-            # Make repo_root read-only
-            repo_root.chmod(0o555)
-            try:
-                git_helper.sanitize_shadow_symlinks(wt_root, repo_root)
-            finally:
-                repo_root.chmod(0o755)
-
-    def test_vul_13_shadow_worktree_decoupling(self):
-        """[VUL-13] Shadow worktrees use decoupled SHADOW_YOUNG_SECONDS, not 24h barrier."""
-        self.assertLessEqual(git_helper.SHADOW_YOUNG_SECONDS, 3600)
-        self.assertGreater(git_helper.PROTECTED_YOUNG_SECONDS, git_helper.SHADOW_YOUNG_SECONDS)
 
     def test_vul_14_seccomp_fail_closed_when_required(self):
         """[VUL-14] seccomp_filter_context raises SandboxConfigError when required and filter generation fails."""

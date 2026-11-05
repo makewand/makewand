@@ -25,11 +25,6 @@ curl -fsSL https://makewand.org/install.sh | bash
 - **🛡️ 跨模型独立红队审查 (Cross-Model Review)**：
   - 审查在只读沙箱中运行，优先采用与实现者不同的引擎。
   - 审查必须给出结构化 `MAKEWAND_VERDICT`，并与经过测试的具体产物绑定。
-- **🔄 自愈修复闭环 (Auto-Fix Loop)**：
-  - 审查若发现 `[P1]`（高危）、`[P2]`（中危）、死锁或竞态缺陷，在配置的修复次数和时间预算内重派实现及复审；测试失败、裁决缺失或产物改变会阻止交付。
-- **🏁 双模型并发隔离竞速 (Race Mode)**：
-  - `makewand race "<任务>"` 在临时隔离沙箱中并行派发两组模型，统计耗时与代码质量，由可用裁判输出结构化采纳裁决。默认保留 A/B 候选，显式 `merge` 才生成混合候选 M。
-- **🌲 非 Git 目录弹性容灾**：未初始化 Git 的工程自动构建轻量级影子跟踪树，彻底解决常规工具依赖 Git 导致的崩溃。
 - **🚀 无头执行与跨平台沙箱约束**：写入任务在必需的 Bubblewrap (bwrap) 沙箱内运行官方 CLI；沙箱不可用时遵循 fail-closed 拒绝执行。bwrap 沙箱依赖 Linux 内核命名空间。没有沙箱时（如 macOS），**包括只读审查 `makewand review` 在内的所有 provider 调用**都需要显式配置 `MAKEWAND_UNSAFE_HOST_EXEC=1` 并完成一次交互确认（所有宿主执行审计至 `unsafe_exec_audit.jsonl`），或改在装有 bwrap 的 Linux 容器/虚拟机中运行。Go 的 Strength1 候选仍需人工确认。
 - **📡 实时流式输出**：支持 `--stream` 参数，带模型专属色彩前缀逐行流式呈现。
 
@@ -53,15 +48,6 @@ flowchart TD
         Router --> Codex["Codex CLI<br>OpenAI / gpt-6-astra"]
         Router --> Muse["Muse Code CLI<br>Meta 订阅 / Muse Spark"]
     end
-
-    subgraph Pipeline ["协同流水线 Pipeline"]
-        Claude -->|主力实现| Diff["代码 Diff 生成"]
-        Codex -->|降级实现| Diff
-        Diff -->|独立红队审查| CodexReview["Codex / AGY 深度审查"]
-        CodexReview -->|检测到 P1/P2 缺陷| AutoFix["Auto-Fix 修复循环"]
-        AutoFix --> Diff
-        CodexReview -->|测试与结构化裁决通过| Done["最终交付验收"]
-    end
 ```
 
 ---
@@ -74,8 +60,6 @@ cd path/to/makewand
 ./scripts/install.sh
 ```
 源码安装需要 Git、Python 3.9+ 和 `go.mod` 指定的 Go 工具链。安装器冻结 Go/Python 构建输入，在独立版本目录中编译、检查版本及公共命令，然后原子切换 `current` 与 `~/.local/bin/makewand`。失败保留原安装，并保留 `previous` 供回退；同时建立兼容的 `trio` 软链接。安装目录（默认 `~/.local/bin`，可用 `MAKEWAND_BIN_DIR` 指定）不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 `makewand` 时，安装器最后会打印需要加入 shell 配置（如 `~/.zshrc`、`~/.bashrc`）的 `export PATH=...` 行，加入后打开新终端即可。
-
-运行时需要 Python 3.9+。手动解包时须将整个目录一起安装，保留二进制旁的 `lib/`。Homebrew/Scoop 会声明 Python 依赖。供应商 CLI 与项目测试工具需要单独安装；Makewand Python 引擎本身仅使用标准库。
 
 > **版本与安全加固**：v3.3.0 包含了 v3.2.0 之后加入的全部保护（#75、#80–#85、#91、#100，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、依赖安装仅下载阶段出网且隔离工作区、候选测试超时或输出泛滥计为候选失败而非环境错误、Homebrew 包装脚本不再写死 `PATH`）；旧版 v3.2.x 没有这些保护，请升级到 v3.3.0 或使用源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
 
@@ -115,30 +99,7 @@ makewand probe
 makewand models
 ```
 
-### 3. 全自动联合编码流水线
-```bash
-# 执行端到端实现 + 跨模型审计 + 自愈回环
-makewand run "在当前目录编写一个支持重试与指数退避的 HTTP 请求客户端"
-
-# 指定工作目录并启用实时流式输出
-makewand run "重构用户认证模块" --cwd /path/to/repo --stream
-
-# 指定推理档位 (fast / standard / deep)
-makewand run "排查并发线程安全" --tier deep
-
-# 保持已有验收测试的内容与权限；任务在隔离工作树完成
-makewand run "修复解析器" --protect tests/test_parser.py
-```
-
-`--protect` 可重复指定相对路径，也适用于 `race` 和 `apply`。成功的受保护流水线提供带校验的 `apply_delivery.sh`；候选应用的 `--force` 不能绕过文件保护。详见 [执行约定](docs/EXECUTION_CONTRACT.md#protected-task-files)。
-
-本地测试在沙箱内运行，Python 用 pytest 还是 unittest 由沙箱内能否导入 pytest 决定（宿主解释器能导入、沙箱里看不到的用户级 pytest 不算）：只读探测 `python -B -c "import pytest"` 先用运行测试的解释器，再用宿主 `pytest` 脚本首行指定的 Python 解释器，只导入 pytest，不加载 pytest 插件和 `conftest.py`；没有 bubblewrap、经宿主执行授权（`MAKEWAND_UNSAFE_HOST_EXEC=1` 加已记录的确认）时，探测与测试本身一样在宿主上运行。测试无法运行——项目配置了 pytest 但沙箱内导入不了、pytest 或 unittest 以退出码 5 结束（没有收集到或执行任何测试）、pytest 根本没有启动（标准输出为空，标准错误最后一行是 pytest 自身的导入错误）或 unittest 失败的只是导入不了 pytest 的测试模块——时结论为未验证（退出码 11）；测试总时间预算先耗尽时为超时（退出码 16）。两者都不算测试失败，不进入自动修复；但此前已有测试套件报告失败、或测试运行修改了待交付输入时，仍按失败处理；测试实际运行并失败时也一律按失败处理，无论它输出了什么。`race` 中测试无法运行或超时的候选没有测试证据、不能胜出：没有候选通过测试时，比赛以未验证（退出码 11）结束，有候选的测试关卡超时则为超时（退出码 16）。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-pipeline-and-race-candidates)。
-
-宿主模式下，审查 diff 之外的改动——新建或改动被忽略的文件、二进制或可执行产物、`.env*`/`.envrc`/`*.pth`/`sitecustomize.py`、子模块或嵌套仓库中的文件、本检出（及其子模块）私有 hooks 目录中的新 hook——会阻止交付并回滚（退出码 11）；新 hook 移入 `rejected_*/quarantine/git-hooks/` 并附 `mv` 恢复命令，链接工作树等共享的 hooks 目录只报告。测试运行在工具默认位置生成的测试产物会被删除，不进入审查与交付。没有备份的既有文件（依赖与缓存目录、超过备份上限的文件）在任务开始时计算 SHA-256 摘要与抽样指纹，上限为 `MAKEWAND_FINGERPRINT_FILE_LIMIT`（单文件，默认 64 MiB）、`MAKEWAND_FINGERPRINT_TOTAL_LIMIT`（总量，默认 512 MiB）与 `MAKEWAND_FINGERPRINT_SECONDS`（默认 20 秒），交付核查与回滚核验同样受这些上限约束；内容无法确认的文件按“无法确认”阻断，并提示应调高哪个上限。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-host-mode-delivery)。
-
-`makewand plan "<目标>"` 把目标拆成 DAG 子任务。多阶段 DAG 在一份私有暂存副本中逐阶段执行，累积结果作为候选 `dg_…` 的 `A` 只交付一次：工作区安全时自动应用，否则给出确切的 `makewand apply` 命令；只读子任务审查此前的累积改动，其写入一律丢弃。原生 Windows 上多阶段 DAG 拒绝执行（请用 WSL2）。暂存区绑定的清单受 `MAKEWAND_WORKSPACE_SNAPSHOT_MAX_FILES`、`MAKEWAND_WORKSPACE_SNAPSHOT_MAX_BYTES`、`MAKEWAND_WORKSPACE_SNAPSHOT_TIMEOUT_SECS`（默认 100,000 个文件、512 MiB、每份 10 秒）约束，超限的仓库在复制任何内容之前即被拒绝（未验证，退出码 11），并提示超出的上限；未跟踪且被 gitignore 的文件（数据、日志等）不计入。详见 [验证契约](docs/VERIFICATION_CONTRACT.md#multi-stage-dag-delivery)。
-
-### 4. 独立代码审查
+### 3. 独立代码审查
 ```bash
 # 针对当前目录未提交的 git diff 实施红队安全审查
 makewand review
@@ -146,27 +107,12 @@ makewand review
 
 审查 diff 超过 256 KiB（用 `MAKEWAND_REVIEW_DIFF_MAX_BYTES` 调整，单位字节）时不做截断审查，结论为未验证（退出码 11），完整补丁保存为可直接 `git apply` 的 `unverified.patch`。超过 31 KiB 的审查提示不交给 agy（它只能分页读取提示文件），流水线改由下一位可用的审查方接替；cursor、copilot 等占位引擎从不审查；本地模型的只读回答须由 token 计数证明读到了完整提示，否则为未验证。详见 [执行约定](docs/EXECUTION_CONTRACT.md#reviewer-capacity)。
 
-### 5. 双模型并发竞速模式
-```bash
-# 两位选手并行实现，由可用裁判评审；工作区保留候选供检查
-makewand race "实现一个快速排序函数 quick_sort(arr) 并写测试用例验证"
-makewand inspect <race-id> --candidate A
-makewand apply <race-id> --candidate A
-
-# 可选混合候选：完整三方合并、测试、独立复审，然后应用
-makewand merge <race-id>
-makewand review --race-id <race-id> --candidate M
-makewand apply <race-id> --candidate M
-```
-
-claude、codex、grok、muse、local、agy 中任意两个不同的已启用且健康的引擎都可组成一对选手（agy 只要不处于已知失败状态），`run --workflow race --provider X` 指定 X 为选手 A；无法组队时列出每个引擎的原因。裁决行必须带本任务的随机 nonce（`MAKEWAND_RACE_VERDICT_<nonce>`），候选 diff 中回显的裁决行无效，不带 nonce 的裁决行在任何环境下都无效。率先通过测试的选手（Winner-Take-All）须经另一提供方的只读复审通过才算胜出；裁判选中与自己同一提供方的候选时，同样需要另一提供方复审。裁判与复审方都优先选择与双方选手都不同的提供方，复审方没有这样的选择时由另一位选手担任，从不是胜者自己。
-
-### 6. 带预算安全搜索 (避免冷归档与大库 I/O 卡死)
+### 4. 带预算安全搜索 (避免冷归档与大库 I/O 卡死)
 ```bash
 makewand search "def safe_search" --cwd /path/to/project
 ```
 
-### 7. Bubblewrap 物理进程沙箱隔离执行
+### 5. Bubblewrap 物理进程沙箱隔离执行
 ```bash
 # 隔离运行单元测试 (只读根目录、凭据自动脱敏、仅工作区可写)
 makewand sandbox python3 -m pytest tests/
@@ -178,7 +124,7 @@ makewand sandbox --no-net go test ./...
 
 > **依赖安装网络**：Go 候选验证中只有“下载”走网络（站主 2026-10-21 定）。依赖步骤拆成两段：不执行项目代码的取回（`pip download --only-binary=:all:`；按 makewand 先解析并检查过、只含注册表包的锁文件进行的 `npm ci --ignore-scripts`，命令行带包参数时不联网；固定到具名 rustup 工具链的 `cargo fetch`；`go mod download`/`tidy`）在工作区之外、每次新建且只含清单与锁文件副本的私有取回目录中联网运行，看不到工作区的任何文件，只运行工作区之外的可信工具，下载到宿主自有的共享缓存（之后的回环步骤只读）；随后的构建/安装（`pip install --no-index --find-links`、含 `-e .`；`cargo build --offline`）只在回环网络下进行——`setup.py`/`build.rs`/生命周期脚本永不在可联网时运行，`node_modules` 与锁文件由宿主在取回后放入工作区。取回找到可信的 `slirp4netns`、`nsenter`、`ip` 时只能访问公网（私网、回环、链路本地与云元数据、组播及本机地址在命令运行前即被路由屏蔽，可选的 `tc`/`nft` 再过滤组播与 IPv6），否则只有回环网络；这些工具不在 root 拥有的系统目录时，用 `MAKEWAND_SLIRP4NETNS_PATH`、`MAKEWAND_NSENTER_PATH`、`MAKEWAND_IP_PATH`、`MAKEWAND_TC_PATH`、`MAKEWAND_NFT_PATH` 指定。取回不绑定宿主模块缓存；pip 配置与需求文件指定的私有索引照样使用，绝不被 PyPI 悄悄替换。无法在不运行代码的前提下取回的依赖（索引显示匹配版本只有源码分发、需构建的 git 依赖、npm 的 git/本地/workspace 依赖、以路径指定的 Rust 工具链等）按环境问题（依赖不可用）报告、不扣分；不存在的项目或版本仍算候选失败。私网或本机回环上的镜像与代理按设计不可达。安装失败只有在 makewand 自己的连通性检查（离线时为项目文件）确认注册表不可达时才算环境问题，此时 TUI 跳过测试、不扣分。详见 [SECURITY.md](SECURITY.md#dependency-installs--依赖安装)。
 
-### 8. 单模型直接透传调用
+### 6. 单模型直接透传调用
 ```bash
 makewand agy "总结当前项目的架构优势"
 makewand codex "分析这段代码的死锁风险"
@@ -186,7 +132,7 @@ makewand claude "编写测试用例"
 makewand muse "检查系统配置项"
 ```
 
-### 9. 自动派活选型：route / mark / outcome
+### 7. 自动派活选型：route / mark / outcome
 
 ```bash
 # 为子任务挑选工具、模型与推理深度，打印可照抄的派活命令（只读本地缓存与成绩账本，不调用模型）
@@ -210,60 +156,20 @@ makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
 
 `makewand observe` 会提示超过默认上限的请求及 UNKNOWN/超时后的后续调用，供核对授权；这些提示本身不证明违规。未分类 CLI 失败的脱敏诊断保存在用户缓存 `makewand/unclassified-cli-failures.jsonl`：仅保留已知 CLI 自身独立 stderr 的末尾，不收集模型回答或 Codex 会话内容，文件有容量上限；诊断写入失败不影响调用结果。
 
-### 10. 统一模式定义与跨语言契约 (Unified Modes & Tiers Contract)
-
-Makewand 在 Python（`orchestrator` / CLI / REPL）与 Go（`router` / TUI / 守护进程）之间保证双向无缝映射与透明别名支持：
-
-| Go Usage Mode | Python Tier | 档位定位与适用场景 |
-|:---:|:---:|---|
-| `fast` | `fast` | 极速响应、低延迟，适合单测生成与简单语法补齐 |
-| `balanced` | `standard` | 均衡平衡档（默认），适合常规编码重构与流水线执行 |
-| `power` | `deep` | 深度推理、最大思考步数（High Effort），适合复杂并发、架构解耦与深度审计 |
-
-- **跨语言参数对齐**：命令行支持 `--mode` 与 `--tier` 互为别名，无论传入 `fast`、`balanced`、`power` 还是 `fast`、`standard`、`deep`，系统均能自适应双向转换与持久化配置。
-
 ### 调用与资源预算
 
-`--max-model-calls` 按 Makewand 派发任务计数。官方 CLI 在一次派发内可能进行多轮内部模型调用，内部轮次及供应商报告的调用数需另行核对；它们也不换算为订阅剩余额度。需要内部轮次上限时，还需使用对应 CLI 支持的限制。
+`--max-model-calls` 按 Makewand 派发任务计数。官方 CLI 在一次派发内可能进行多轮内部模型调用，这些内部调用不计入。
 
 ```bash
-makewand run "修复边界用例" --max-model-calls 3 --call-budget-file /tmp/task-budget.json
-makewand run "修复局部边界" --workflow single --risk low --total-timeout 180 --max-model-calls 2
-makewand race "比较两种实现" --total-timeout 180 --judge-reserve-seconds 45 --max-model-calls 3
-MAKEWAND_CANDIDATES=1 MAKEWAND_CANDIDATE_CONCURRENCY=1 makewand new
+makewand codex --model gpt-6-astra --effort medium -C <目录> -f <任务文件> --readonly \
+  --request-id <请求ID> --caller claude --max-model-calls 3 --timeout 1800 --total-timeout 1800
 ```
 
-`run`、`review`、`race`、`ensemble` 以及直接派活命令（`codex`、`claude`、`agy`、`grok`、`muse`、`local`、`aider` 及直接 API 命令）未指定 `--timeout` 时继承 `--total-timeout`；两者都未指定时为 300 秒（ensemble 为 900 秒），均指定时取较小值。
+带 `--request-id` 时默认上限 3 次；同一请求 ID 跨会话、跨工具共用计数。`makewand budget request --request-id <ID> --json` 查看用量，用户明确同意后用 `--set-limit` 调整。
 
-`makewand route <类型> <难度> --self codex` 输出的每条派活命令包含 `--max-model-calls 1 --timeout N --total-timeout N`；`--not <工具>` 排除同家族候选、`--self <工具>` 把同家族候选排到最后，家族同时按 provider 和所带模型判断（agy 代理的 `claude-*` 属于 claude，`gpt-oss` 属于 codex），跳过列表写明被跳过的模型；review 任务还包含 `--readonly`。按 mechanical / normal / hard，implement 的 N 为 1200 / 3600 / 10800 秒，其余 review / test / research / doc 为 900 / 1800 / 5400 秒。时限按难度和实际档位中较高者选取，route 的 `--total-timeout` 可覆盖该值，升档提示保留此覆盖。JSON 顶层及每个候选包含 `timeout`、`total_timeout`、`readonly` 字段，候选的 `command` 可直接照抄。
+`makewand route <类型> <难度> --self <你>` 输出的命令已带好时限和 `--readonly`；Codex 审查默认 1800 秒，其他审查按难度 900/1800/5400 秒。`route` 和 `status` 会在 Codex、Claude 周额度按目前速度来不及撑到重置时给出预计到线时间。
 
-Go 原生调用、Python 流水线、直接工具命令、比赛裁判及真实模型探活共享调用账本，失败和裁决补问也占一次。`--call-budget-file` 让多个进程共享上限；只指定 `--max-model-calls` 时，入口创建本次任务的独立账本。账本的最大值只能降低，已开始的调用不退还额度。发送后无法确定结果时返回 `UNKNOWN`，停止自动切换提供者或重派；Go 路由的只读 CLI 运行（bubblewrap 沙箱内以只读方式挂载工作区的审查，以及未指定 WorkDir、在临时目录中运行的 `serve` 远端请求）不会写工作区，其无法识别的退出仍记为 `UNKNOWN`，但可切换到下一个提供者；宿主机上运行的审查（`MAKEWAND_UNSAFE_HOST_EXEC`）和指定了 WorkDir 的远端请求不算只读。provider CLI 自己打印、由共享消息目录识别的拒绝（未登录或凭据被拒、agy 拒绝参数）是结果已知的失败，照常切换；可能写入工作区的运行只有在 stdout 没有回答、且 stderr 上拒绝之前只有 agy 自己的提示行时才算拒绝；运行途中登录失效的输出与开头的拒绝相同，glog 诊断（agy 用它记录工具与模型调用）或状态行之后的拒绝可能发生在工作之后，这些都仍为 `UNKNOWN` 并停止重派。Power 模式中某个生成方或裁判的登录在准入后被切换到其他账号时，请求以该拒绝结束。统计单位是 Makewand 派发尝试，无法限制供应商 CLI 内部工具轮次或代替 Token/费用计量。
-
-`--workflow auto` 对风险未知的任务采用跨提供商流水线；明确的低风险任务可使用 `--workflow single --risk low`：由写代码的同一引擎在单独的只读调用中自审，没有独立引擎审查，仍需本地测试。`--risk high` 要求跨提供商验证，不足时返回未验证。Race 提前预留两次实现和一次裁判调用，并默认留出总期限的 25%（最多 60 秒）供裁判使用；资源不足会停止派发。混合候选仍通过显式 `merge` 和独立审查交付。
-
-设置 `MAKEWAND_EXECUTION_EVENTS_FILE=/tmp/task-events.jsonl` 可记录准备、复制、生成、验证、审查和应用各阶段的时间、任务 ID、产物摘要及结果状态。日志不记录提示词、工作目录、原始错误或凭据，未测得的 Token、费用和内存保持 `null`。稳定状态码、跨语言契约及超时边界见[执行契约](docs/EXECUTION_CONTRACT.md)，固定 12 项评测与离线验收检查见[评测说明](benchmarks/README.md)。
-
-Go 原生候选选择支持 1–3 的候选数与并发上限，以及 `MAKEWAND_CANDIDATE_TIMEOUT=2m` 和 `MAKEWAND_CANDIDATE_BUDGET_USD=0.5`。正数美元预算自动启用串行候选，并根据已报告成本停止后续调用；它是每次选择的软阈值，不能限制未知订阅成本或单次超额。超时通过 context 协作取消，不能撤销已发生的远端调用。资源设置不改变 Strength1 候选仍须人工确认的门槛。
-
-Go 工作区复制默认仅在 Linux 的源目录与临时目录位于同一 Btrfs/XFS 文件系统时尝试写时复制；reflink 不可用或尝试失败时完整回退到普通复制，普通复制错误会中止候选工作区创建。`MAKEWAND_WORKSPACE_REFLINK=0` 强制普通复制，`=1` 可在其他文件系统显式尝试。候选输入始终使用独立文件，不使用硬链接共享可写内容；实际性能取决于文件系统和文件大小。配置与 Windows 身份边界见[验证契约](docs/VERIFICATION_CONTRACT.md#go-candidate-resources-and-workspace-copies)。
-
-### 11. 可选 Unix daemon 派发
-
-```bash
-makewand daemon start
-makewand status --daemon --json
-makewand daemon stop
-```
-
-有界派发使用机器共享的 `call-budget.json`，任务上限之外，项目每日默认 200 次、机器每日默认 1000 次，按本地时区午夜重置（`MAKEWAND_BUDGET_TIMEZONE` 可固定为某个 IANA 时区，如 `Asia/Shanghai`；Go 与 Python 算出同一天）。时钟回拨不拒绝派发、不清零计数，继续计入已见过的最新一天，在实际日期到达那一天之前，项目与机器的每日上限按从今天到那一天的各日期桶合计检查；系统时钟一度超前时写下的账本不会卡住租约清理，也不会让预留多占名额（预留按账本时钟计时，超前创建的预留保持原时长改按当前时钟计算），`makewand budget clock` 查看、`makewand budget clock --repair` 让账本时钟回到实际时间（不退还已计次数，后面日期的预留随计数改计入今天）。账号/订阅池默认并发 1，无可用回退时默认最多等 30 秒；busy 不计费，返回 FAILED（退出码 10），预算耗尽返回退出码 13。已结算记录保留 48 小时并自动清理，旧 lifetime 预算仍保留累计花费；活动记录和租约不清除。配置及恢复规则见 [预算与租约](docs/layered-call-admission.md)，账号绑定和缓存见 [quota 账号绑定](docs/quota-account-binding.md)。
-
-provider 子进程继承 `MAKEWAND_PROVIDER_WORKER=1` 后只允许 `search`、`repomap`、静态帮助/版本和 `completion <shell>`；`quota`、`status`、`route` 等管理命令也拒绝。完整参数白名单见 [worker 策略](docs/PROVIDER_WORKER_GUARD.md)。
-
-Daemon 为每次请求启动独立 Python worker，使用相同的 CLI 参数解析器，并保留调用目录、参数、标准输入和客户端环境快照。`MAKEWAND_API_POLICY` 等执行策略按请求生效；任务不会继承 daemon 启动时的旧策略。独立进程防止并发请求串目录或串输出，仓库写入仍受工作区锁、沙箱和交付校验约束。
-
-此实现包含每次 worker 的启动时间，不承诺 `<15ms` 执行延迟。使用 `--no-daemon` 可直接执行。协议不兼容时需重启 daemon；执行请求发送后若失去最终结果，客户端返回错误并停止自动重试。断连、超时或取消会终止请求关联的本机进程树，不能撤销已经发生的文件修改或远端模型请求。
-
-默认最多 4 个任务和 12 个连接并发，请求限 1 MiB、输出限 16 MiB；IPC 期限默认 600 秒，上限 3600 秒。请求结果在当前 daemon 内保留一小时、最多 4096 条，重启后不再可查询。完整协议、结果查询及取消边界见 [验证契约](docs/VERIFICATION_CONTRACT.md#python-daemon-execution-contract)。
+设置 `MAKEWAND_EXECUTION_EVENTS_FILE=/tmp/task-events.jsonl` 可记录执行事件。
 
 ---
 

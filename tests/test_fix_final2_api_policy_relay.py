@@ -25,7 +25,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from makewand import config, engine_selection, health, orchestrator as orch
-from makewand.ensemble import resolve_ensemble_providers
 from makewand.git_helper import run_git_cmd
 from makewand.providers.claude import execute_claude_task
 from makewand.providers.codex import execute_codex_task
@@ -171,33 +170,6 @@ class SelectionTests(unittest.TestCase):
              patch("makewand.usage.get_all_engine_reliability", return_value={}):
             return engine_selection.select_optimal_engine_pair("编写Python脚本", cache=cache)
 
-    def test_logged_out_engine_with_a_forbidden_key_is_not_usable_and_the_guard_fires(self):
-        cache = {"claude": live("needs_auth", "login expired")}
-        with environment("ANTHROPIC_API_KEY"):
-            self.assertFalse(engine_selection._usable_or_api_relay("claude", cache))
-        coders, _, meta = self.route(cache)
-        self.assertEqual(coders, [])
-        self.assertTrue(meta["no_usable_engines"])
-        self.assertTrue(engine_selection._no_provider_detected(None, meta))
-
-    def test_logged_out_engine_with_an_allowed_relay_stays_usable(self):
-        cache = {"claude": live("needs_auth", "login expired")}
-        with environment("ANTHROPIC_API_KEY", "allow_paid"):
-            self.assertTrue(engine_selection._usable_or_api_relay("claude", cache))
-        coders, _, meta = self.route(cache, "allow_paid")
-        self.assertEqual(coders, ["claude"])
-        self.assertFalse(engine_selection._no_provider_detected(None, meta))
-
-    def test_ensemble_counts_a_relay_only_under_an_allowing_policy(self):
-        cache = {"claude": live("needs_auth", "login expired"), "codex": live("healthy")}
-        for policy, expected in ((None, ["codex"]), ("allow_paid", ["claude", "codex"])):
-            unavailable = {}
-            with self.subTest(policy=policy), environment("ANTHROPIC_API_KEY", policy), \
-                 patch("makewand.health.load_status_cache", return_value=cache), \
-                 patch("makewand.ensemble.has_subscription_configured", return_value=True):
-                self.assertEqual(resolve_ensemble_providers(["claude", "codex"], unavailable=unavailable), expected)
-            if policy is None:
-                self.assertIn("subscription_only", unavailable["claude"])
 
     def test_probe_reports_a_missing_cli_with_a_forbidden_key_as_missing(self):
         for policy, status in ((None, "missing"), ("allow_paid", "healthy")):
@@ -207,35 +179,6 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(entry["status"], status)
             if status == "missing":
                 self.assertIn("subscription_only", entry["reason"])
-
-
-class WorkflowTests(unittest.TestCase):
-    def test_explain_with_a_stale_login_failure_and_a_forbidden_key_stops_with_exit_11(self):
-        temporary = tempfile.TemporaryDirectory(prefix="makewand-final2-relay-")
-        self.addCleanup(temporary.cleanup)
-        repo = Path(temporary.name) / "repo"
-        repo.mkdir()
-        (repo / "app.py").write_text("VALUE = 1\n")
-        for arguments in (["init", "-q"], ["config", "user.name", "Fixture"],
-                          ["config", "user.email", "fixture@example.invalid"], ["add", "."], ["commit", "-qm", "base"]):
-            self.assertEqual(run_git_cmd(["git", *arguments], cwd=str(repo))[0], 0)
-        cache = {"claude": live("needs_auth", "login expired"), "codex": live("needs_auth", "login expired")}
-        calls = []
-        with environment("ANTHROPIC_API_KEY"), patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-not-a-real-key"}), \
-             patch.object(orch, "get_or_update_status", return_value=cache), \
-             patch("makewand.health.load_status_cache", return_value=cache), \
-             patch.object(orch, "check_load_backpressure", return_value=True), \
-             patch("makewand.config.get_active_providers", return_value=["claude", "codex"]), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)), \
-             patch("makewand.usage.get_engine_usage_stats", return_value={}), \
-             patch("makewand.usage.get_all_engine_reliability", return_value={}), \
-             patch.object(orch, "classify_prompt_intent", return_value="explain"), \
-             patch.object(orch, "dispatch_task", side_effect=lambda engine, *a, **k: calls.append(engine)), \
-             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = orch.run_workflow("解释 VALUE 的含义", cwd=str(repo), total_timeout=60)
-        self.assertEqual(calls, [], "the relay used to count the logged-out engines as usable")
-        self.assertEqual(result.status, "UNVERIFIED")
-        self.assertTrue(result.error.startswith("No usable execution provider: "), result.error)
 
 
 if __name__ == "__main__":

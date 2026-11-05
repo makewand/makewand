@@ -71,50 +71,6 @@ class ConfigFailureBoundaries(unittest.TestCase):
                 self.assertFalse(config.is_api_allowed("claude"))
                 self.assertEqual(config.API_KEYS_FILE.read_text(), value)
 
-    def test_atomic_saves_keep_shared_fields_and_create_private_files(self):
-        config.CONFIG_FILE.write_text(json.dumps({"claude_model": "native-model", "api_policy": "subscription_only", "custom": {"keep": True}}))
-        config.CONFIG_FILE.chmod(0o644)
-        self.assertTrue(config.save_user_config({"enabled_providers": {"claude": False}}))
-        result = json.loads(config.CONFIG_FILE.read_text())
-        self.assertEqual(result["claude_model"], "native-model")
-        self.assertEqual(result["custom"], {"keep": True})
-        self.assertEqual(result["enabled_providers"], {"claude": False})
-        config.API_KEYS_FILE.write_text(json.dumps({"claude": {"api_key": "old", "opaque": "keep"}, "codex": {"api_key": "other"}}))
-        config.API_KEYS_FILE.chmod(0o644)
-        self.assertTrue(config.save_api_key("claude", "new", model="fixture-model"))
-        keys = json.loads(config.API_KEYS_FILE.read_text())
-        self.assertEqual(keys["codex"], {"api_key": "other"})
-        self.assertEqual(keys["claude"], {"api_key": "new", "opaque": "keep", "model": "fixture-model"})
-        if os.name != "nt":
-            for path in (config.CONFIG_FILE, config.API_KEYS_FILE):
-                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        self.assertFalse(list(self.config_dir.glob(".*-*.json")))
-
-    def test_write_and_replace_failure_preserve_old_documents(self):
-        for filename, save in (("config.json", lambda: config.save_user_config({"new": True})),
-                               ("api_keys.json", lambda: config.save_api_key("claude", "new"))):
-            path = self.config_dir / filename
-            original = '{"claude":{"api_key":"offline-old"},"shared":"keep"}'
-            path.write_text(original)
-            path.chmod(0o600)
-            for point in ("fsync", "replace"):
-                with self.subTest(filename=filename, failure=point), patch.object(config.os, point, side_effect=OSError("injected save failure")):
-                    self.assertFalse(save())
-                self.assertEqual(path.read_text(), original)
-                self.assertFalse(list(self.config_dir.glob(".*-*.json")))
-            if filename == "config.json":
-                self.assertFalse(config.save_user_config({"not_json": object()}))
-                self.assertEqual(path.read_text(), original)
-
-    def test_saving_never_replaces_a_damaged_existing_document(self):
-        for value in ("{", "[]", "null"):
-            with self.subTest(value=value):
-                config.CONFIG_FILE.write_text(value)
-                config.API_KEYS_FILE.write_text(value)
-                self.assertFalse(config.save_user_config({"enabled_providers": {"claude": True}}))
-                self.assertFalse(config.save_api_key("claude", "offline-key"))
-                self.assertEqual(config.CONFIG_FILE.read_text(), value)
-                self.assertEqual(config.API_KEYS_FILE.read_text(), value)
 
     def test_invalid_authorization_updates_do_not_replace_valid_policy(self):
         original = '{"enabled_providers":{"claude":false},"native_field":"keep"}'
@@ -147,7 +103,7 @@ class CLIConfigFailureBoundaries(unittest.TestCase):
                    "MAKEWAND_API_POLICY": "subscription_only", "OFFLINE_PROVIDER_LOG": str(log), "LANG": "C.UTF-8"}
             document = json.dumps({"active_providers": [], "enabled_providers": {"claude": False}, "local_model_enabled": False})
             path = root / "config" / "config.json"
-            commands = ((["status", "--json"], 0), (["models"], 0), (["run", "explain 2 + 2", "--timeout", "1"], 11))
+            commands = ((["status", "--json"], 0), (["models"], 0), (["claude", "explain 2 + 2", "--timeout", "1"], 10))
             for contents, damaged in ((document, False), (document + "X", True), ("[]", True), ("null", True),
                                       ('{"enabled_providers":{"claude":"false"}}', True),
                                       ('{"enabled_providers":{"claude":null}}', True),

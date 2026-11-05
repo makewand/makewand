@@ -14,7 +14,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
-from makewand.engine_selection import _engine_usable, _select_race_judge
+from makewand.engine_selection import _engine_usable
 
 REGION = "Antigravity 在当前地区/账号不可用 (真实派发返回地区限制)"
 
@@ -49,15 +49,6 @@ class TestErrorVerdictExcludesEngine(unittest.TestCase):
                 self.assertTrue(_engine_usable("agy", {"agy": info})[0])
         # Statuses without a TTL keep excluding the engine.
         self.assertFalse(_engine_usable("agy", {"agy": {"status": "limited", "updated_at": ago(days=3)}})[0])
-
-    def test_region_blocked_agy_is_not_the_race_judge(self):
-        cache = {"agy": {"status": "error", "reason": REGION, "updated_at": ago(minutes=1), "ttl_seconds": 6 * 3600},
-                 "codex": {"status": "healthy"}, "claude": {"status": "healthy"}, "grok": {"status": "healthy"}}
-        self.assertEqual(_select_race_judge(cache, ("claude", "grok")), "codex")
-
-    def test_unprobed_agy_remains_the_preferred_judge(self):
-        cache = {"agy": {"status": "unknown"}, "codex": {"status": "healthy"}}
-        self.assertEqual(_select_race_judge(cache, ("claude", "grok")), "agy")
 
 
 if __name__ == "__main__":

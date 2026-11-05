@@ -58,24 +58,12 @@ class MakefileTests(unittest.TestCase):
         self.assertIn("bash scripts/check_version.sh", out)
 
 class RepositoryHygieneTests(unittest.TestCase):
-    def test_golangci_exclusions_point_at_existing_paths(self):
-        text = (ROOT / ".golangci.yml").read_text(encoding="utf-8")
-        entries = []
-        for block in re.finditer(r"(?m)^(\s*)paths:\s*\n((?:\1\s+- .*\n)+)", text):
-            entries += [line.split("- ", 1)[1].strip() for line in block.group(2).splitlines()]
-        self.assertTrue(entries, "expected at least one exclusion path")
-        for entry in entries:
-            literal = entry.strip("^$").rstrip("/")
-            with self.subTest(entry=entry):
-                self.assertTrue((ROOT / literal).exists(), f"{entry} excludes a path that does not exist")
 
     @unittest.skipUnless(shutil.which("git") and (ROOT / ".git").exists(), "git checkout required")
     def test_gitignore_does_not_hide_tracked_files(self):
         result = _git("ls-files", "-ci", "--exclude-standard")
         self.assertEqual(result.returncode, 0, result.stderr)
-        # benchmarks/results/go.mod is a deliberately tracked module stub that
-        # keeps generated benchmark projects out of `go ./...`.
-        self.assertEqual(sorted(set(result.stdout.split()) - {"benchmarks/results/go.mod"}), [])
+        self.assertEqual(sorted(set(result.stdout.split())), [])
 
     @unittest.skipUnless(shutil.which("git") and (ROOT / ".git").exists(), "git checkout required")
     def test_generated_artifacts_are_ignored(self):

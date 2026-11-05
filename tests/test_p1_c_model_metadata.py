@@ -171,47 +171,6 @@ class ModelMetadataTests(unittest.TestCase):
             cli.cmd_models(argparse.Namespace(json=True))
         self.assertEqual(len(json.loads(output.getvalue())["agy"]["candidates"]), 3)
 
-    def test_same_family_across_tools_never_counts_as_independent(self):
-        def resolve(tool, tier="standard"):
-            return {"model": "claude-opus-5-5" if tool == "agy" else "claude-sonnet-5"}
-        with patch.object(discovery, "get_provider_model_tier", side_effect=resolve):
-            self.assertFalse(discovery.independent_models("agy", "claude"))
-            self.assertTrue(discovery.independent_models("agy", "codex", author_model="gpt-6-sol"))
-            self.assertFalse(discovery.independent_models("agy", "codex", author_model="argon"))
-            with patch.object(orch, "_engine_usable", return_value=(True, "")), \
-                 patch.object(orch, "_select_race_judge", return_value="agy"), \
-                 patch("makewand.config.get_active_providers", return_value=["agy", "claude"]):
-                self.assertIsNone(orch._select_wta_reviewer({}, "claude", ("claude", "agy")))
-                self.assertEqual(orch._review_stand_ins(["agy"], {"claude"}, {}, None), [])
-
-
-    def test_winner_family_uses_implementation_tier(self):
-        def resolve(tool, tier="standard"):
-            if tool == "agy":
-                return {"model": "gemini-3-pro" if tier == "deep" else "claude-sonnet-5"}
-            return {"model": "claude-opus-5"}
-        with patch.object(discovery, "get_provider_model_tier", side_effect=resolve), \
-             patch.object(orch, "_engine_usable", side_effect=lambda e, cache: (e == "claude", "")), \
-             patch.object(orch, "_select_race_judge", return_value="claude"):
-            self.assertFalse(discovery.independent_models("claude", "agy", author_tier="auto"))
-            self.assertIsNone(orch._select_wta_reviewer({}, "agy", ("agy", "claude"), winner_tier="standard"))
-            self.assertEqual(orch._select_wta_reviewer({}, "agy", ("agy", "claude"), winner_tier="deep"), "claude")
-
-
-class FamilyPipelineTests(unittest.TestCase):
-    # Reuse the hermetic pipeline fixture, without inheriting its test cases.
-    from test_workflow_scheduling import SchedulingTests as _Fixtures
-    setUp = _Fixtures.setUp
-    fixtures = _Fixtures.fixtures
-
-    def test_same_family_tools_cannot_approve_high_risk_pipeline(self):
-        with self.fixtures(), patch.object(discovery, "get_provider_model_tier", return_value={"model": "claude-opus-5"}):
-            result = orch.run_workflow("Implement value", cwd=str(self.repo), force_code=True,
-                                       risk="high", auto_fix=False, total_timeout=10)
-        self.assertEqual(result.status, "UNVERIFIED")
-        self.assertEqual([(engine, ro) for engine, ro, _, _ in self.calls], [("claude", False)])
-        self.assertEqual((self.repo / "app.py").read_text(), "VALUE = 1\n")
-
 
 if __name__ == "__main__":
     unittest.main()

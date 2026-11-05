@@ -136,26 +136,6 @@ def test_concurrency_limit_can_increase_after_quiescence(isolated, monkeypatch):
         budget.complete(second, True, 0)
 
 
-def test_compaction_keeps_lifetime_charges(isolated, monkeypatch):
-    monkeypatch.setenv("MAKEWAND_LAYERED_BUDGET", "")
-    monkeypatch.delenv("MAKEWAND_MACHINE_DAILY_CALLS")
-    monkeypatch.delenv("MAKEWAND_PROJECT_DAILY_CALLS")
-    monkeypatch.setenv("MAKEWAND_MAX_MODEL_CALLS", "2")
-    base = 1800000000
-    for slot in range(2):
-        with patch.object(budget.time, "time", return_value=base):
-            attempt = budget.reserve("codex", "fast", task_id=f"legacy-{slot}")
-            budget.complete(attempt, True, 0)
-    with patch.object(budget.time, "time", return_value=base + 4 * 86400):
-        with budget._ledger() as (path, data):
-            budget._save(path, data)
-        assert budget.remaining_capacity() == 0
-        with pytest.raises(budget.BudgetError, match="exhausted"):
-            budget.reserve("codex", "fast")
-    data = json.loads(Path(os.environ["MAKEWAND_CALL_BUDGET_FILE"]).read_text())
-    assert not data["attempts"] and data["archived_used"] == 2
-
-
 def test_compaction_keeps_active_lease_holds_and_recent_charge(isolated):
     from makewand import ledger_compaction
     base = 1800000000

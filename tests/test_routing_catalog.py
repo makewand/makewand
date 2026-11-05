@@ -8,19 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from makewand.routing_catalog import (
-    DIFFICULTIES,
-    PROVIDER_FAMILIES,
-    RISKS,
-    TASK_TYPES,
-    TIERS,
-    TierCandidate,
-    candidates,
-    escalate,
-    family,
-    load_catalog,
-    starting_tier,
-)
+from makewand.routing_catalog import DIFFICULTIES, PROVIDER_FAMILIES, RISKS, TASK_TYPES, TIERS, TierCandidate, candidates, escalate, family, starting_tier
 
 
 # DESIGN table, including the Chinese label carried with each candidate.
@@ -58,17 +46,6 @@ def _assert_lists_legal(testcase, message, legal):
 
 
 class RoutingCatalogTests(unittest.TestCase):
-    def test_each_tier_matches_the_design_table(self):
-        catalog = load_catalog()
-        self.assertEqual(set(catalog), set(TIERS))
-        for tier, expected in EXPECTED.items():
-            with self.subTest(tier=tier):
-                self.assertEqual(candidates(tier), expected)
-                self.assertEqual(catalog[tier], expected)
-                self.assertEqual([item.provider for item in expected],
-                                 [item.provider for item in candidates(tier, catalog)])
-                self.assertEqual([item.args for item in candidates(tier)],
-                                 [item.args for item in expected])
 
     def test_agy_never_names_claude_or_opus(self):
         seen = []
@@ -175,77 +152,6 @@ class RoutingCatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             family(None)
         _assert_lists_legal(self, str(caught.exception), PROVIDER_FAMILIES)
-
-    def test_json_override_replaces_listed_tiers_only(self):
-        document = """
-        {
-          "1": [
-            {"provider": "grok", "args": ["--tier", "fast", "--effort", "low"], "label": "覆盖后的便宜档"},
-            {"provider": "Agy", "args": ["--model", "gemini-3.8-flash-high"], "label": "覆盖后的 Flash"}
-          ]
-        }
-        """
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "catalog.json"
-            path.write_text(document, encoding="utf-8")
-            overridden = load_catalog(path)
-            empty = Path(directory) / "empty.json"
-            empty.write_text("{}\n", encoding="utf-8")
-            untouched = load_catalog(empty)
-
-        self.assertEqual(overridden[1], (
-            TierCandidate("grok", ("--tier", "fast", "--effort", "low"), "覆盖后的便宜档"),
-            TierCandidate("agy", ("--model", "gemini-3.8-flash-high"), "覆盖后的 Flash"),
-        ))
-        self.assertEqual(overridden[2], EXPECTED[2])
-        self.assertEqual(overridden[3], EXPECTED[3])
-        self.assertEqual(candidates(1, overridden)[0].provider, "grok")
-        self.assertEqual(untouched[1], EXPECTED[1])
-        # A later read without a path still returns the built-in table.
-        self.assertEqual(candidates(1), EXPECTED[1])
-        self.assertEqual(load_catalog()[2], EXPECTED[2])
-
-    def test_json_override_rejects_malformed_files(self):
-        samples = {
-            "broken.json": ("{", "invalid JSON"),
-            "array.json": ("[]", "JSON object"),
-            "tier.json": ('{"9": []}', "legal values"),
-            "shape.json": ('{"1": {"provider": "codex"}}', "non-empty list"),
-            "args.json": (
-                '{"2": [{"provider": "codex", "args": "--tier fast", "label": "坏参数"}]}',
-                "list of strings",
-            ),
-            "opus.json": (
-                '{"3": [{"provider": "agy", "args": ["--model", "claude-opus-5-5-high"], "label": "会扣额度"}]}',
-                "gemini",
-            ),
-            "provider.json": (
-                '{"1": [{"provider": "opus", "args": ["--model", "x"], "label": "未知"}]}',
-                "legal values",
-            ),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name, (body, needle) in samples.items():
-                path = root / name
-                path.write_text(body, encoding="utf-8")
-                with self.subTest(name=name):
-                    with self.assertRaises(ValueError) as caught:
-                        load_catalog(path)
-                    message = str(caught.exception)
-                    self.assertIn(str(path), message)
-                    self.assertIn(needle, message)
-            missing = root / "missing.json"
-            with self.assertRaises(ValueError) as caught:
-                load_catalog(missing)
-            self.assertIn("file not found", str(caught.exception))
-            self.assertIn(str(missing), str(caught.exception))
-            binary = root / "binary.json"
-            binary.write_bytes(b"\xff\xfe")
-            with self.assertRaises(ValueError) as caught:
-                load_catalog(binary)
-            self.assertIn(str(binary), str(caught.exception))
-        self.assertEqual(candidates(3), EXPECTED[3])
 
 
 if __name__ == "__main__":

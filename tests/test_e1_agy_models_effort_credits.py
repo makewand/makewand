@@ -201,82 +201,6 @@ class TestNormalizeAndCliEffort(unittest.TestCase):
         self.assertEqual(normalize_provider_effort("codex", "xhigh"), "xhigh")
         self.assertEqual(normalize_provider_effort("codex", "ultra"), "ultra")
 
-    def test_cli_accepts_xhigh_and_ultra_and_rejects_bogus(self):
-        import makewand.cli as cli
-        captured = {}
-
-        def fake_dispatch(args, is_auto_routed_run=False):
-            captured["effort"] = getattr(args, "effort", None)
-            captured["subcommand"] = args.subcommand
-
-        original_argv = sys.argv
-        original_cwd = os.getcwd()
-        try:
-            for value in ("low", "medium", "high", "xhigh", "max", "ultra"):
-                with self.subTest(effort=value):
-                    captured.clear()
-                    with patch.object(cli, "_dispatch_parsed_command", side_effect=fake_dispatch), \
-                         patch("makewand.daemon.try_dispatch_via_daemon", return_value=None):
-                        sys.argv = ["makewand", "agy", "hello", "--effort", value]
-                        cli._main()
-                    self.assertEqual(captured.get("effort"), value)
-                    self.assertEqual(captured.get("subcommand"), "agy")
-            with self.assertRaises(SystemExit) as ctx:
-                sys.argv = ["makewand", "agy", "hello", "--effort", "bogus"]
-                cli._main()
-            self.assertEqual(ctx.exception.code, 2)
-        finally:
-            sys.argv = original_argv
-            os.chdir(original_cwd)
-
-
-class TestAgyProviderCommandConstruction(_HomeCase):
-    def _write_host_settings(self, cli_value, root_value):
-        cli = self.home / ".gemini" / "antigravity-cli" / "settings.json"
-        cli.parent.mkdir(parents=True, exist_ok=True)
-        root = self.home / ".gemini" / "settings.json"
-        if cli_value is not None:
-            cli.write_text(json.dumps({"useG1Credits": cli_value}), encoding="utf-8")
-        if root_value is not None:
-            root.write_text(json.dumps({"useG1Credits": root_value}), encoding="utf-8")
-
-    def _dispatch_cmd(self, model, effort):
-        from makewand.providers import agy as agy_provider
-        discovered = DiscoveredAgyModels(AVAILABLE, None, None)
-        workspace = Path(self._tmp.name) / "ws"
-        workspace.mkdir(exist_ok=True)
-        # No-bwrap direct runs are only allowed when both host settings
-        # already prove useG1Credits is false (see TestAgyNoSandboxCredits).
-        self._write_host_settings(False, False)
-        with patch("makewand.config.has_subscription_configured", return_value=True), \
-             patch("makewand.config.has_api_configured", return_value=False), \
-             patch("makewand.sandbox.is_bwrap_available", return_value=False), \
-             patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
-             patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
-             patch("makewand.sandbox.audit_unsafe_host_exec"), \
-             patch.object(discovery, "_discover_local_agy_models", return_value=discovered), \
-             patch.object(agy_provider, "run_subprocess", return_value=(0, "ok", "", None)) as run:
-            agy_provider.execute_agy_task("hello", cwd=str(workspace), model=model, effort=effort, readonly=True)
-        return run.call_args[0][0]
-
-    def test_suffixed_model_verbatim_no_effort_flag(self):
-        cmd = self._dispatch_cmd("gemini-4-argon-high", "low")
-        self.assertEqual(cmd[cmd.index("--model") + 1], "gemini-4-argon-high")
-        self.assertNotIn("--effort", cmd)
-
-    def test_base_model_selects_variant_for_effort(self):
-        cmd = self._dispatch_cmd("gemini-4-argon", "medium")
-        self.assertEqual(cmd[cmd.index("--model") + 1], "gemini-4-argon-medium")
-        self.assertNotIn("--effort", cmd)
-        cmd = self._dispatch_cmd("gemini-4-argon", "xhigh")
-        self.assertEqual(cmd[cmd.index("--model") + 1], "gemini-4-argon-high")
-        self.assertNotIn("--effort", cmd)
-
-    def test_plain_model_uses_effort_flag(self):
-        cmd = self._dispatch_cmd("some-plain-model", "xhigh")
-        self.assertEqual(cmd[cmd.index("--model") + 1], "some-plain-model")
-        self.assertEqual(cmd[cmd.index("--effort") + 1], "xhigh")
-
 
 class TestAgyCreditsOff(unittest.TestCase):
     def _materialize(self, home: Path):
@@ -345,7 +269,6 @@ class TestAgyCreditsOff(unittest.TestCase):
             finally:
                 ph.finalize(write_back=False)
             self.assertFalse((home / ".gemini").exists())
-
 
 
 class TestAgyNoSandboxCredits(_HomeCase):

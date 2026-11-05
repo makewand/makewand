@@ -22,16 +22,8 @@ from makewand.config import (
     has_api_configured,
     has_subscription_configured
 )
-from makewand.providers.local import (
-    is_local_model_available,
-    get_default_local_model,
-    list_local_models,
-    parse_local_quota,
-    get_free_gpu_vram_mb,
-    execute_local_task
-)
+from makewand.providers.local import is_local_model_available, get_default_local_model, list_local_models, get_free_gpu_vram_mb, execute_local_task
 from makewand.health import probe_model
-from makewand.orchestrator import select_optimal_engine_pair
 
 class TestHybridRouting(unittest.TestCase):
 
@@ -121,15 +113,6 @@ class TestHybridRouting(unittest.TestCase):
         self.assertEqual(out, "Claude API direct response")
         mock_call_api.assert_called_once()
 
-    def test_local_model_functions(self):
-        from makewand.providers import local as local_mod
-        avail, active, all_m = local_mod.is_local_model_available()
-        if avail:
-            self.assertTrue(len(all_m) > 0)
-            self.assertIn(active, all_m)
-            self.assertEqual(local_mod.list_local_models(), all_m)
-        is_lim, _, _ = parse_local_quota("any output")
-        self.assertFalse(is_lim)
 
     @patch("makewand.providers.local.get_free_gpu_vram_mb")
     @patch("makewand.providers.local.is_local_model_available")
@@ -165,31 +148,6 @@ class TestHybridRouting(unittest.TestCase):
         extra = kwargs.get("extra_params", {})
         self.assertEqual(extra.get("options", {}).get("num_gpu"), 0)
 
-
-    def test_orchestrator_hybrid_and_local_selection(self):
-        # 1. Test local preference
-        cache = {
-            "agy": {"status": "healthy"},
-            "claude": {"status": "healthy"},
-            "codex": {"status": "healthy"},
-            "local": {"status": "healthy"}
-        }
-        coders, reviewers, meta = select_optimal_engine_pair("在本地私有大模型上运行离线分析", cache=cache)
-        # Should heavily boost local model
-        self.assertIn("local", coders[:2])
-
-        # 2. Test fallback when subscription is limited but API is available
-        with patch("makewand.config.has_api_configured") as mock_api:
-            mock_api.side_effect = lambda m: m == "codex"
-            cache_limited = {
-                "agy": {"status": "healthy"},
-                "claude": {"status": "healthy"},
-                "codex": {"status": "limited"},
-                "local": {"status": "healthy"}
-            }
-            coders, reviewers, meta = select_optimal_engine_pair("算法优化与底层并发", cache=cache_limited, boost=True)
-            # Codex should NOT be disqualified (-999) because it has API fallback!
-            self.assertGreater(meta["scores"]["codex"], 0)
 
     def test_health_probe_modes(self):
         # Test probe for local model

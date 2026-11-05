@@ -427,41 +427,6 @@ def complete(attempt, success, seconds, *, result_status=None, outcome_known=Tru
         raise BudgetError("model task reservation disappeared")
 
 
-def reserve_capacity(count, owner, purpose="review", ttl_seconds=600):
-    """Hold future calls without recording an attempt that has not started."""
-    if (type(count) is not int or count <= 0 or not isinstance(owner, str) or not owner
-            or not isinstance(purpose, str) or not purpose
-            or isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
-            or not math.isfinite(ttl_seconds) or not 0 < ttl_seconds <= layered_budget.MAX_HOLD_SECONDS):
-        raise BudgetError("invalid model call capacity reservation")
-    try:
-        with _ledger(lock_deadline=_admission_deadline()) as (path, data):
-            if data is None:
-                return None
-            holds = _active_holds(data)
-            available = _maximum(data) - _charged(data) - sum(h["remaining"] for h in holds.values())
-            keys = None
-            if "scopes" in data:
-                from makewand.execution_runtime import task_id
-                keys = layered_budget.scopes(data, task_id(), None)
-                _save(path, data)
-                available = layered_budget.available(data, keys, holds)
-            if count > available:
-                raise BudgetError(f"insufficient model task capacity ({available} available; {count} required)")
-            lease = uuid.uuid4().hex
-            # Dated from the clock that compaction expires holds by: from wall time, a
-            # ledger clock within its permitted lead cut a hold short, even at this save.
-            created = layered_budget.effective_clock(data)
-            data.setdefault("holds", {})[lease] = dict(owner=owner, purpose=purpose, remaining=count,
-                created_at=created, expires_at=created + ttl_seconds, scopes=keys)
-            _save(path, data)
-            return lease
-    except BudgetError:
-        raise
-    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-        raise BudgetError(f"cannot reserve model task capacity: {error}") from error
-
-
 def repair_clock(budget_file=None, apply=False):
     """Report a budget clock or day bucket that leads real time; apply=True brings it back.
 
@@ -531,28 +496,6 @@ def request_budget(request_id, maximum=None, budget_file=None):
         raise
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
         raise BudgetError(f"cannot read request budget: {error}") from error
-
-
-def release_capacity(lease_id):
-    if lease_id is None:
-        return
-    with _ledger() as (path, data):
-        if data is not None and lease_id in data.get("holds", {}):
-            del data["holds"][lease_id]
-            _save(path, data)
-
-
-def remaining_capacity():
-    with _ledger() as (path, data):
-        if data is None:
-            return None
-        if "scopes" in data:
-            from makewand.execution_runtime import task_id
-            keys = layered_budget.scopes(data, task_id(), None)
-            _save(path, data)
-            return max(0, layered_budget.available(data, keys, _active_holds(data)))
-        return max(0, _maximum(data) - _charged(data) - sum(
-            h["remaining"] for h in _active_holds(data).values()))
 
 
 def start(attempt, *, budget_file=None, max_model_calls=None):

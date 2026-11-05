@@ -21,10 +21,8 @@ from unittest.mock import patch, MagicMock
 
 from makewand.providers.api_client import apply_agentic_code_output, call_api_chat
 from makewand.providers.local import execute_local_task
-from makewand.ensemble import resolve_ensemble_providers, run_ensemble, FRONTIER_ENSEMBLE_PROVIDERS, ALL_ENSEMBLE_PROVIDERS
 from makewand.cli import cmd_clean
-from makewand.orchestrator import run_pipeline, run_race, run_review, _run_pipeline_impl
-from makewand.task_dag import TaskDAG, TaskNode, execute_task_dag
+from makewand.orchestrator import run_review
 
 
 class TestUntrustedRepoInterception(unittest.TestCase):
@@ -112,71 +110,9 @@ class TestUntrustedRepoInterception(unittest.TestCase):
             self.assertEqual(out, "analysis result")
 
 
-class TestEnsembleEnhancements(unittest.TestCase):
-    """Test ensemble 'all' provider expansion and model divergence fix."""
-
-    @patch("makewand.providers.local.is_local_model_available", return_value=(True, "qwen2.5-coder", ["qwen2.5-coder"]))
-    @patch("makewand.ensemble.is_provider_enabled", return_value=True)
-    @patch("makewand.ensemble.has_subscription_configured", return_value=True)
-    def test_resolve_ensemble_providers_all_includes_local(self, mock_sub, mock_en, mock_avail):
-        # 'all' must include 'local'
-        providers = resolve_ensemble_providers("all")
-        self.assertIn("local", providers)
-        self.assertIn("claude", providers)
-        self.assertIn("codex", providers)
-
-    @patch("makewand.providers.local.is_local_model_available", return_value=(False, "", []))
-    @patch("makewand.ensemble.is_provider_enabled", return_value=True)
-    @patch("makewand.ensemble.has_subscription_configured", return_value=True)
-    def test_resolve_ensemble_providers_all_skips_unhealthy_local(self, mock_sub, mock_en, mock_avail):
-        # If local is not available, do not include it
-        providers = resolve_ensemble_providers("all")
-        self.assertNotIn("local", providers)
-
-    @patch("makewand.orchestrator.dispatch_task")
-    def test_ensemble_single_expert_passes_resolved_model(self, mock_dispatch):
-        mock_dispatch.return_value = (True, "LGTM", None)
-        with patch("makewand.ensemble.resolve_ensemble_providers", return_value=["claude"]):
-            run_ensemble("review code", providers="claude", tier="standard", effort="high")
-            self.assertTrue(mock_dispatch.called)
-            kwargs = mock_dispatch.call_args[1]
-            self.assertIn("model", kwargs)
-            self.assertIsNotNone(kwargs["model"])
-            self.assertEqual(kwargs.get("effort"), "high")
-
-
 class TestEffortForwarding(unittest.TestCase):
     """Verify reasoning effort is cleanly propagated to all pipeline and race stages."""
 
-    @patch("makewand.orchestrator.dispatch_task")
-    @patch("makewand.orchestrator.get_git_diff", return_value="diff --git a/test.py b/test.py\n+x = 1")
-    @patch("makewand.orchestrator.run_local_tests", return_value=(True, "OK"))
-    def test_run_pipeline_forwards_effort(self, mock_tests, mock_diff, mock_dispatch):
-        mock_dispatch.return_value = (True, "```python\nx = 1\n```", None)
-        with tempfile.TemporaryDirectory() as td:
-            # Init empty git repo
-            import subprocess
-            subprocess.run(["git", "init"], cwd=td, capture_output=True)
-            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=td, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "test"], cwd=td, capture_output=True)
-            with open(os.path.join(td, "init.txt"), "w") as f:
-                f.write("base")
-            subprocess.run(["git", "add", "."], cwd=td, capture_output=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=td, capture_output=True)
-
-            with patch("makewand.orchestrator.resolve_review_verdict", return_value=("LGTM", {"pass": True, "execution_status": "PASSED"})):
-                with patch("makewand.orchestrator.evaluate_review_verdict", return_value={"status": "PASSED"}):
-                    run_pipeline(
-                        "write code",
-                        cwd=td,
-                        effort="max",
-                        auto_fix=False,
-                        force_code=True,
-                        forced_engine="claude",
-                    )
-            # Check implementation dispatch received effort="max"
-            impl_call = [call for call in mock_dispatch.call_args_list if call[1].get("effort") == "max"]
-            self.assertTrue(len(impl_call) > 0, "effort was not forwarded to dispatch_task")
 
     @patch("makewand.orchestrator.dispatch_task")
     @patch("makewand.orchestrator.get_git_diff", return_value="diff --git a/test.py b/test.py\n+x = 1")
@@ -187,18 +123,6 @@ class TestEffortForwarding(unittest.TestCase):
             run_review(cwd=td, effort="high", output_json=True)
             self.assertTrue(mock_dispatch.called)
             self.assertEqual(mock_dispatch.call_args_list[0][1].get("effort"), "high")
-
-    @patch("makewand.orchestrator.run_pipeline")
-    def test_execute_task_dag_forwards_effort(self, mock_pipeline):
-        mock_pipeline.return_value = True
-        dag = TaskDAG("build goal", [TaskNode("task-1", "title", "desc")])
-        # A private workspace: the shared temporary directory may hold the checkout under
-        # test, which the test harness refuses as a workspace.
-        with tempfile.TemporaryDirectory(prefix="makewand-effort-") as workspace:
-            ok, msg, stages = execute_task_dag(dag, cwd=workspace, effort="high")
-        self.assertTrue(ok, msg)
-        self.assertTrue(mock_pipeline.called)
-        self.assertEqual(mock_pipeline.call_args[1].get("effort"), "high")
 
 
 class TestCmdCleanEnhancement(unittest.TestCase):

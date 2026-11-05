@@ -17,8 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECK_VERSION = ROOT / "scripts" / "check_version.sh"
 VERSION_SURFACE = [
     "makewand/__init__.py",
-    "makewand/interactive.py",
-    "tests/test_interactive.py",
     "README.md",
     "site/index.html",
     "site/docs.html",
@@ -93,8 +91,6 @@ class CheckVersionTests(unittest.TestCase):
             "site/index.html": lambda s: s.replace("v" + version, stale, 1),
             "site/main.js": lambda s: s.replace("v" + version, stale, 1),
             "makewand/__init__.py": lambda s: s.replace("(v" + version + ")", "(" + stale + ")", 1),
-            "makewand/interactive.py": lambda s: s + f'\n_STALE_BANNER = "Makewand ({stale})"\n',
-            "tests/test_interactive.py": lambda s: s + f'\n# card shows "Makewand ({stale})"\n',
             "CHANGELOG.md": lambda s: s.replace(f"## [{version}]", "## [0.0.1]"),
             "internal/buildinfo/buildinfo.go": lambda s: s.replace('Version = "dev"', f'Version = "{version}"', 1),
             "scripts/install.sh": lambda s: s.replace('exec python3 -I "$SCRIPT_ROOT/scripts/install_source.py" "$SCRIPT_ROOT"', 'echo "installation bypassed"', 1),

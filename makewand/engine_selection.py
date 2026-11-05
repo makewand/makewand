@@ -7,14 +7,7 @@ import re
 import sys
 from typing import Optional, Tuple, List, Dict, Any
 
-import makewand.config as config
-from makewand.config import (
-    c,
-    COLOR_BOLD,
-    COLOR_RED,
-    COLOR_YELLOW,
-    API_ONLY_ENGINES,
-)
+from makewand.config import c, COLOR_BOLD, COLOR_RED, API_ONLY_ENGINES
 from makewand.task_admission import classify_prompt_intent
 
 # ---------------------------------------------------------------------------
@@ -35,7 +28,6 @@ _UNUSABLE_ENGINE_STATUSES = ("limited", "needs_auth", "error", "missing", "disab
 # when an API key is configured and the API policy allows paid calls
 # (config.api_relay_available). An "error" verdict is not relayed: the CLI runs.
 _API_RELAY_STATUSES = ("limited", "needs_auth", "missing")
-_RACE_JUDGE_ORDER = ("agy", "codex", "claude", "grok", "muse", "local")
 
 
 def _failure_verdict_expired(info: Dict[str, Any]) -> bool:
@@ -161,26 +153,6 @@ def _usable_or_api_relay(engine: str, cache: Optional[Dict[str, Any]], usable_fn
     return status in _API_RELAY_STATUSES and is_provider_enabled(engine) and api_relay_available(engine)
 
 
-def _select_race_judge(cache: Optional[Dict[str, Any]], contestants: Tuple[Optional[str], ...]) -> Optional[str]:
-    """Antigravity first; otherwise an enabled/usable non-contestant, and only then a contestant (blind A/B)."""
-    orch = sys.modules.get("makewand.orchestrator")
-    if orch is not None:
-        custom = getattr(orch, "_select_race_judge", None)
-        if custom is not None and custom is not _select_race_judge:
-            return custom(cache, contestants)
-    usable_fn = getattr(orch, "_engine_usable", None) if orch else None
-    if usable_fn is None or usable_fn is _engine_usable:
-        usable_fn = _engine_usable
-    usable = [e for e in _RACE_JUDGE_ORDER if usable_fn(e, cache)[0]]
-    if "agy" in usable:
-        return "agy"
-    taken = {e for e in contestants if e}
-    for e in usable:
-        if e not in taken:
-            return e
-    return usable[0] if usable else None
-
-
 def forced_engine_name(forced_engine: Optional[str]) -> Optional[str]:
     """The engine a caller forced (--provider, a race contestant), or None for none or "auto"."""
     name = (forced_engine or "").strip().lower()
@@ -240,26 +212,6 @@ def forced_engine_refusal_lines(forced_engine: str, why: str) -> List[str]:
             "   运行 'makewand probe' 复查，或不指定引擎，由 Makewand 选择当前可用的引擎。"]
 
 
-def _no_provider_detected(forced_engine: Optional[str], route_meta: Dict[str, Any]) -> bool:
-    """True when routing has nothing to dispatch: zero active providers (N=0), or
-    none of them usable right now and no caller override chose an engine pair.
-    A forced engine was decided before routing (forced_engine_refusal): when it
-    got here it is usable and runs, whatever routing found for the others."""
-    if forced_engine_name(forced_engine):
-        return False
-    if route_meta.get("no_usable_engines") and not route_meta.get("primary_reviewer"):
-        return True
-    if route_meta.get("no_active_providers"):
-        return True
-    if not route_meta.get("single_tool_mode"):
-        return False
-    try:
-        from makewand.config import get_active_providers
-        return not get_active_providers()
-    except Exception:
-        return False
-
-
 def _unusable_engines(active, cache: Optional[Dict[str, Any]], usable_fn=None) -> Dict[str, str]:
     """Why each active engine with an executor cannot be selected right now; empty
     when at least one of them can be."""
@@ -271,45 +223,6 @@ def _unusable_engines(active, cache: Optional[Dict[str, Any]], usable_fn=None) -
             return {}
         reasons[engine] = (usable_fn or _engine_usable)(engine, cache)[1] or "当前不可用"
     return reasons
-
-
-def _routing_unusable_engines(route_meta: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
-    """Why each active engine cannot run: from routing, else from the status cache."""
-    unusable = (route_meta or {}).get("unusable_engines")
-    if unusable is None:
-        try:
-            from makewand.config import get_active_providers
-            from makewand.health import load_status_cache
-            active = get_active_providers()
-            unusable = _unusable_engines(active, load_status_cache()) if active else {}
-        except Exception:
-            unusable = {}
-    return unusable
-
-
-def _no_provider_error(route_meta: Optional[Dict[str, Any]] = None) -> str:
-    """The run outcome's error when _no_provider_detected stops it, with each engine's reason."""
-    unusable = _routing_unusable_engines(route_meta)
-    if not unusable:
-        return "No enabled execution provider"
-    return "No usable execution provider: " + "; ".join(f"{engine}: {why}" for engine, why in unusable.items())
-
-
-def _print_no_provider_guidance(route_meta: Optional[Dict[str, Any]] = None) -> None:
-    unusable = _routing_unusable_engines(route_meta)
-    if unusable:
-        print(c(f"❌ [Makewand Routing] 已接入的 {len(unusable)} 个 AI 工具当前都不可用，任务未执行，工作区未做任何改动。",
-                COLOR_RED + COLOR_BOLD))
-        for engine, why in unusable.items():
-            print(f"   • {engine}: {why}")
-        print("   运行 'makewand probe' 立即复查；失败状态在有效期过后自动恢复为中性，额度受限在重置后自动恢复。")
-        return
-    print(c("❌ [Makewand Setup] 未检测到任何可用的 AI 编码工具 (0 个)，任务未执行，工作区未做任何改动。", COLOR_RED + COLOR_BOLD))
-    print("   接入引导：")
-    print("   • 安装并登录任一订阅 CLI：claude / codex / agy (Gemini) / grok / muse；")
-    print("   • 或配置 API Key（如 ANTHROPIC_API_KEY / OPENAI_API_KEY），并设置 MAKEWAND_API_POLICY=allow_paid 允许按量计费；")
-    print("   • 或启用本地模型：makewand enable local（需本机 Ollama / vLLM）。")
-    print("   完成后运行 makewand status 查看检测结果。")
 
 
 def select_optimal_engine_pair(

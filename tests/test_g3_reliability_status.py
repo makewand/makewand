@@ -117,16 +117,6 @@ class TestStaleCache(_IsolatedStatus):
         self.assertEqual(pacing["routing_boost"], 0.0, "stale agy must not keep its +0.5 preference")
         self.assertIn("makewand probe", pacing["reason"])
 
-    def test_selector_reports_stale_engines(self):
-        from makewand.orchestrator import select_optimal_engine_pair
-        cache = {e: {"status": "healthy", "updated_at": self.ago(hours=8)} for e in ("claude", "codex", "grok")}
-        with patch("makewand.config.get_active_providers", return_value=["claude", "codex", "grok"]), \
-             patch("makewand.config.has_api_configured", return_value=False), \
-             patch("makewand.config.is_provider_enabled", return_value=True), \
-             patch("makewand.usage.get_burn_rate_penalty", return_value=(0.0, None)):
-            _, _, meta = select_optimal_engine_pair("实现导出功能", tier="standard", cache=cache)
-        self.assertTrue(any("makewand probe" in r and "6 小时" in r for r in meta["reasons"]), meta["reasons"])
-
 
 class TestNeedsAuthHint(_IsolatedStatus):
     """runtime-state#6: needs_auth must tell the user exactly what to do."""

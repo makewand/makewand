@@ -4,53 +4,14 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-def _normalize_verdict_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-    res = dict(d)
-    raw_pass = res.get("pass")
-    pass_val = False
-    if isinstance(raw_pass, bool):
-        pass_val = raw_pass
-    elif isinstance(raw_pass, str):
-        pass_val = raw_pass.strip().lower() in ["true", "1", "yes", "pass", "lgtm"]
-    elif isinstance(raw_pass, (int, float)):
-        # Strictly 1 is True; values like 2, -1, 0 must NOT be treated as True
-        pass_val = (raw_pass == 1)
-
-    raw_defects = res.get("defects", [])
-    if isinstance(raw_defects, str):
-        defects_list = [raw_defects.strip()] if raw_defects.strip() else []
-    elif isinstance(raw_defects, list):
-        defects_list = [str(x).strip() for x in raw_defects if str(x).strip()]
-    elif isinstance(raw_defects, dict):
-        items = raw_defects.get("items") or raw_defects.get("defects") or list(raw_defects.values())
-        if isinstance(items, list):
-            defects_list = [str(x).strip() for x in items if str(x).strip()]
-        else:
-            defects_list = [str(raw_defects)]
-    elif raw_defects:
-        defects_list = [str(raw_defects).strip()]
-    else:
-        defects_list = []
-
-    # Contradiction guard: non-empty defects MUST force pass to False
-    if defects_list:
-        pass_val = False
-
-    res["pass"] = pass_val
-    res["defects"] = defects_list
-    return res
 
 REVIEW_PASSED = "passed"
 REVIEW_FAILED = "failed"
 REVIEW_UNVERIFIED = "unverified"
 
-# A verdict line must START with the tag (optionally behind markdown decoration such as
-# "**", "`", "> " or "- "). Mentions in the middle of a sentence (e.g. quoting the prompt
-# template) are never treated as a verdict.
-_VERDICT_TAG_RE = re.compile(r"^[ \t>*_`#\-]*MAKEWAND_VERDICT[ \t*_`]*[:：]", re.IGNORECASE | re.MULTILINE)
 _VERDICT_TAG_ANY_NONCE_RE = re.compile(r"^[ \t>*_`#\-]*MAKEWAND_VERDICT(?:_[0-9a-zA-Z_-]+)?[ \t*_`]*[:：]", re.IGNORECASE | re.MULTILINE)
-_VERDICT_ANY_RE = re.compile(r"MAKEWAND_VERDICT", re.IGNORECASE)
 _VERDICT_TRAILER_OK_RE = re.compile(r"^[\s`*_。.]*$")
+_VERDICT_ANY_RE = re.compile(r"MAKEWAND_VERDICT", re.IGNORECASE)
 
 
 def generate_review_nonce() -> str:
@@ -214,36 +175,6 @@ def evaluate_review_verdict(
     else:
         reason = "审查裁决 pass=false"
     return {"status": REVIEW_FAILED, "pass": False, "defects": defects, "reason": reason}
-
-
-def extract_verdict_json(
-    text: str,
-    nonce: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Backward-compatible view of the structured verdict.
-    Returns None when no line-anchored MAKEWAND_VERDICT exists; a fail-closed dict with
-    parse_error=True when the verdict is malformed or contradictory; otherwise {"pass", "defects"}.
-    """
-    if not text:
-        return None
-    if not _scan_verdict_lines(text, nonce=nonce):
-        return None
-    verdict = evaluate_review_verdict(text, nonce=nonce)
-    if verdict["status"] == REVIEW_UNVERIFIED:
-        return {"pass": False, "defects": [verdict["reason"]], "parse_error": True}
-    return {"pass": verdict["pass"], "defects": list(verdict["defects"])}
-
-
-def is_review_passed(
-    review_text: str,
-    nonce: Optional[str] = None,
-) -> bool:
-    """
-    True if and only if the review carries exactly one well-formed, uncontradicted
-    MAKEWAND_VERDICT with pass=true and no defects. Free-text approval never passes (Fail-Closed).
-    """
-    return evaluate_review_verdict(review_text, nonce=nonce)["status"] == REVIEW_PASSED
 
 
 def canonical_verdict_line(verdict: Dict[str, Any], nonce: Optional[str] = None) -> str:

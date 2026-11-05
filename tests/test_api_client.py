@@ -16,16 +16,7 @@ import unittest
 import urllib.error
 from unittest.mock import patch, MagicMock, call
 
-from makewand.providers.api_client import (
-    _make_http_request,
-    _stream_post_sse,
-    _post_json,
-    MAX_API_RESPONSE_BYTES,
-    call_api_chat,
-    DEFAULT_SYSTEM_PROMPTS,
-    apply_agentic_code_output,
-    execute_agentic_tool_batch,
-)
+from makewand.providers.api_client import _make_http_request, _stream_post_sse, _post_json, MAX_API_RESPONSE_BYTES, call_api_chat, DEFAULT_SYSTEM_PROMPTS, apply_agentic_code_output
 
 
 class TestMakeHttpRequest(unittest.TestCase):
@@ -703,36 +694,6 @@ class TestApiClientRegressions(unittest.TestCase):
                 )
                 self.assertFalse(res[0])
                 self.assertIn("不可信仓库", str(res[2]))
-
-    def test_github_path_allowed_while_git_tampering_blocked(self):
-        """Regression test for P2-2: .github paths must be allowed while .git tampering is blocked."""
-        import tempfile
-        from pathlib import Path
-
-        with tempfile.TemporaryDirectory() as td:
-            # 1. .github workflow file should succeed
-            github_output = "```filepath: .github/workflows/ci.yml\nname: CI\n```"
-            mod_files = apply_agentic_code_output(github_output, td, repo_trust="trusted")
-            self.assertIn(".github/workflows/ci.yml", mod_files)
-            self.assertTrue((Path(td) / ".github" / "workflows" / "ci.yml").exists())
-
-            # 2. .git directory tampering must be rejected
-            git_output = "```filepath: .git/config\n[core]\nrepositoryformatversion = 0\n```"
-            mod_git = apply_agentic_code_output(git_output, td, repo_trust="trusted")
-            self.assertEqual(mod_git, [])
-            self.assertFalse((Path(td) / ".git" / "config").exists())
-
-            # 3. execute_agentic_tool_batch allows .github and blocks .git
-            tools = [
-                {"action": "write_file", "path": ".github/dependabot.yml", "content": "version: 2"},
-                {"action": "write_file", "path": ".git/hooks/pre-commit", "content": "#!/bin/sh"},
-            ]
-            batch_res = execute_agentic_tool_batch(tools, td)
-            self.assertEqual(batch_res[0]["status"], "ok")
-            self.assertEqual(batch_res[1]["status"], "error")
-            self.assertIn("unsafe", batch_res[1]["error"].lower())
-            self.assertTrue((Path(td) / ".github" / "dependabot.yml").exists())
-            self.assertFalse((Path(td) / ".git" / "hooks" / "pre-commit").exists())
 
 
 class TestApiResponseSizeLimits(unittest.TestCase):

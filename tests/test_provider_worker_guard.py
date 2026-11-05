@@ -47,8 +47,6 @@ class TestProviderWorkerGuard(unittest.TestCase):
                 self.assertEqual(r.returncode, 2, r.stderr)
                 self.assertIn("递归", r.stderr)
 
-    def test_safe_commands_allowed_inside_worker(self):
-        self.assertEqual(cli.WORKER_SAFE_SUBCOMMANDS, {"search", "repomap"})
 
     def test_shared_go_python_policy(self):
         cases = json.loads((Path(__file__).parent / "testdata/provider_worker_policy.json").read_text())
@@ -142,7 +140,7 @@ class TestProviderWorkerGuard(unittest.TestCase):
         self.assertEqual((code, out.strip()), (0, "1"))
 
     def test_guard_inactive_without_marker(self):
-        r = _run(["run", "--help"], worker=False)
+        r = _run(["review", "--help"], worker=False)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("递归", r.stderr)
 
