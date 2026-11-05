@@ -328,6 +328,14 @@ class SelectTests(unittest.TestCase):
             self.assertIsNone(reason(marks, provider, model, self.now))
         self.assertIsNone(reason(self.ledger.active_marks(self.now + 3600), "agy", "gemini-4-argon-high", self.now + 3600))
 
+    def test_the_quota_gate_outranks_a_mark_on_one_model(self):
+        rows = candidates(3, full=True, discovered={})
+        model = next(row.model for row in rows if row.provider == "codex")
+        self.ledger.mark(f"codex:{model}", self.now + 3600, "模型标记")
+        result = self._select(task_type="review", difficulty="hard", quota_reader=lambda: {"codex": (100, "")},
+                              not_tool="claude", full=True)
+        self.assertNotIn("模型标记", dict(result.skipped)["codex"])
+
     def test_weekly_threshold_skips_codex_and_claude_only(self):
         def reader():
             return {

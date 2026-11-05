@@ -169,7 +169,9 @@ def hold_after_refusal(provider, entry):
 
     A pool that refuses again right after its hold ended gets the next longer
     hold, so callers stop spending calls on a known-empty pool. A real success
-    on that model, or a quiet day after the hold ended, starts over.
+    on that model, or a quiet day after the hold ended, starts over. None means
+    the running hold already covers this refusal: a late answer from a call
+    started before the hold must not move its end.
     """
     from datetime import datetime
     from makewand import health, usage
@@ -187,14 +189,14 @@ def hold_after_refusal(provider, entry):
     observed = health._written_at(previous) if previous is not None else None
     if observed is None or not _names_no_reset(previous):
         return holds[0]
+    if any(model_matches(scope.get("model"), canonical_model(provider, model))
+           for model in usage.successes_since(provider, observed)):
+        return holds[0]
     last = health.unknown_reset_hold(previous.get("hold_seconds"))
     elapsed = (datetime.now().astimezone() - observed).total_seconds()
     if elapsed < last:
-        # A call that started before the hold, not a new try after it.
-        return last
-    if elapsed > last + 24 * 3600 or any(
-            model_matches(scope.get("model"), canonical_model(provider, model))
-            for model in usage.successes_since(provider, observed)):
+        return None
+    if elapsed > last + 24 * 3600:
         return holds[0]
     return holds[min(holds.index(last) + 1, len(holds) - 1)]
 

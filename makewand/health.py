@@ -1268,7 +1268,13 @@ def record_engine_limit(engine: str, reason: str, resets_at: Optional[str] = Non
         return
     from makewand.model_quota import hold_after_refusal, refusal
     entry = refusal(model_name, reason, resets_at, model)
-    hold = hold_after_refusal(model_name, entry)
+    try:
+        hold = hold_after_refusal(model_name, entry)
+    except Exception:
+        # The hold is an optimization; the refusal itself must still be recorded.
+        hold = UNKNOWN_RESET_HOLDS[0]
+    if hold is None:
+        return
     if hold != UNKNOWN_RESET_HOLDS[0]:
         entry["hold_seconds"] = hold
     status_entry = {model_name: dict(entry, quota_limits=[entry])}

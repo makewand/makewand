@@ -80,10 +80,37 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertIsNone(self._limited())
         self.assertEqual(self._refuse(), 24 * hours)
 
-    def test_a_refusal_during_the_hold_does_not_lengthen_it(self):
+    def test_a_late_refusal_during_the_hold_does_not_move_its_end(self):
         self._usage()
+        self._refuse()
+        self._age_refusals("agy", 3600)
+        before = self.info("agy")["quota_limits"][-1]["updated_at"]
+        self._refuse()
+        self.assertEqual(self.info("agy")["quota_limits"][-1]["updated_at"], before)
+
+    def test_a_success_during_the_hold_starts_over(self):
+        from makewand import usage
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        self._refuse()
+        self._age_refusals("agy", 3600)
+        usage.record_engine_usage("agy", success=True, route="cli", model="gemini-4-argon-high")
         self.assertEqual(self._refuse(), 2 * 3600)
-        self.assertEqual(self._refuse(), 2 * 3600)
+        self.assertNotIn("hold_seconds", self.info("agy")["quota_limits"][-1])
+
+    def test_an_api_relay_success_says_nothing_about_the_subscription(self):
+        from makewand import usage
+        self._usage()
+        self._refuse()
+        self._age_refusals("agy", 2 * 3600 + 60)
+        usage.record_engine_usage("agy", success=True, route="api", model="gemini-4-argon-high")
+        self.assertEqual(self._refuse(), 6 * 3600)
+
+    def test_a_damaged_status_file_still_records_the_refusal(self):
+        with patch("makewand.model_quota.hold_after_refusal", side_effect=TypeError("damaged")):
+            health.record_engine_limit("agy", "fixture refusal", "待重置", model="gemini-4-argon-high")
+        self.assertIsNotNone(self._limited())
 
     def test_a_success_on_that_model_starts_over(self):
         from makewand import usage

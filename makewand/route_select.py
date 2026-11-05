@@ -340,9 +340,10 @@ def select(
             or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
         )
+        # The quota gate comes first: a redeemable Codex reset is keyed on its reason.
         quota_reason = None if provider_reason else (
-            _model_mark_reason(marks, row.provider, _row_model(row), moment)
-            or _quota_reason(row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {})))
+            _quota_reason(row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
+            or _model_mark_reason(marks, row.provider, _row_model(row), moment))
         reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
         if quota_reason:
             quota_models.setdefault(row.provider, set()).add(_row_model(row))

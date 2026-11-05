@@ -204,10 +204,13 @@ def get_dispatch_records(engine: Optional[str] = None, max_age_days: float = 7.0
 
 
 def successes_since(engine: str, since: datetime) -> List[str]:
-    """Models named by this engine's successful dispatches after `since`, an aware time."""
+    """Models named by this engine's successful subscription dispatches after `since`, an aware time.
+
+    An API relay says nothing about the subscription pool that refused.
+    """
     models = []
     for record in _load_raw_usage_records():
-        if record.get("engine") != engine or record.get("success") is not True:
+        if record.get("engine") != engine or record.get("success") is not True or record.get("route") == "api":
             continue
         model = record.get("model")
         if isinstance(model, str) and datetime.fromisoformat(record["timestamp"]).astimezone() > since:
