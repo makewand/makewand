@@ -156,10 +156,19 @@ class SharedCapacityTests(unittest.TestCase):
 
     def test_the_tool_pool_logs_waits_too(self):
         with patch.object(capacity, "WAIT_WORTH_RECORDING_SECONDS", 0), \
+                patch.object(capacity, "tool_memory_available", return_value=True), \
                 capacity.tool_scope(capacity.policy(), time.monotonic() + 5):
             pass
         row = self._waits()[-1]
         self.assertEqual((row["kind"], row["admitted"]), ("tool", True))
+
+    def test_the_tool_pool_logs_refusals_too(self):
+        with patch.object(capacity, "tool_memory_available", return_value=False), \
+                self.assertRaises(budget.ConcurrencyBusyError):
+            with capacity.tool_scope(capacity.policy(), time.monotonic() + .15):
+                pass
+        row = self._waits()[-1]
+        self.assertEqual((row["kind"], row["admitted"]), ("tool", False))
 
     def test_queue_wait_never_spends_and_reserves_execution_time(self):
         a = self.reserve("a", "codex")
