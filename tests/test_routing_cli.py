@@ -379,13 +379,17 @@ class RoutingCliTests(unittest.TestCase):
                     self.assertTrue(commands)
                     payload = self.route_json(task_type, difficulty, "--simple", quota={})
                     self.assertTrue(payload["candidates"])
-                    for item in [payload, *payload["candidates"]]:
-                        self.assertEqual(item["timeout"], timeout)
-                        self.assertEqual(item["total_timeout"], timeout)
+                    self.assertEqual(payload["timeout"], timeout)
+                    codex_cap = 1800 if task_type == "review" else timeout
+                    for item in payload["candidates"]:
+                        wanted = min(timeout, codex_cap) if item["provider"] == "codex" else timeout
+                        self.assertEqual(item["timeout"], wanted)
+                        self.assertEqual(item["total_timeout"], wanted)
                         self.assertEqual(item["readonly"], task_type == "review")
                     commands += [item["command"] for item in payload["candidates"]]
                     for command in commands:
-                        self.assertIn(f"--timeout {timeout} --total-timeout {timeout}", command)
+                        wanted = min(timeout, codex_cap) if " codex " in command else timeout
+                        self.assertIn(f"--timeout {wanted} --total-timeout {wanted}", command)
                         self.assertEqual("--readonly" in command, task_type == "review")
 
     def test_route_timeout_tracks_tier_risk_and_explicit_total(self):

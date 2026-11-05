@@ -204,7 +204,7 @@ def _command_for(candidate, execution_options) -> str:
 
 
 def _candidate_payload(item, execution_options) -> dict:
-    return {
+    payload = {
         "provider": item.provider,
         "model": item.model,
         "effort": item.effort,
@@ -215,6 +215,10 @@ def _candidate_payload(item, execution_options) -> dict:
         "command": _command_for(item, execution_options),
         **execution_options,
     }
+    timeout = payload.pop("provider_timeouts", {}).get(item.provider)
+    if timeout:
+        payload.update(timeout=timeout, total_timeout=timeout)
+    return payload
 
 
 def _restore_codex_reset(policy, result, not_tool) -> bool:
