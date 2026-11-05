@@ -466,8 +466,6 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         exit_code = EXIT_FAILED
     else:
         exit_code = EXIT_UNVERIFIED
-    from makewand.execution_runtime import current_context
-    from makewand.execution_contract import EXIT_TIMEOUT
     if current_context().get("_deadline_monotonic", float("inf")) <= time.monotonic():
         exit_code = EXIT_TIMEOUT
     # A verdict approves only the exact diff it saw: re-extract and compare.

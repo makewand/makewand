@@ -21,7 +21,7 @@ from makewand.config import (
     ensure_config_dir,
     API_ONLY_ENGINES,
 )
-from makewand.providers.base import check_cli_installed, run_subprocess
+from makewand.providers.base import run_subprocess
 from makewand.providers.agy import parse_agy_quota
 from makewand.providers.claude import parse_claude_quota
 from makewand.providers.codex import parse_codex_quota

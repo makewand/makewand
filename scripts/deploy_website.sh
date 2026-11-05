@@ -30,7 +30,7 @@ fi
 
 # Pre-flight check
 echo "🔍 检查网站静态资源完整性..."
-for f in index.html docs.html styles.css main.js install.sh assets/favicon.svg _headers _redirects; do
+for f in index.html styles.css install.sh assets/favicon.svg _headers _redirects; do
   if [ ! -f "${SITE_DIR}/${f}" ]; then
     echo "❌ 缺少关键文件: site/${f}"
     exit 1

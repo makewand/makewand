@@ -41,6 +41,8 @@ DIRECT_TASK_COMMANDS = frozenset({
 })
 
 
+# Refresh a little before health treats the snapshot as expired.
+_QUOTA_SNAPSHOT_FRESH_SECONDS = 600
 TIMEOUT_DEFAULTS = {**dict.fromkeys(DIRECT_TASK_COMMANDS, 300), "review": 300}
 PROMPT_COMMANDS = DIRECT_TASK_COMMANDS
 
@@ -156,9 +158,35 @@ def build_status_json(cache: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _refresh_official_quota(args):
+    """status reads the snapshot `makewand-server quota` leaves behind, valid for 15 minutes.
+
+    Nothing refreshes it when no route ran lately, and status then called a known quota unknown.
+    """
+    import subprocess
+    from makewand.route_select import quota_argv
+    if getattr(args, "repo_trust", "trusted") != "trusted":
+        return  # the reader can run `agy models`, which an untrusted repository must not reach
+    snapshot = Path.home() / ".cache" / "makewand" / "quota-snapshot.json"
+    try:
+        if time.time() - snapshot.stat().st_mtime < _QUOTA_SNAPSHOT_FRESH_SECONDS:
+            return
+    except OSError:
+        pass
+    argv = quota_argv()
+    if argv is None:
+        return
+    try:
+        subprocess.run([*argv, "--timeout", "10s"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _status_cache(args):
     import json
     from makewand.health import ProbePolicyError
+    _refresh_official_quota(args)
     try:
         return get_or_update_status(force_probe=getattr(args, "probe", False),
             repo_trust=getattr(args, "repo_trust", "trusted"), cwd=getattr(args, "cwd", None))
@@ -173,12 +201,10 @@ def _status_cache(args):
 def cmd_status(args):
     import shutil
     from makewand.config import (
-        ALL_SUPPORTED_PROVIDERS,
         get_all_supported_providers,
         get_active_providers,
         get_provider_execution_mode,
-        is_provider_enabled,
-        normalize_provider_name
+        is_provider_enabled
     )
 
     if getattr(args, "json", False):
@@ -936,13 +962,13 @@ def _main():
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--risk", choices=["auto", "low", "high"],
                              default="auto" if default is None else default,
-                             help="Unknown risk requires cross-provider review; high cannot use single")
+                             help="Risk of this task, recorded with the run")
         options.add_argument("--total-timeout", type=float, default=default,
                              help="Shared wall-clock deadline for every task stage, in seconds")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
-        description="Makewand v3.1: Unified Multi-Model AI Subscription & Universal Tool Orchestrator",
+        description=f"Makewand {__version__}: dispatch work and independent reviews to the coding CLIs signed in on this machine",
         parents=[common_parser]
     )
     parser.add_argument("-v", "--version", action="version", version=f"makewand {__version__}")
@@ -954,7 +980,7 @@ def _main():
     p_models.add_argument("--json", action="store_true", help="Show candidate provenance, model family, account and quota-pool metadata")
 
     # status
-    p_status = subparsers.add_parser("status", help="Show health, quota indicators (local estimates), and reset times of all AIs", parents=[sub_common_parser])
+    p_status = subparsers.add_parser("status", help="Show health, official quota where it can be read, and reset times of all AIs", parents=[sub_common_parser])
     p_status.add_argument("--probe", action="store_true", help="Force immediate live probe of all CLIs (real model calls for claude/codex/muse/grok; agy makes one real call while an agy quota limit has not reset, or while a login/region failure that a real agy dispatch or an earlier real probe recorded is still live; otherwise only a version check)")
     p_status.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
@@ -963,7 +989,7 @@ def _main():
     p_probe.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
     # quota
-    p_quota = subparsers.add_parser("quota", help="Show quota indicators (Python: local call-count estimates, not official quota)", parents=[sub_common_parser])
+    p_quota = subparsers.add_parser("quota", help="Same as status", parents=[sub_common_parser])
     p_quota.add_argument("--probe", action="store_true", help="Force immediate live probe")
     p_quota.add_argument("--json", action="store_true", default=False, help="Print machine-readable per-provider status/quota indicators")
 
@@ -1062,7 +1088,6 @@ def _main():
 
     # Candidate Lifecycle Subcommands
     # daemon (Resident Daemon / IPC Socket Fast-Path)
-    # sessions (Host-wide AI session observer and worktree collision detector)
     # clean (cleanup stale /tmp restore, drill, and temporary artifact directories)
     p_clean = subparsers.add_parser("clean", help="Clean up stale /tmp restore, drill, and temporary artifact directories", parents=[sub_common_parser])
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
@@ -1236,8 +1261,7 @@ def _main():
     if args.max_model_calls is not None:
         args.max_model_calls = min(args.max_model_calls, inherited_limit) if inherited_limit is not None else args.max_model_calls
         if not explicit_budget and not parent_budget:
-            import uuid
-            from makewand.config import CONFIG_DIR, ensure_config_dir
+            from makewand.config import ensure_config_dir
             ensure_config_dir()
             from makewand.layered_budget import default_path
             explicit_budget = default_path()

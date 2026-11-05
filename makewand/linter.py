@@ -5,15 +5,10 @@ before launching expensive end-to-end test suites.
 """
 
 import os
-import re
 import shutil
 import subprocess
-import sys
-import json
-import tempfile
 from pathlib import Path
-from typing import List, Sequence, Dict, Tuple, Optional
-from makewand.sandbox import run_in_sandbox, is_bwrap_available
+from typing import Sequence, Dict
 
 
 def auto_format_files(cwd: str, file_paths: Sequence[str]) -> Dict[str, bool]:

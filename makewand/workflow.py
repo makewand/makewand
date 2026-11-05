@@ -1,6 +1,5 @@
 """Conservative workflow policy. Selection never waives verification gates."""
 from dataclasses import dataclass
-import math
 from contextvars import ContextVar
 
 _last_result = ContextVar("makewand_workflow_result", default=None)

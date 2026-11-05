@@ -22,7 +22,6 @@ from unittest import mock
 
 from makewand import config
 from makewand.native_windows import relative_parts
-from makewand.protected_files import ProtectionError
 from makewand.providers.base import run_subprocess
 
 

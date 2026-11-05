@@ -5,9 +5,8 @@ Integrates local aider CLI into Makewand orchestration pipeline.
 import os
 import sys
 import shutil
-import subprocess
 from typing import Tuple, Optional
-from makewand.config import c, COLOR_GREEN, COLOR_RED, COLOR_YELLOW, is_provider_enabled, get_api_config
+from makewand.config import c, COLOR_GREEN, is_provider_enabled, get_api_config
 
 def is_aider_available() -> bool:
     """Returns True if aider executable is found in system PATH."""

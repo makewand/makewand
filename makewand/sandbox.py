@@ -30,7 +30,6 @@ import logging
 import math
 import os
 import platform
-import signal
 import socket
 import stat
 import struct
@@ -43,7 +42,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import atexit
 import contextlib
 import errno

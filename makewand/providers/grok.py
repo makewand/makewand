@@ -121,7 +121,7 @@ def execute_grok_task(
     If readonly=True, enforces --permission-mode plan and reports a turn that did not finish.
     If repo_root is provided, wraps execution in bubblewrap with transparent repo_root bind-mount.
     """
-    from makewand.health import load_status_cache, save_status_cache, record_engine_limit
+    from makewand.health import load_status_cache, record_engine_limit
     from makewand.sandbox import (
         is_bwrap_available,
         verify_writable_sandbox_or_authorized,

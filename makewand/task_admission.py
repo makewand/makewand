@@ -6,7 +6,6 @@ Task tiering, prompt intent routing, conversational detection, and backpressure 
 import re
 from typing import List
 
-from makewand.config import c
 
 
 def is_identity_or_chit_chat(prompt: str) -> bool:

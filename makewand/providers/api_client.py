@@ -18,7 +18,7 @@ import urllib.error
 import re
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
-from makewand.config import get_api_config, c, COLOR_CYAN, COLOR_YELLOW, COLOR_RED, COLOR_RESET, COLOR_GREEN
+from makewand.config import get_api_config, c, COLOR_GREEN
 
 DEFAULT_SYSTEM_PROMPTS = {
     "coder": (

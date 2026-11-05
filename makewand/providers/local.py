@@ -11,7 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from typing import Tuple, List, Optional, Dict, Any
-from makewand.config import c, COLOR_GREEN, COLOR_BOLD, COLOR_CYAN, get_api_config
+from makewand.config import c, COLOR_GREEN, COLOR_BOLD, get_api_config
 # Message sizes are measured as dispatched, like every review prompt (one definition).
 from makewand.review_contract import dispatched_size
 

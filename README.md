@@ -1,4 +1,4 @@
-# Makewand (魔杖) v3.3.0
+# Makewand (魔杖) v4.0.0
 
 > **多模型编程订阅联合调度与红队自愈体系** (Unified Multi-Model Subscription Orchestrator)  
 > 官方网站：[https://makewand.org](https://makewand.org) · 备用镜像：[https://makewand.com](https://makewand.com)  
@@ -60,8 +60,6 @@ cd path/to/makewand
 ./scripts/install.sh
 ```
 源码安装需要 Git、Python 3.9+ 和 `go.mod` 指定的 Go 工具链。安装器冻结 Go/Python 构建输入，在独立版本目录中编译、检查版本及公共命令，然后原子切换 `current` 与 `~/.local/bin/makewand`。失败保留原安装，并保留 `previous` 供回退；同时建立兼容的 `trio` 软链接。安装目录（默认 `~/.local/bin`，可用 `MAKEWAND_BIN_DIR` 指定）不在 `PATH` 中，或 `PATH` 上更早的位置有另一个 `makewand` 时，安装器最后会打印需要加入 shell 配置（如 `~/.zshrc`、`~/.bashrc`）的 `export PATH=...` 行，加入后打开新终端即可。
-
-> **版本与安全加固**：v3.3.0 包含了 v3.2.0 之后加入的全部保护（#75、#80–#85、#91、#100，例如 `bwrap` 只从 root 拥有的系统目录解析、宿主 provider 目录不再可写挂载、依赖安装仅下载阶段出网且隔离工作区、候选测试超时或输出泛滥计为候选失败而非环境错误、Homebrew 包装脚本不再写死 `PATH`）；旧版 v3.2.x 没有这些保护，请升级到 v3.3.0 或使用源码安装。详见 [SECURITY.md 发布状态](SECURITY.md#release-status--发布状态)。
 
 供应商启停策略对 Go/Python 入口共同生效，禁用也阻止该工具的探测和额度读取。Claude、Gemini 和 OpenAI 的 API 参数按环境变量、`api_keys.json`、`config.json`、默认值的顺序读取；付费调用仍需显式启用 `allow_paid`。详见[共享配置契约](docs/EXECUTION_CONTRACT.md#shared-provider-configuration)。
 

@@ -98,11 +98,9 @@ rows sort after every current row in the same tier.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Mapping, Optional, Sequence, Union
+from typing import Mapping, Optional, Sequence
 
 TASK_TYPES = ("review", "implement", "test", "research", "doc")
 DIFFICULTIES = ("mechanical", "normal", "hard")
