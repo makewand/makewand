@@ -330,12 +330,17 @@ class OutcomeLedger:
         model: Any = None,
         effort: Any = None,
         infer_request_id: Any = None,
+        measure: Any = None,
+        require_measured: bool = False,
         **details,
     ) -> Dict[str, Any]:
         """追加一条成绩记录。ts 可注入（epoch 秒或 datetime），默认真实时钟。
 
         model / effort 可选。不给就不写入，行的字段和旧账本一致；给了就记在行尾，
         供候选级 stats 使用。
+
+        ``measure(request_id, rows)`` 在锁内、请求 ID 确定之后补上缺的 seconds/calls，
+        返回 (seconds, calls) 或 None。``require_measured`` 为真时补完仍缺就不写入。
         """
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider must be a non-empty string")
@@ -365,7 +370,8 @@ class OutcomeLedger:
         if row.get("candidate_approved") is True:
             if row.get("review_validated") is not True or not row["passed"]:
                 raise ValueError("candidate approval requires validated review work")
-            if row["seconds"] is None or row["calls"] is None:
+            # A measure callback may still supply them from the call ledger under the lock below.
+            if (row["seconds"] is None or row["calls"] is None) and not callable(measure):
                 raise ValueError("candidate approval requires measured seconds and actual calls")
             if not row.get("candidate_hash"):
                 raise ValueError("candidate approval requires --candidate-hash (candidate_hash)")
@@ -383,12 +389,28 @@ class OutcomeLedger:
                     pass
             filelock.flock(fd, filelock.LOCK_EX)
             try:
+                existing = None
                 if "request_id" not in details and callable(infer_request_id):
-                    inferred = infer_request_id(self._read_rows(strict=False, locked=True, descriptor=fd))
+                    existing = self._read_rows(strict=False, locked=True, descriptor=fd)
+                    inferred = infer_request_id(existing)
                     if inferred is not None:
                         details = dict(details, request_id=inferred)
                         row.update(_outcome_details(dict(row, **details)))
-                        payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+                if callable(measure) and row.get("request_id") and (row["seconds"] is None or row["calls"] is None):
+                    # Under the append lock, so two outcomes cannot both take one call's timing.
+                    if existing is None:
+                        existing = self._read_rows(strict=False, locked=True, descriptor=fd)
+                    measured = measure(row["request_id"], existing)
+                    if measured is not None:
+                        if row["seconds"] is None:
+                            row["seconds"] = _normalize_seconds(measured[0])
+                        if row["calls"] is None:
+                            row["calls"] = _normalize_calls(measured[1])
+                if (require_measured or row.get("candidate_approved") is True) and (
+                        row["seconds"] is None or row["calls"] is None):
+                    raise ValueError("--candidate-verdict requires measured --seconds and actual --calls; the call "
+                                     "ledger has no single unrecorded call of this request to take them from")
+                payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
                 if row.get("candidate_approved") is True and not row.get("request_id"):
                     raise ValueError("candidate approval requires --request-id or MAKEWAND_TASK_ID "
                                      "(request_id); no unique dispatched call could be linked")

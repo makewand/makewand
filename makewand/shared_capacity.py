@@ -28,6 +28,8 @@ WAIT_LOG_NAME = "capacity-waits.jsonl"
 WAIT_LOG_MAX_BYTES = 256 * 1024
 # Shorter than this is lock traffic, not a queue.
 WAIT_WORTH_RECORDING_SECONDS = 1.0
+# One waiting line a minute: every 15 seconds put 20 lines into the caller's context per 5-minute wait.
+WAIT_REPORT_SECONDS = 60
 MAX_BYTES = 16 * 1024 * 1024
 _tool = contextvars.ContextVar("makewand_capacity_tool", default=None)
 
@@ -549,7 +551,7 @@ def tool_scope(current_policy, deadline):
                 raise ConcurrencyBusyError(message)
             if time.monotonic() >= next_report:
                 report_busy(message)
-                next_report = time.monotonic() + 15
+                next_report = time.monotonic() + WAIT_REPORT_SECONDS
             time.sleep(min(.1, max(0, wait_until - time.monotonic())))
         token = _tool.set(identifier)
         stop = threading.Event()

@@ -20,7 +20,15 @@ EXIT_LEDGER_ERROR = 1
 
 
 def cmd_budget(args) -> None:
-    if args.budget_action == "request":
+    # `budget` with no action, `budget show` and `budget status` were the usual misspellings.
+    action = {"show": "request", "status": "request"}.get(args.budget_action, args.budget_action)
+    if action is None:
+        if not getattr(args, "request_id", None):
+            print("用法：makewand budget request --request-id <ID> [--json] 看请求已用次数和上限；"
+                  "makewand budget clock 看账本时钟；makewand observe 看近 24 小时的调用。", file=sys.stderr)
+            raise SystemExit(2)
+        action = "request"
+    if action == "request":
         try:
             if getattr(args, "repair", False):
                 raise call_budget.BudgetError("--repair is only for budget clock")

@@ -22,7 +22,7 @@ def is_startup_environment_failure(value):
             and value.error_kind == "startup_environment" and value.outcome_known)
 
 
-def provider_outcome(value):
+def provider_outcome(value, engine=None):
     """Recognize runner-owned legacy errors without guessing from model text."""
     from makewand.execution_contract import ExecutionResult
     import re
@@ -42,6 +42,9 @@ def provider_outcome(value):
     elif (("Bubblewrap" in error or "bwrap" in error or "沙箱构建失败" in error or "不可信仓库" in error)
           and ("拒绝执行" in error or "未检测到" in error or "禁止执行" in error)):
         status = "SANDBOX_UNAVAILABLE"
+        if "不可信仓库" not in error:  # a policy refusal is not a sandbox failure
+            from makewand import cli_failure_log
+            cli_failure_log.record_message(engine or "unknown", "sandbox", error)
     return ExecutionResult(False, value[1], str(error), status=status, outcome_known=status in ("FAILED", "SANDBOX_UNAVAILABLE")) if status else value
 
 

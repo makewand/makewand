@@ -160,6 +160,77 @@ class RoutingCliTests(unittest.TestCase):
             args = shlex.split(candidate["command"])
             self.assertEqual(args[args.index("--call-budget-file") + 1], ledger)
 
+    def _ledger_with(self, *attempts):
+        import time as _time
+        from makewand.shared_capacity import project
+        proj = project(self.work)[0]
+        now = _time.time()
+        rows = []
+        for index, (task, engine, model, seconds) in enumerate(attempts):
+            rows.append({"id": f"{index:032x}", "engine": engine, "tier": "standard", "requested_model": model,
+                         "readonly": True, "started_at": now - 100 - seconds, "finished_at": now - 100,
+                         "status": "completed", "task_id": task, "result_status": "PASSED", "success": True,
+                         "scopes": [["tasks", task], ["projects", f"{proj}:2026-11-06"], ["machine", "2026-11-06"]]})
+        cfg = self.base / "config"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "call-budget.json").write_text(json.dumps({
+            "schema": 2, "maximum": 1000, "attempts": rows,
+            "scopes": {"tasks": {}, "projects": {}, "machine": {}, "day": "2026-11-06", "clock": now}}), encoding="utf-8")
+
+    def test_outcome_takes_measured_seconds_and_calls_from_the_call_ledger(self):
+        self._ledger_with(("measure-42", "codex", "gpt-6-sol", 66.4), ("measure-42", "claude", None, 5.0))
+        result = self.run_cli("outcome", "codex", "2", "review", "pass", "--candidate-verdict", "pass",
+                              "--candidate-hash", "a" * 64, "--model", "gpt-6-sol", "--request-id", "measure-42")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("从调用账本补上实测 --seconds 66.4 --calls 1", result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual((rows[-1]["seconds"], rows[-1]["calls"], rows[-1]["candidate_approved"]), (66.4, 1, True))
+        # That call now has its outcome: a second verdict for it is not given the same timing.
+        again = self.run_cli("outcome", "codex", "2", "review", "pass", "--candidate-verdict", "fail",
+                             "--model", "gpt-6-sol", "--request-id", "measure-42")
+        self.assertEqual(again.returncode, 2)
+        self.assertIn("--candidate-verdict requires measured --seconds and actual --calls", again.stderr)
+        # Given values win over the ledger.
+        given = self.run_cli("outcome", "claude", "3", "review", "pass", "--candidate-verdict", "fail",
+                             "--seconds", "9", "--calls", "2", "--request-id", "measure-42")
+        self.assertEqual(given.returncode, 0, given.stderr)
+        self.assertNotIn("从调用账本补上", given.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual((rows[-1]["seconds"], rows[-1]["calls"]), (9.0, 2))
+
+    def test_outcome_does_not_guess_which_call_it_measures(self):
+        self._ledger_with(("two-42", "codex", "gpt-6-sol", 10.0), ("two-42", "codex", "gpt-6-sol", 20.0),
+                          ("other-42", "codex", "gpt-6-astra", 30.0))
+        for request, model in (("two-42", "gpt-6-sol"), ("other-42", "gpt-6-sol")):
+            with self.subTest(request=request):
+                result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
+                                      "--model", model, "--request-id", request)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("no single unrecorded call", result.stderr)
+        outcomes = self.routing_dir / "outcomes.jsonl"
+        self.assertEqual(outcomes.read_text() if outcomes.exists() else "", "")
+
+    def test_outcome_accepts_tier_names_and_explains_bad_ones(self):
+        named = self.run_cli("outcome", "codex", "standard", "implement", "pass", "--request-id", "tier-42")
+        self.assertEqual(named.returncode, 0, named.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[-1]["tier"], 2)
+        wrong = self.run_cli("outcome", "codex", "strong", "implement", "pass", "--request-id", "tier-42")
+        self.assertEqual(wrong.returncode, 2)
+        self.assertIn("档位写 1、2、3，或 fast、standard、deep", wrong.stderr)
+
+    def test_budget_without_an_action_shows_how_and_show_is_request(self):
+        bare = self.run_cli("budget")
+        self.assertEqual(bare.returncode, 2)
+        self.assertIn("makewand budget request --request-id <ID>", bare.stderr)
+        request = self.run_cli("budget", "request", "--request-id", "absent-42")
+        for alias in (("budget", "show", "--request-id", "absent-42"), ("budget", "status", "--request-id", "absent-42"),
+                      ("budget", "--request-id", "absent-42")):
+            with self.subTest(alias=alias):
+                result = self.run_cli(*alias)
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (request.returncode, request.stdout, request.stderr))
+
     def test_unverified_review_cannot_be_recorded_as_valid(self):
         result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "unverified",
                               "--seconds", "1", "--calls", "1")

@@ -21,10 +21,13 @@ makewand 将工作交给已登录的编码工具。由调用方负责验收；�
 
 第一次确实需要派发时生成一个随机请求 ID，保存在当前会话；同一用户请求的所有 CLI 始终带同一个 `--request-id <ID>` 和总上限 `--max-model-calls <N>`，并用 `--caller <claude|codex|agy|grok|muse>` 标注发起工具。也可继承 `MAKEWAND_TASK_ID`、`MAKEWAND_MAX_MODEL_CALLS`、`MAKEWAND_CALLER`。不要用项目名或长期会话 ID 合并互不相关的用户请求，不要把 ID 当秘密。
 
-先运行：
+先运行（按风险选档位）：
 
 ```bash
+# 安全、并发、数据丢失、资金、生产发布：强档
 makewand route review hard --risk high --self <你> --not <实现方> --request-id <ID> --caller <你> --max-model-calls <N>
+# 其他审查用中档：Codex 中档给出结论、打回的比例和高档相近，快约 1 分钟
+makewand route review normal --self <你> --not <实现方> --request-id <ID> --caller <你> --max-model-calls <N>
 ```
 
 类型可为 review/implement/test/research/doc，难度为 mechanical/normal/hard。先选够用的最便宜档，验收失败再升档；高风险直接强档，审查尽量跨模型家族。route 不调用模型，会避开暂停、额度过线、429 标记及本请求已记录的操作失败；审查不派 Grok（`makewand review` 也不再默认用它）；agy credits 保持禁用。
@@ -47,9 +50,9 @@ makewand route review hard --risk high --self <你> --not <实现方> --request-
 makewand outcome codex 3 review pass --candidate-verdict fail --candidate-hash <SHA256> --model <模型> --effort <深度> --seconds <实际秒数> --calls 1 --caller <你> --request-id <ID> --max-model-calls <N>
 ```
 
-验收对不上派发调用（没有 `--request-id`/`MAKEWAND_TASK_ID`，也无法唯一自动关联）时照常记账但会警告，请带上派发用的同一个请求 ID。review 记录不带 `--candidate-verdict` 时照常记账但会警告：没有实测耗时和实际调用数就照实不填，不要为消除警告编数字。用 `--call-budget-file` 指定非默认账本时，任务上限照常生效，但整机/项目日计数另算，`makewand observe` 会列出这些账本。
+带请求 ID、且这个请求里正好有一次该工具的调用还没记成绩时，可以不填 `--seconds`/`--calls`，makewand 从调用账本补上实测值（不含排队）；对不上时仍要自己填。验收对不上派发调用（没有 `--request-id`/`MAKEWAND_TASK_ID`，也无法唯一自动关联）时照常记账但会警告，请带上派发用的同一个请求 ID。review 记录不带 `--candidate-verdict` 时照常记账但会警告：没有实测耗时和实际调用数就照实不填，不要为消除警告编数字。用 `--call-budget-file` 指定非默认账本时，任务上限照常生效，但整机/项目日计数另算，`makewand observe` 会列出这些账本。
 
-实现/测试任务的 pass/fail 仍是其结果是否通过验收。操作失败另带 `--failure-kind startup|auth|quota|timeout|unknown|invalid_output|verification`；只有 startup/auth/quota 在本请求冷却 5 分钟，unknown/timeout 要用户批准重试。候选测试失败或有效审查拒绝不触发提供方冷却。429/额度耗尽还应 `makewand mark <工具> <剩余时长>`，不要猜测失败原因。
+实现/测试任务的 pass/fail 仍是其结果是否通过验收。操作失败另带 `--failure-kind startup|auth|quota|timeout|unknown|invalid_output|verification`；只有 startup/auth/quota 在本请求冷却 5 分钟，unknown/timeout 要用户批准重试。候选测试失败或有效审查拒绝不触发提供方冷却。429/额度耗尽还应 `makewand mark <工具> <剩余时长>`；只是某个模型被拒时加 `--model <模型>`：Agy 的 Gemini、Claude、GPT-OSS 额度分开算，Gemini 用完不要标记整个 agy。不要猜测失败原因。
 
 退出码 12/16/17 分别为取消/超时/未知：告知用户，未经授权不自动重试，UNKNOWN 可能已产生花费。13 是预算耗尽，14 是应用冲突，15 是沙箱不可用。模型恢复、冷却时间经过或预选推荐项都不构成重试授权；用户已批准后才使用 route 的 `--retry-approved`。`status --probe` 可能产生真实模型调用，不能当廉价健康检查。
 

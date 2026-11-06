@@ -201,7 +201,7 @@ def dispatch_task(
                        repo_trust=repo_trust, allow_network=allow_network)
         if engine not in ("local", "ollama", "aider"):
             options["effort"] = effort
-        return provider_outcome(adapters[engine](provider_prompt, **options))
+        return provider_outcome(adapters[engine](provider_prompt, **options), engine=engine)
     # The route (cli/api) the adapter reports goes into the usage ledger
     # (health._dispatch_failure_superseded reads it).
     with observe_dispatch_route() as route:

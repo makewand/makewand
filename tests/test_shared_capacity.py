@@ -126,6 +126,30 @@ class SharedCapacityTests(unittest.TestCase):
                 worker.kill()
                 worker.wait(timeout=5)
 
+    def test_a_model_wait_is_reported_once_a_minute(self):
+        # Every 15 seconds put 20 lines into the caller's context during a five-minute wait.
+        import contextlib
+        from types import SimpleNamespace
+        from makewand import call_budget
+        clock, reports = [1000.0], []
+        fake = SimpleNamespace(monotonic=lambda: clock[0], time=lambda: clock[0],
+                               sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+        @contextlib.contextmanager
+        def admission(*args, **kwargs):
+            yield object()
+
+        with patch.object(call_budget, "time", fake), \
+                patch.object(call_budget, "_reserve_once", side_effect=call_budget.ConcurrencyBusyError("busy")), \
+                patch.object(capacity, "admission", admission), \
+                patch.object(capacity, "report_busy", side_effect=lambda error: reports.append(clock[0])):
+            with self.assertRaises(call_budget.ConcurrencyBusyError):
+                call_budget._reserve_wait("codex", "fast", None, True, capacity_policy={"enabled": True}, ticket_id="t",
+                                          wait_until=1300.0, scope=None, working_directory=None, deadline_monotonic=None,
+                                          account_ref=None, budget_file=None, task_id="t")
+        self.assertIn(len(reports), (5, 6))
+        self.assertGreaterEqual(reports[1] - reports[0], capacity.WAIT_REPORT_SECONDS)
+
     def _waits(self):
         path = self.root / capacity.WAIT_LOG_NAME
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
