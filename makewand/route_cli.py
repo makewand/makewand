@@ -536,11 +536,14 @@ def _infer_recent_request_id(
 
 
 def _measured_call(provider, model, request_id, rows, budget_file=None):
-    """Seconds and calls of the one finished call an outcome is about, from call-budget.json.
+    """Measured seconds and calls of the only call an outcome can be about, from call-budget.json.
 
-    Only when this request has exactly one more completed call of this provider than
-    recorded outcomes for it; anything else is ambiguous and needs measured values.
-    Seconds run from admission to the end of the call, so queueing is not counted.
+    Filled only when that is provable: the ledger still lists every call of this
+    request (its task counter equals the calls listed, so none was compacted away),
+    exactly one of them is this provider's and it completed, no outcome of this
+    provider is recorded for the request yet, and a named model is the one the call
+    asked for. The seconds are the ones measured around the run, not wall-clock
+    differences. Anything else returns None and the caller must pass measured values.
     """
     try:
         from makewand.layered_budget import default_path
@@ -549,28 +552,29 @@ def _measured_call(provider, model, request_id, rows, budget_file=None):
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return None
-    attempts = data.get("attempts") if isinstance(data, dict) else None
-    if not isinstance(attempts, list):
+    if not isinstance(data, dict) or not isinstance(data.get("attempts"), list):
         return None
-    done = [entry for entry in attempts if isinstance(entry, dict) and entry.get("task_id") == request_id
-            and entry.get("engine") == provider and entry.get("status") == "completed"]
-    recorded = sum(1 for row in rows or () if isinstance(row, dict)
-                   and row.get("request_id") == request_id and row.get("provider") == provider)
-    if len(done) != recorded + 1:
+    calls = [entry for entry in data["attempts"] if isinstance(entry, dict) and entry.get("task_id") == request_id]
+    scopes = data.get("scopes")
+    tasks = scopes.get("tasks") if isinstance(scopes, dict) else None
+    counter = tasks.get(request_id) if isinstance(tasks, dict) else None
+    used = counter.get("used") if isinstance(counter, dict) else None
+    if isinstance(used, bool) or not isinstance(used, int) or used != len(calls):
         return None
-
-    def moment(value):
-        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
-
-    newest = max(done, key=lambda entry: moment(entry.get("finished_at")) or 0.0)
+    mine = [entry for entry in calls if entry.get("engine") == provider]
+    if len(mine) != 1 or mine[0].get("status") != "completed":
+        return None
+    if any(isinstance(row, dict) and row.get("request_id") == request_id and row.get("provider") == provider
+           for row in rows or ()):
+        return None
     wanted = model.strip() if isinstance(model, str) and model.strip() else None
-    asked = newest.get("requested_model")
-    if wanted and isinstance(asked, str) and asked.strip() and asked.strip() != wanted:
+    asked = mine[0].get("requested_model")
+    if wanted is not None and not (isinstance(asked, str) and asked.strip() == wanted):
         return None
-    started, finished = moment(newest.get("started_at")), moment(newest.get("finished_at"))
-    if started is None or finished is None or finished < started:
+    seconds = mine[0].get("seconds")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
         return None
-    return round(finished - started, 1), 1
+    return round(float(seconds), 1), 1
 
 
 def cmd_mark(args) -> None:

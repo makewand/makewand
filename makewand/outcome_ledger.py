@@ -409,7 +409,7 @@ class OutcomeLedger:
                 if (require_measured or row.get("candidate_approved") is True) and (
                         row["seconds"] is None or row["calls"] is None):
                     raise ValueError("--candidate-verdict requires measured --seconds and actual --calls; the call "
-                                     "ledger has no single unrecorded call of this request to take them from")
+                                     "ledger cannot show which single call of this request they belong to")
                 payload = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
                 if row.get("candidate_approved") is True and not row.get("request_id"):
                     raise ValueError("candidate approval requires --request-id or MAKEWAND_TASK_ID "

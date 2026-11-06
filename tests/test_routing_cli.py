@@ -160,28 +160,36 @@ class RoutingCliTests(unittest.TestCase):
             args = shlex.split(candidate["command"])
             self.assertEqual(args[args.index("--call-budget-file") + 1], ledger)
 
-    def _ledger_with(self, *attempts):
+    def _ledger_with(self, *attempts, used=None):
+        """Completed calls (task, engine, requested model, measured seconds); wall time runs 7 s longer."""
         import time as _time
         from makewand.shared_capacity import project
         proj = project(self.work)[0]
         now = _time.time()
-        rows = []
+        rows, counts = [], {}
         for index, (task, engine, model, seconds) in enumerate(attempts):
-            rows.append({"id": f"{index:032x}", "engine": engine, "tier": "standard", "requested_model": model,
-                         "readonly": True, "started_at": now - 100 - seconds, "finished_at": now - 100,
-                         "status": "completed", "task_id": task, "result_status": "PASSED", "success": True,
-                         "scopes": [["tasks", task], ["projects", f"{proj}:2026-11-06"], ["machine", "2026-11-06"]]})
+            row = {"id": f"{index:032x}", "engine": engine, "tier": "standard", "requested_model": model,
+                   "readonly": True, "started_at": now - 107 - (seconds or 0), "finished_at": now - 100,
+                   "status": "completed", "task_id": task, "result_status": "PASSED", "success": True,
+                   "scopes": [["tasks", task], ["projects", f"{proj}:2026-11-06"], ["machine", "2026-11-06"]]}
+            if seconds is not None:
+                row["seconds"] = seconds
+            rows.append(row)
+            counts[task] = counts.get(task, 0) + 1
+        counts.update(used or {})
+        tasks = {task: {"maximum": 3, "used": count, "last_used": now} for task, count in counts.items()}
         cfg = self.base / "config"
         cfg.mkdir(parents=True, exist_ok=True)
         (cfg / "call-budget.json").write_text(json.dumps({
             "schema": 2, "maximum": 1000, "attempts": rows,
-            "scopes": {"tasks": {}, "projects": {}, "machine": {}, "day": "2026-11-06", "clock": now}}), encoding="utf-8")
+            "scopes": {"tasks": tasks, "projects": {}, "machine": {}, "day": "2026-11-06", "clock": now}}), encoding="utf-8")
 
     def test_outcome_takes_measured_seconds_and_calls_from_the_call_ledger(self):
         self._ledger_with(("measure-42", "codex", "gpt-6-sol", 66.4), ("measure-42", "claude", None, 5.0))
         result = self.run_cli("outcome", "codex", "2", "review", "pass", "--candidate-verdict", "pass",
                               "--candidate-hash", "a" * 64, "--model", "gpt-6-sol", "--request-id", "measure-42")
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The measured seconds, not the 7 s longer wall-clock difference.
         self.assertIn("从调用账本补上实测 --seconds 66.4 --calls 1", result.stderr)
         rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
         self.assertEqual((rows[-1]["seconds"], rows[-1]["calls"], rows[-1]["candidate_approved"]), (66.4, 1, True))
@@ -200,15 +208,21 @@ class RoutingCliTests(unittest.TestCase):
 
     def test_outcome_does_not_guess_which_call_it_measures(self):
         self._ledger_with(("two-42", "codex", "gpt-6-sol", 10.0), ("two-42", "codex", "gpt-6-sol", 20.0),
-                          ("other-42", "codex", "gpt-6-astra", 30.0))
-        for request, model in (("two-42", "gpt-6-sol"), ("other-42", "gpt-6-sol")):
+                          ("other-42", "codex", "gpt-6-astra", 30.0), ("nomodel-42", "codex", None, 30.0),
+                          ("compacted-42", "codex", "gpt-6-sol", 30.0), ("unmeasured-42", "codex", "gpt-6-sol", None),
+                          used={"compacted-42": 3})
+        # Two calls of one provider: even after one of them gets a typed-in outcome, the other is not guessed.
+        typed = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
+                             "--seconds", "20", "--calls", "1", "--model", "gpt-6-sol", "--request-id", "two-42")
+        self.assertEqual(typed.returncode, 0, typed.stderr)
+        for request in ("two-42", "other-42", "nomodel-42", "compacted-42", "unmeasured-42"):
             with self.subTest(request=request):
                 result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
-                                      "--model", model, "--request-id", request)
+                                      "--model", "gpt-6-sol", "--request-id", request)
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("no single unrecorded call", result.stderr)
-        outcomes = self.routing_dir / "outcomes.jsonl"
-        self.assertEqual(outcomes.read_text() if outcomes.exists() else "", "")
+                self.assertIn("cannot show which single call", result.stderr)
+        rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
 
     def test_outcome_accepts_tier_names_and_explains_bad_ones(self):
         named = self.run_cli("outcome", "codex", "standard", "implement", "pass", "--request-id", "tier-42")
