@@ -293,7 +293,7 @@ self-review; none in a single-tool run, `--local-only` included. A stand-in that
 fails with a non-terminal status is replaced by the next allowed one; `UNKNOWN`,
 `TIMEOUT`, `CANCELLED` and `BUDGET_EXHAUSTED` stop the review. Placeholder engines
 without an executor (`cursor`, `copilot`) never review or stand in.
-`makewand review` keeps its codex → grok → agy ladder (`local` with
+`makewand review` keeps its codex → agy ladder (Grok only with `--provider grok`; `local` with
 `--local-only`; a review request through `run --provider X` asks X alone), so when
 agy is the only usable engine there an oversized prompt ends `UNVERIFIED`.
 

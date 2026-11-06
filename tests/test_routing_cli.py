@@ -477,7 +477,8 @@ class RoutingCliTests(unittest.TestCase):
         # The owner's review rule: an agy-proxied Claude model must not review Claude's work.
         result = self.run_cli("route", "review", "hard", "--not", "claude", "--self", "claude", quota={})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("跳过：claude（与 claude 同属 anthropic 家族）；"
+        self.assertIn("跳过：grok（不派审查：11-04 修好后仍有约一半审查没给出结论）；"
+                      "claude（与 claude 同属 anthropic 家族）；"
                       "agy（claude-opus-5-5-high 属于 claude 模型家族，与 claude 同家族）", result.stdout)
         self.assertNotIn("claude-opus", "\n".join(line for line in result.stdout.splitlines()
                                                   if CANDIDATE_LINE.match(line)))

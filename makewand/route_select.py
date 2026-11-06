@@ -5,6 +5,7 @@
 
 不可用的原因按这个顺序取第一条：
 
+- 这类任务不派给这一家（``TASK_TYPE_SKIPS``：审查不派 grok）；
 - policy 的 PAUSED 里还没到期的；
 - 账本里还没过期的额度标记；
 - 当前账号/模型的有效拒绝记录、官方周额度策略及各额度窗口保护阈值；
@@ -63,6 +64,9 @@ DEFAULT_REQUEST_BUDGET = 3
 HALF_LIFE_DAYS = 14
 # Sample weight runs from 1.0 for the cheapest catalog position down to 1 - spread for the last.
 COST_WEIGHT_SPREAD = 0.2
+# Task types route never offers to a provider (owner, 2026-11-06): after the 11-04 fixes
+# Grok still gave no verdict on half of its reviews. Calling `makewand grok` directly still works.
+TASK_TYPE_SKIPS = {"review": {"grok": "不派审查：11-04 修好后仍有约一半审查没给出结论"}}
 
 # 官方额度命令是已安装 Go 组件的 `quota` 子命令（与 cli._find_go_binary 同样查找）。
 # 找不到组件、超时或输出不可用时当作没有数据。
@@ -313,9 +317,11 @@ def select(
 
     request_blocks = ledger.request_cooldowns(request_id, now=moment) if request_id and not retry_approved else {}
 
+    task_skips = TASK_TYPE_SKIPS.get(task_type, {})
     blocked_early = []
     for row in rows:
-        if _pause_reason(policy, row.provider, moment) or _mark_reason(marks.get(row.provider), moment) or row.provider in request_blocks:
+        if (row.provider in task_skips or _pause_reason(policy, row.provider, moment)
+                or _mark_reason(marks.get(row.provider), moment) or row.provider in request_blocks):
             blocked_early.append(row.provider)
     quota = _read_quota(rows, blocked_early, quota_reader)
     # Explicit readers keep deterministic/offline callers free of wall-clock
@@ -336,7 +342,8 @@ def select(
     available = []
     for index, row in enumerate(rows):
         provider_reason = (
-            _pause_reason(policy, row.provider, moment)
+            task_skips.get(row.provider)
+            or _pause_reason(policy, row.provider, moment)
             or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
         )

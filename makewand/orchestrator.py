@@ -379,9 +379,10 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         # The reviewer the user forced, usable (checked above), and no other.
         reviewer_ladder = [(forced, f"派发给指定的审查引擎 {forced.upper()} 进行红队审计 (只读隔离)...", COLOR_CYAN)]
     else:
+        # No Grok by default (owner, 2026-11-06): half of its reviews still gave no verdict
+        # after the 11-04 fixes. `--provider grok` still forces it.
         reviewer_ladder = [
             ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
-            ("grok", "派发给 Grok Build CLI 进行红队审计 (xAI / grok-4.7, 只读隔离)...", COLOR_RED),
             ("agy", "由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN),
         ]
     review_res = None
