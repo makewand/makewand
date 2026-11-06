@@ -161,6 +161,17 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(self.routes, ["cli", "api"])
 
 
+    def test_an_agy_quota_refusal_keeps_agys_own_words(self):
+        # agy names no reset time; its words show whether one was printed and missed.
+        refusal = "Error: You have exhausted your quota on this model.\n"
+        with patch("makewand.health.record_engine_limit"), patch("makewand.cli_failure_log.record") as record:
+            self.dispatch("agy", "healthy", key=False, policy=None, cli={"code": 1, "out": "", "err": refusal})
+        [call] = record.call_args_list
+        self.assertEqual(call.args[:2], ("agy", 1))
+        self.assertIn("exhausted your quota", str(call.args[2]))
+        self.assertEqual(call.kwargs, {"kind": "quota"})
+
+
 class SelectionTests(unittest.TestCase):
     def route(self, cache, policy=None):
         with environment("ANTHROPIC_API_KEY", policy), \

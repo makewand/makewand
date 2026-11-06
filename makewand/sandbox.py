@@ -66,7 +66,9 @@ class ProviderStartupError(SandboxConfigError):
     """Trusted prelaunch evidence: the provider has not been started."""
 
     def as_result(self, engine, readonly):
+        from makewand import cli_failure_log
         from makewand.execution_contract import ExecutionResult
+        cli_failure_log.record_message(engine, "startup", str(self))
         return ExecutionResult(False, None, str(self), status="UNVERIFIED",
                                engine=engine, readonly=readonly,
                                error_kind="startup_environment", outcome_known=True)

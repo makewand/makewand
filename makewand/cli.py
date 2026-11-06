@@ -91,7 +91,7 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
         nonlocal launched
         from makewand.workflow import provider_outcome
         try:
-            return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)))
+            return provider_outcome(execute(prompt, **dict(kwargs, timeout=effective_timeout)), engine=engine)
         finally:
             launched = execution_runtime.provider_invocation_used()
     with observe_dispatch_route() as route:
@@ -923,6 +923,19 @@ def main():
         raise SystemExit(EXIT_USAGE_ERROR) from None
 
 
+_OUTCOME_TIER_NAMES = {"fast": 1, "standard": 2, "deep": 3, "balanced": 2, "power": 3}
+
+
+def _outcome_tier(text):
+    """`outcome` TIER: 1, 2, 3, or the dispatch tier names (5 runs used `standard` or `strong`)."""
+    value = str(text).strip().lower()
+    if value in ("1", "2", "3"):
+        return int(value)
+    if value in _OUTCOME_TIER_NAMES:
+        return _OUTCOME_TIER_NAMES[value]
+    raise argparse.ArgumentTypeError(f"档位写 1、2、3，或 fast、standard、deep（收到 {text!r}）")
+
+
 def _main():
     refusal = _provider_worker_refusal(None, sys.argv[1:])
     if refusal:
@@ -1112,7 +1125,7 @@ def _main():
 
     p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
     p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
-    p_outcome.add_argument("outcome_tier", metavar="TIER", type=int, help="档位（1, 2, 3）")
+    p_outcome.add_argument("outcome_tier", metavar="TIER", type=_outcome_tier, help="档位（1, 2, 3；也认 fast、standard、deep）")
     p_outcome.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
     p_outcome.add_argument("result", choices=["pass", "fail"], help="受委派工作是否通过验收；review 按审查有效性记，代码裁决用 --candidate-verdict")
     p_outcome.add_argument("--seconds", type=float, default=None, help="这次派活耗时秒数（可选）")
@@ -1123,7 +1136,8 @@ def _main():
     p_outcome.add_argument("--failure-kind", choices=["startup", "auth", "quota", "timeout", "unknown", "invalid_output", "verification"], help="失败类别；候选被有效审查拒绝时不要把工具记 fail")
 
     p_budget = subparsers.add_parser("budget", allow_abbrev=False, help="查看或修复共享调用账本 call-budget.json 领先实际时间的时钟（不调用模型）", parents=[sub_common_parser])
-    p_budget.add_argument("budget_action", metavar="ACTION", choices=["clock", "request"], help="clock：账本时钟；request：请求总调用上限与已用计数")
+    p_budget.add_argument("budget_action", metavar="ACTION", nargs="?", default=None, choices=["clock", "request", "show", "status"],
+                          help="clock：账本时钟；request（也可写 show、status）：请求总调用上限与已用计数；不写时带 --request-id 就看该请求，否则给出用法")
     p_budget.add_argument("--set-limit", type=int, help="用户已批准的新请求总上限；保留 ID 与已用计数，不能自动提高")
     p_budget.add_argument("--repair", action="store_true", default=False, help="让领先实际时间的时钟与日期桶回到实际时间（持账本锁，不退还已计的调用次数）")
     p_budget.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")

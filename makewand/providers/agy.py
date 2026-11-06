@@ -338,6 +338,9 @@ def execute_agy_task(
                 pass
             return False, combined, fail_reason
     if is_limited:
+        # agy names no reset time; keep its own words to see whether one was printed and missed.
+        from makewand import cli_failure_log
+        cli_failure_log.record("agy", code, own_err, kind="quota")
         record_engine_limit("agy", reason, resets_at, model=target_model)
         if relay.available:
             return relay(f"[Makewand -> Antigravity] 订阅触发配额限制 ({reason})，无缝切换为 Gemini API Key 模式接力执行...", cwd=cwd)

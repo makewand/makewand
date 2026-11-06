@@ -286,7 +286,7 @@ def _reserve_wait(engine, tier, model, readonly, *, capacity_policy, ticket_id, 
             busy_error = error
             if capacity_policy and time.monotonic() >= next_report:
                 shared_capacity.report_busy(error)
-                next_report = time.monotonic() + 15
+                next_report = time.monotonic() + shared_capacity.WAIT_REPORT_SECONDS
             remaining = wait_until - time.monotonic()
             if remaining <= 0:
                 raise

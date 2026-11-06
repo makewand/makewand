@@ -9,6 +9,11 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- `outcome` 不填 `--seconds`/`--calls` 时，如果这个工具在本请求里只调用过一次、还没记过成绩，且账本里这个请求的调用都还在（没被压缩），就从调用账本补上测得的秒数并提示；手填的调用次数不是 1、指定的模型对不上或缺实测秒数时都不补，带裁决的成绩照旧要求自己填。此前漏填就报错，两周 7 次。
+- `outcome` 的档位也认 fast、standard、deep（写错时提示正确写法）；`budget` 不写动作时给出用法，`show`、`status` 等同 `request`。两周里这两处写错 16 次。
+- 没启动模型就失败时（启动预检失败、沙箱建不起来）把 makewand 自己的原因写进 `unclassified-cli-failures.jsonl`（带 `kind`）；Agy 额度被拒时也存它的原话尾部，看它有没有给重置时间。此前这类 0.1 秒内结束的失败什么都没留下。
+- 排队提示从每 15 秒一行改成每分钟一行：等满 5 分钟原来会往调用方的上下文里打 20 行。
+- 技能说明：审查按风险选档位，不是高风险的用 `review normal`；Agy 被拒只标记那个模型；`outcome` 可以从账本补秒数。
 - 审查不再派给 Grok：`route` 的审查候选跳过它并写明原因，`makewand review` 的默认顺序改为 Codex → Agy，只有 `--provider grok` 才会用它；`status` 的推荐分工也不再推荐它审查。11-04 修复后它仍有一半审查没给出结论（10 次里 5 次）。
 - 技能说明加上审查轮数：同一改动默认最多审 2 轮，第 2 轮仍不通过就把剩下的问题交给用户决定。
 - Muse 的订阅额度拒绝覆盖整个订阅，不再只算当前模型：`muse-wonder-1.0` 和 `muse-wonder-full-1.0` 被拒时给的是同一个重置时间。

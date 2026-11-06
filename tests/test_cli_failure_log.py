@@ -42,6 +42,34 @@ class CliFailureLogTest(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(os.stat(self.log).st_mode & 0o777, 0o600)
 
+    def test_a_provider_that_never_started_keeps_makewand_s_reason(self):
+        from makewand.sandbox import ProviderStartupError
+        result = ProviderStartupError("bwrap: setting up uid map: Permission denied\nAuthorization: Bearer abc.def").as_result(
+            "claude", True)
+        self.assertEqual(result.status, "UNVERIFIED")
+        [entry] = self.entries()
+        self.assertEqual((entry["engine"], entry["kind"]), ("claude", "startup"))
+        self.assertEqual(entry["message_tail"][0], "bwrap: setting up uid map: Permission denied")
+        self.assertNotIn("abc.def", self.log.read_text())
+
+    def test_a_sandbox_that_could_not_be_built_keeps_its_reason_but_a_policy_refusal_does_not(self):
+        from makewand.workflow import provider_outcome
+        built = provider_outcome((False, None, "Bubblewrap 沙箱构建失败，拒绝执行：mount /proc failed"), engine="codex")
+        self.assertEqual(built.status, "SANDBOX_UNAVAILABLE")
+        policy = provider_outcome((False, None, "不可信仓库 (--repo-trust=untrusted) 禁止执行写入任务，Bubblewrap 未检测到"))
+        self.assertEqual(policy.status, "SANDBOX_UNAVAILABLE")
+        [entry] = self.entries()
+        self.assertEqual((entry["engine"], entry["kind"]), ("codex", "sandbox"))
+        self.assertIn("mount /proc failed", entry["message_tail"][0])
+
+    def test_a_refusal_entry_names_its_kind(self):
+        cli_failure_log.record("agy", 1, "Error: You have exhausted your quota on this model.\n", kind="quota")
+        cli_failure_log.record("grok", 1, "Error: something new\n")
+        quota, unknown = self.entries()
+        self.assertEqual((quota["engine"], quota["kind"]), ("agy", "quota"))
+        self.assertEqual(quota["stderr_tail"], ["Error: You have exhausted your quota on this model."])
+        self.assertNotIn("kind", unknown)
+
     def test_timeout_and_empty_stderr_are_not_logged(self):
         class Timeout(Exception):
             execution_status = "TIMEOUT"

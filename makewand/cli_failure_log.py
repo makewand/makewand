@@ -1,5 +1,11 @@
 """Bounded log of the CLI's own last lines when a dispatch ends UNKNOWN.
 
+Also kept, with a ``kind``: an Antigravity quota refusal (``quota``; it names no
+reset time, so its own words show whether one was printed and missed), and
+makewand's own reason when a provider never started (``startup``) or its
+sandbox could not be built (``sandbox``). Those ended UNVERIFIED or
+SANDBOX_UNAVAILABLE within a tenth of a second with nothing kept to explain them.
+
 A provider CLI that exits nonzero without a catalogued message (quota, rate,
 auth) is recorded as UNKNOWN, and nothing kept what it printed, so a missing
 or stale cli_message_catalog.json pattern could not be found or fixed (Grok
@@ -69,15 +75,29 @@ def tail_lines(engine, stderr):
     return [redact(line[:4 * MAX_LINE_CHARS])[:MAX_LINE_CHARS] for line in lines]
 
 
-def record(engine, code, stderr):
-    """Append one entry for an UNKNOWN exit; ignore every error."""
+def record(engine, code, stderr, kind=None):
+    """Append one entry for an UNKNOWN exit, or for a refusal of ``kind``; ignore every error."""
     try:
         lines = tail_lines(engine, stderr)
         if not lines:
             return
-        entry = (json.dumps({"ts": time.time(), "engine": str(engine), "exit_code": code, "stderr_tail": lines},
-                            ensure_ascii=False) + "\n").encode("utf-8")
-        append_bounded(log_path(), entry, MAX_BYTES)
+        fields = {"ts": time.time(), "engine": str(engine), "exit_code": code, "stderr_tail": lines}
+        if kind:
+            fields["kind"] = kind
+        append_bounded(log_path(), (json.dumps(fields, ensure_ascii=False) + "\n").encode("utf-8"), MAX_BYTES)
+    except Exception:  # noqa: BLE001 - diagnostics only, never part of a result
+        return
+
+
+def record_message(engine, kind, message):
+    """Append makewand's own reason for a dispatch that started no model; ignore every error."""
+    try:
+        lines = [line.strip() for line in str(message or "").splitlines() if line.strip()][-5:]
+        lines = [redact(line[:4 * MAX_LINE_CHARS])[:MAX_LINE_CHARS] for line in lines]
+        if not lines:
+            return
+        fields = {"ts": time.time(), "engine": str(engine), "kind": kind, "message_tail": lines}
+        append_bounded(log_path(), (json.dumps(fields, ensure_ascii=False) + "\n").encode("utf-8"), MAX_BYTES)
     except Exception:  # noqa: BLE001 - diagnostics only, never part of a result
         return
 

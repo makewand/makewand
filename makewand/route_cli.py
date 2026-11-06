@@ -535,6 +535,50 @@ def _infer_recent_request_id(
     return candidate_tasks[0] if len(candidate_tasks) == 1 else None
 
 
+def _measured_call(provider, model, request_id, rows, budget_file=None):
+    """Measured seconds and calls of the only call an outcome can be about, from call-budget.json.
+
+    Filled only when that is provable: the ledger still lists every call of this
+    request (its task counter equals the unreleased calls listed, so none was compacted away),
+    exactly one of them is this provider's and it completed, no outcome of this
+    provider is recorded for the request yet, and a named model is the one the call
+    asked for. The seconds are the ones measured around the run, not wall-clock
+    differences. Anything else returns None and the caller must pass measured values.
+    """
+    try:
+        from makewand.layered_budget import default_path
+
+        path = Path(budget_file or os.environ.get("MAKEWAND_CALL_BUDGET_FILE") or default_path()).expanduser()
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("attempts"), list):
+        return None
+    # A released (refunded) reservation never ran and no longer counts in the task counter.
+    calls = [entry for entry in data["attempts"] if isinstance(entry, dict) and entry.get("task_id") == request_id
+             and entry.get("status") != "released"]
+    scopes = data.get("scopes")
+    tasks = scopes.get("tasks") if isinstance(scopes, dict) else None
+    counter = tasks.get(request_id) if isinstance(tasks, dict) else None
+    used = counter.get("used") if isinstance(counter, dict) else None
+    if isinstance(used, bool) or not isinstance(used, int) or used != len(calls):
+        return None
+    mine = [entry for entry in calls if entry.get("engine") == provider]
+    if len(mine) != 1 or mine[0].get("status") != "completed":
+        return None
+    if any(isinstance(row, dict) and row.get("request_id") == request_id and row.get("provider") == provider
+           for row in rows or ()):
+        return None
+    wanted = model.strip() if isinstance(model, str) and model.strip() else None
+    asked = mine[0].get("requested_model")
+    if wanted is not None and not (isinstance(asked, str) and asked.strip() == wanted):
+        return None
+    seconds = mine[0].get("seconds")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+        return None
+    return round(float(seconds), 1), 1
+
+
 def cmd_mark(args) -> None:
     try:
         provider = _validate_provider(args.provider)
@@ -581,17 +625,18 @@ def cmd_outcome(args) -> None:
             # Recorded anyway: a missing verdict must not cost the row or invite made-up timings.
             print("makewand: warning: review outcome without --candidate-verdict; the code verdict "
                   "(pass|fail|unverified) is what shows whether cross-model review is worth it. "
-                  "It needs measured --seconds and actual --calls; if you have none, record as is.",
+                  "It needs measured --seconds and actual --calls (taken from the call ledger when this "
+                  "provider made exactly one call in this request and it has no outcome yet); if you have "
+                  "none, record as is.",
                   file=sys.stderr)
         if verdict is not None:
-            if seconds is None or calls is None:
-                raise ValueError("--candidate-verdict requires measured --seconds and actual --calls")
             details.update(review_validated=passed, candidate_approved={"pass": True, "fail": False, "unverified": None}[verdict])
         for name in ("caller", "request_id", "candidate_hash", "failure_kind"):
             value = getattr(args, name, None)
             if value is not None:
                 details[name] = value
         ledger = OutcomeLedger()
+        budget_file = getattr(args, "call_budget_file", None)
         recorded = ledger.record(
             provider, tier, task_type, passed,
             seconds=seconds, calls=calls, model=model, effort=effort,
@@ -600,16 +645,21 @@ def cmd_outcome(args) -> None:
                     ledger,
                     provider,
                     model,
-                    budget_file=getattr(args, "call_budget_file", None),
+                    budget_file=budget_file,
                     existing_rows=rows,
                 )
             ),
+            measure=lambda request_id, rows: _measured_call(provider, model, request_id, rows, budget_file),
+            require_measured=verdict is not None,
             **details,
         )
     except ValueError as error:
         _fail(f"错误：{error}")
     except OSError as error:
         _fail(f"错误：写入成绩失败：{error}")
+    if (seconds is None or calls is None) and recorded.get("seconds") is not None and recorded.get("calls") is not None:
+        print(f"makewand: 从调用账本补上实测 --seconds {recorded['seconds']:g} --calls {recorded['calls']}"
+              f"（请求 {recorded.get('request_id')}）", file=sys.stderr)
     if not recorded.get("request_id"):
         # Recorded anyway: an unlinked row still counts, it just cannot be matched to its call.
         print("makewand: warning: outcome not linked to a dispatched call: no --request-id or "
