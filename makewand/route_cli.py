@@ -539,7 +539,7 @@ def _measured_call(provider, model, request_id, rows, budget_file=None):
     """Measured seconds and calls of the only call an outcome can be about, from call-budget.json.
 
     Filled only when that is provable: the ledger still lists every call of this
-    request (its task counter equals the calls listed, so none was compacted away),
+    request (its task counter equals the unreleased calls listed, so none was compacted away),
     exactly one of them is this provider's and it completed, no outcome of this
     provider is recorded for the request yet, and a named model is the one the call
     asked for. The seconds are the ones measured around the run, not wall-clock
@@ -554,7 +554,9 @@ def _measured_call(provider, model, request_id, rows, budget_file=None):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("attempts"), list):
         return None
-    calls = [entry for entry in data["attempts"] if isinstance(entry, dict) and entry.get("task_id") == request_id]
+    # A released (refunded) reservation never ran and no longer counts in the task counter.
+    calls = [entry for entry in data["attempts"] if isinstance(entry, dict) and entry.get("task_id") == request_id
+             and entry.get("status") != "released"]
     scopes = data.get("scopes")
     tasks = scopes.get("tasks") if isinstance(scopes, dict) else None
     counter = tasks.get(request_id) if isinstance(tasks, dict) else None
@@ -623,8 +625,9 @@ def cmd_outcome(args) -> None:
             # Recorded anyway: a missing verdict must not cost the row or invite made-up timings.
             print("makewand: warning: review outcome without --candidate-verdict; the code verdict "
                   "(pass|fail|unverified) is what shows whether cross-model review is worth it. "
-                  "It needs measured --seconds and actual --calls (taken from the call ledger when "
-                  "this request has one unrecorded call); if you have none, record as is.",
+                  "It needs measured --seconds and actual --calls (taken from the call ledger when this "
+                  "provider made exactly one call in this request and it has no outcome yet); if you have "
+                  "none, record as is.",
                   file=sys.stderr)
         if verdict is not None:
             details.update(review_validated=passed, candidate_approved={"pass": True, "fail": False, "unverified": None}[verdict])

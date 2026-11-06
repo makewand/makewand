@@ -401,7 +401,8 @@ class OutcomeLedger:
                     if existing is None:
                         existing = self._read_rows(strict=False, locked=True, descriptor=fd)
                     measured = measure(row["request_id"], existing)
-                    if measured is not None:
+                    # A typed-in call count other than the measured one means another call: fill nothing.
+                    if measured is not None and row["calls"] in (None, _normalize_calls(measured[1])):
                         if row["seconds"] is None:
                             row["seconds"] = _normalize_seconds(measured[0])
                         if row["calls"] is None:

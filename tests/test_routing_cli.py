@@ -167,15 +167,16 @@ class RoutingCliTests(unittest.TestCase):
         proj = project(self.work)[0]
         now = _time.time()
         rows, counts = [], {}
-        for index, (task, engine, model, seconds) in enumerate(attempts):
+        for index, (task, engine, model, seconds, *status) in enumerate(attempts):
+            status = status[0] if status else "completed"
             row = {"id": f"{index:032x}", "engine": engine, "tier": "standard", "requested_model": model,
                    "readonly": True, "started_at": now - 107 - (seconds or 0), "finished_at": now - 100,
-                   "status": "completed", "task_id": task, "result_status": "PASSED", "success": True,
+                   "status": status, "task_id": task, "result_status": "PASSED", "success": True,
                    "scopes": [["tasks", task], ["projects", f"{proj}:2026-11-06"], ["machine", "2026-11-06"]]}
             if seconds is not None:
                 row["seconds"] = seconds
             rows.append(row)
-            counts[task] = counts.get(task, 0) + 1
+            counts[task] = counts.get(task, 0) + (status != "released")
         counts.update(used or {})
         tasks = {task: {"maximum": 3, "used": count, "last_used": now} for task, count in counts.items()}
         cfg = self.base / "config"
@@ -210,17 +211,25 @@ class RoutingCliTests(unittest.TestCase):
         self._ledger_with(("two-42", "codex", "gpt-6-sol", 10.0), ("two-42", "codex", "gpt-6-sol", 20.0),
                           ("other-42", "codex", "gpt-6-astra", 30.0), ("nomodel-42", "codex", None, 30.0),
                           ("compacted-42", "codex", "gpt-6-sol", 30.0), ("unmeasured-42", "codex", "gpt-6-sol", None),
-                          used={"compacted-42": 3})
+                          # A compacted Codex call plus a refunded reservation of another tool: two calls counted, two listed.
+                          ("released-42", "claude", None, 0.0, "released"), ("released-42", "codex", "gpt-6-sol", 30.0),
+                          ("partial-42", "codex", "gpt-6-sol", 30.0),
+                          used={"compacted-42": 3, "released-42": 2})
         # Two calls of one provider: even after one of them gets a typed-in outcome, the other is not guessed.
         typed = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
                              "--seconds", "20", "--calls", "1", "--model", "gpt-6-sol", "--request-id", "two-42")
         self.assertEqual(typed.returncode, 0, typed.stderr)
-        for request in ("two-42", "other-42", "nomodel-42", "compacted-42", "unmeasured-42"):
+        for request in ("two-42", "other-42", "nomodel-42", "compacted-42", "unmeasured-42", "released-42"):
             with self.subTest(request=request):
                 result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
                                       "--model", "gpt-6-sol", "--request-id", request)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("cannot show which single call", result.stderr)
+        # A typed-in call count of 2 is not this single call: its seconds are not borrowed.
+        partial = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
+                               "--calls", "2", "--model", "gpt-6-sol", "--request-id", "partial-42")
+        self.assertEqual(partial.returncode, 2)
+        self.assertIn("cannot show which single call", partial.stderr)
         rows = [json.loads(line) for line in (self.routing_dir / "outcomes.jsonl").read_text().splitlines()]
         self.assertEqual(len(rows), 1)
 

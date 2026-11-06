@@ -50,7 +50,7 @@ makewand route review normal --self <你> --not <实现方> --request-id <ID> --
 makewand outcome codex 3 review pass --candidate-verdict fail --candidate-hash <SHA256> --model <模型> --effort <深度> --seconds <实际秒数> --calls 1 --caller <你> --request-id <ID> --max-model-calls <N>
 ```
 
-带请求 ID、且这个请求里正好有一次该工具的调用还没记成绩时，可以不填 `--seconds`/`--calls`，makewand 从调用账本补上实测值（不含排队）；对不上时仍要自己填。验收对不上派发调用（没有 `--request-id`/`MAKEWAND_TASK_ID`，也无法唯一自动关联）时照常记账但会警告，请带上派发用的同一个请求 ID。review 记录不带 `--candidate-verdict` 时照常记账但会警告：没有实测耗时和实际调用数就照实不填，不要为消除警告编数字。用 `--call-budget-file` 指定非默认账本时，任务上限照常生效，但整机/项目日计数另算，`makewand observe` 会列出这些账本。
+带请求 ID、这个工具在本请求里只调用过一次、且还没记过成绩时，可以不填 `--seconds`/`--calls`，makewand 从调用账本补上实测值（不含排队）；手填的调用次数不是 1 或对不上时仍要自己填。验收对不上派发调用（没有 `--request-id`/`MAKEWAND_TASK_ID`，也无法唯一自动关联）时照常记账但会警告，请带上派发用的同一个请求 ID。review 记录不带 `--candidate-verdict` 时照常记账但会警告：没有实测耗时和实际调用数就照实不填，不要为消除警告编数字。用 `--call-budget-file` 指定非默认账本时，任务上限照常生效，但整机/项目日计数另算，`makewand observe` 会列出这些账本。
 
 实现/测试任务的 pass/fail 仍是其结果是否通过验收。操作失败另带 `--failure-kind startup|auth|quota|timeout|unknown|invalid_output|verification`；只有 startup/auth/quota 在本请求冷却 5 分钟，unknown/timeout 要用户批准重试。候选测试失败或有效审查拒绝不触发提供方冷却。429/额度耗尽还应 `makewand mark <工具> <剩余时长>`；只是某个模型被拒时加 `--model <模型>`：Agy 的 Gemini、Claude、GPT-OSS 额度分开算，Gemini 用完不要标记整个 agy。不要猜测失败原因。
 
