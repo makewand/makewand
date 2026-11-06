@@ -103,6 +103,27 @@ class TestUnknownStatusIsNeutral(_IsolatedState):
         self.assertTrue(next(iter(outputs)).startswith("claude "), outputs)
 
 
+class TestStatusDoesNotRecommendGrokReviews(_IsolatedState):
+    """Owner, 2026-11-06: status recommends only reviewers route would offer, so never Grok."""
+
+    def test_grok_is_not_a_recommended_reviewer(self):
+        from makewand.engine_selection import select_optimal_engine_pair
+        coders, reviewers, meta = select_optimal_engine_pair("审查改动", tier="standard", cache=self.healthy_cache())
+        self.assertNotEqual(coders[0], "grok")
+        self.assertTrue(reviewers)
+        self.assertNotIn("grok", reviewers)
+
+    def test_grok_is_not_the_fallback_reviewer_either(self):
+        # Every scored reviewer limited: the stand-in list must not bring Grok back.
+        from makewand.engine_selection import select_optimal_engine_pair
+        cache = self.healthy_cache()
+        for engine in ("codex", "agy", "muse"):
+            cache[engine]["status"] = "limited"
+        coders, reviewers, meta = select_optimal_engine_pair("审查改动", tier="standard", cache=cache)
+        self.assertEqual(coders[0], "claude")
+        self.assertNotIn("grok", reviewers)
+
+
 class TestAgyReliabilityBonus(_IsolatedState):
     """runtime-state#3: agy loses its +0.5 when real dispatches mostly fail, keeps it otherwise."""
 

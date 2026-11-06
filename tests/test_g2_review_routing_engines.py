@@ -9,6 +9,7 @@ G2 regressions for reviewer/contestant selection and race dead code.
 
 import contextlib
 import io
+import json
 import shutil
 import subprocess
 import tempfile
@@ -64,6 +65,22 @@ class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
         code, calls = self.run_review(cache, disabled=("codex", "agy"))
         self.assertEqual(code, orch.EXIT_UNVERIFIED)
         self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 0})
+
+    def test_no_reviewer_message_names_only_the_default_ladder(self):
+        cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "get_git_diff", return_value="diff --git a/a b/a\n+x"))
+            stack.enter_context(patch.object(orch, "get_or_update_status", return_value=cache))
+            stack.enter_context(patch("makewand.config.is_provider_enabled", side_effect=enabled_except("codex", "agy")))
+            for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task"):
+                stack.enter_context(patch.object(orch, name, side_effect=AssertionError(name)))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            code = orch.run_review(cwd="/tmp", output_json=True)
+        self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        message = " ".join(json.loads(output.getvalue())["defects"])
+        self.assertIn("(codex/agy 均被禁用或不可用)", message)
+        self.assertNotIn("grok", message)
 
     def test_grok_still_reviews_when_forced(self):
         cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}

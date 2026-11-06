@@ -439,7 +439,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                       else f"指定的审查引擎 {forced.upper()} 未能产生有效输出 (UNVERIFIED)")
         else:
             reason = ("没有可完整接收审查提示的已启用审查引擎" if no_engine and partial
-                      else "没有已启用且健康的审查引擎 (codex/grok/agy 均被禁用或不可用)" if no_engine
+                      else f"没有已启用且健康的审查引擎 ({'/'.join(e for e, _, _ in reviewer_ladder)} 均被禁用或不可用)" if no_engine
                       else "独立审查服务未能产生有效输出 (UNVERIFIED)")
         if partial:
             reason += f"；{'/'.join(e.upper() for e in partial)} 无法完整接收审查提示 ({dispatched_size(prompt)} 字节)，已跳过"
