@@ -24,6 +24,7 @@ from makewand.route_select import (
     Policy,
     RouteCandidate,
     RouteResult,
+    TASK_TYPE_SKIPS,
     default_policy_path,
     default_quota_reader,
     load_policy,
@@ -533,6 +534,23 @@ class SelectTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self._select(risk="medium")
+
+    def test_review_never_offers_grok(self):
+        # Owner, 2026-11-06: Grok still gave no verdict on half of its reviews after the 11-04 fixes.
+        reason = TASK_TYPE_SKIPS["review"]["grok"]
+        self.assertTrue(_chinese(reason))
+        for task_type in ("implement", "research"):
+            other = self._select(task_type, "normal", full=True, discovered={})
+            self.assertIn("grok", [item.provider for item in other.candidates])
+            self.assertNotIn("grok", dict(other.skipped))
+        # The task-type skip comes first, so a live mark does not replace its reason.
+        self.ledger.mark("grok", self.now + 3600, "额度用完")
+        for difficulty in ("mechanical", "normal", "hard"):
+            for full in (False, True):
+                result = self._select("review", difficulty, full=full, discovered={})
+                self.assertNotIn("grok", [item.provider for item in result.candidates])
+                self.assertEqual(dict(result.skipped)["grok"], reason)
+                self.assertIn("codex", [item.provider for item in result.candidates])
 
     def test_skip_reasons_follow_catalog_order(self):
         text = "2099-01-01T00:00"

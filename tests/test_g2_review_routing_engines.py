@@ -9,6 +9,7 @@ G2 regressions for reviewer/contestant selection and race dead code.
 
 import contextlib
 import io
+import json
 import shutil
 import subprocess
 import tempfile
@@ -34,7 +35,7 @@ def enabled_except(*disabled):
 
 
 class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
-    def run_review(self, cache, disabled):
+    def run_review(self, cache, disabled, engine=None):
         mocks = {name: MagicMock(side_effect=answer_with_nonce((True, PASS_LINE, None)))
                  for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task")}
         with contextlib.ExitStack() as stack:
@@ -44,7 +45,7 @@ class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
             for name, mock in mocks.items():
                 stack.enter_context(patch.object(orch, name, mock))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            code = orch.run_review(cwd="/tmp", output_json=True)
+            code = orch.run_review(cwd="/tmp", output_json=True, engine=engine)
         return code, {name.split("_")[1]: mock.call_count for name, mock in mocks.items()}
 
     def test_all_reviewers_disabled_or_missing_is_unverified_without_any_call(self):
@@ -53,9 +54,38 @@ class TestRunReviewHonoursDisableAndHealth(unittest.TestCase):
         self.assertEqual(code, orch.EXIT_UNVERIFIED)
         self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 0})
 
-    def test_disabled_codex_is_skipped_in_favour_of_enabled_grok(self):
+    def test_disabled_codex_falls_to_agy_and_never_to_grok(self):
         cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}
         code, calls = self.run_review(cache, disabled=("codex",))
+        self.assertEqual(code, orch.EXIT_PASSED)
+        self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 1})
+
+    def test_a_healthy_grok_is_not_a_default_reviewer(self):
+        cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}
+        code, calls = self.run_review(cache, disabled=("codex", "agy"))
+        self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 0})
+
+    def test_no_reviewer_message_names_only_the_default_ladder(self):
+        cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(orch, "get_git_diff", return_value="diff --git a/a b/a\n+x"))
+            stack.enter_context(patch.object(orch, "get_or_update_status", return_value=cache))
+            stack.enter_context(patch("makewand.config.is_provider_enabled", side_effect=enabled_except("codex", "agy")))
+            for name in ("execute_codex_task", "execute_grok_task", "execute_agy_task"):
+                stack.enter_context(patch.object(orch, name, side_effect=AssertionError(name)))
+            stack.enter_context(contextlib.redirect_stdout(output))
+            code = orch.run_review(cwd="/tmp", output_json=True)
+        self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        message = " ".join(json.loads(output.getvalue())["defects"])
+        self.assertIn("(codex/agy 均被禁用或不可用)", message)
+        self.assertNotIn("grok", message)
+
+    def test_grok_still_reviews_when_forced(self):
+        cache = {"codex": {"status": "healthy"}, "grok": {"status": "healthy"}, "agy": {"status": "healthy"}}
+        with patch("makewand.config.has_subscription_configured", return_value=True):
+            code, calls = self.run_review(cache, disabled=(), engine="grok")
         self.assertEqual(code, orch.EXIT_PASSED)
         self.assertEqual(calls, {"codex": 0, "grok": 1, "agy": 0})
 

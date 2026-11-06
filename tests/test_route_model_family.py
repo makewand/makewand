@@ -17,7 +17,7 @@ from pathlib import Path
 
 from makewand.discovery import model_family
 from makewand.outcome_ledger import OutcomeLedger
-from makewand.route_select import Policy, select
+from makewand.route_select import TASK_TYPE_SKIPS, Policy, select
 
 # The owner's review rule (route review hard --not claude --self claude) plus the
 # tiers that list agy-proxied Claude rows.
@@ -29,6 +29,11 @@ CLAUDE_CASES = (
 )
 # gpt-oss-120b-medium is a tier-2 row.
 GPT_CASES = (("review", "normal", "low"), ("implement", "normal", "low"))
+
+
+def _task_skips(task_type):
+    """What route skips for this task type before any other rule (review: grok)."""
+    return dict(TASK_TYPE_SKIPS.get(task_type, {}))
 
 
 class RouteModelFamilyTests(unittest.TestCase):
@@ -76,6 +81,7 @@ class RouteModelFamilyTests(unittest.TestCase):
                 result = self._select(task_type, difficulty, risk, not_tool="codex", self_tool="codex")
                 self.assertEqual(self._family(result, "gpt"), [])
                 self.assertEqual(dict(result.skipped), {
+                    **_task_skips(task_type),
                     "codex": "与 codex 同属 openai 家族",
                     "agy": "gpt-oss-120b-medium 属于 gpt 模型家族，与 codex 同家族",
                 })
@@ -95,7 +101,7 @@ class RouteModelFamilyTests(unittest.TestCase):
             for task_type, difficulty, risk in cases:
                 with self.subTest(tool=tool, task=task_type, difficulty=difficulty, risk=risk):
                     result = self._select(task_type, difficulty, risk, self_tool=tool)
-                    self.assertEqual(result.skipped, [])
+                    self.assertEqual(dict(result.skipped), _task_skips(task_type))
                     for item in result.candidates:
                         self.assertEqual(item.is_self, model_family(item.model) == lineage, item.candidate_id)
                     flags = [item.is_self for item in result.candidates]

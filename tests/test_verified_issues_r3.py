@@ -198,11 +198,11 @@ def test_review_falls_back_after_actual_busy_admission(isolated, monkeypatch):
             patch.object(orch, "get_or_update_status", return_value={}), \
             patch.object(orch, "_engine_usable", return_value=(True, "")), \
             patch.object(orch, "execute_codex_task", side_effect=AssertionError("busy codex launched")), \
-            patch.object(orch, "execute_grok_task", side_effect=verdict) as fallback, \
+            patch.object(orch, "execute_agy_task", side_effect=verdict) as fallback, \
             contextlib.redirect_stdout(io.StringIO()) as output:
         code = orch.run_review(cwd=str(isolated.parent), output_json=True)
     assert code == 0, output.getvalue()
-    assert json.loads(output.getvalue())["engine"] == "grok"
+    assert json.loads(output.getvalue())["engine"] == "agy"
     fallback.assert_called_once()
     assert len(json.loads(Path(os.environ["MAKEWAND_CALL_BUDGET_FILE"]).read_text())["attempts"]) == 2
     budget.complete(first, True, 0)

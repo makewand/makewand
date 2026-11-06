@@ -83,12 +83,12 @@ def test_review_other_candidate_never_sleeps(isolated, monkeypatch, explicit_cap
                 patch.object(orch, "get_or_update_status", return_value={}), \
                 patch.object(orch, "_engine_usable", return_value=(True, "")), \
                 patch.object(orch, "execute_codex_task", side_effect=AssertionError("busy codex launched")), \
-                patch.object(orch, "execute_grok_task", side_effect=verdict) as fallback, \
+                patch.object(orch, "execute_agy_task", side_effect=verdict) as fallback, \
                 patch.object(budget, "time", budget_clock(reject_busy_sleep)), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             code = orch.run_review(cwd=str(isolated.parent), output_json=True, timeout=1)
         assert code == 0, output.getvalue()
-        assert json.loads(output.getvalue())["engine"] == "grok"
+        assert json.loads(output.getvalue())["engine"] == "agy"
         fallback.assert_called_once()
         assert len(attempts()) == 2
     finally:

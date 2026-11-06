@@ -539,6 +539,11 @@ def select_optimal_engine_pair(
         "cursor": 0.5,
         "copilot": 0.5
     }
+    # status recommends only reviewers route would offer (route_select.TASK_TYPE_SKIPS: no Grok).
+    from makewand.route_select import TASK_TYPE_SKIPS
+    not_reviewers = set(TASK_TYPE_SKIPS.get("review", {}))
+    for model_name in not_reviewers:
+        reviewer_base_scores.pop(model_name, None)
     reviewer_base_scores.pop(primary_coder, None)
     for model_name in list(reviewer_base_scores.keys()):
         if not is_provider_enabled(model_name):
@@ -585,7 +590,7 @@ def select_optimal_engine_pair(
         reasons.append(f"当前系统仅检测到 1 个活跃可用工具 ({primary_coder.upper()})，已自动切换为单工具实现 + 独立沙箱自审闭环模式")
     elif not available_reviewers:
         other_active = [m for m in active_pool if m != primary_coder and is_provider_enabled(m)
-                        and m not in ENGINES_WITHOUT_EXECUTOR
+                        and m not in ENGINES_WITHOUT_EXECUTOR and m not in not_reviewers
                         and _usable_or_api_relay(m, cache, _usable_fn)]
         if other_active:
             available_reviewers = sorted(other_active, key=lambda m: (-reviewer_base_scores.get(m, -999.0), m))

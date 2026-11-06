@@ -9,6 +9,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 审查不再派给 Grok：`route` 的审查候选跳过它并写明原因，`makewand review` 的默认顺序改为 Codex → Agy，只有 `--provider grok` 才会用它；`status` 的推荐分工也不再推荐它审查。11-04 修复后它仍有一半审查没给出结论（10 次里 5 次）。
+- 技能说明加上审查轮数：同一改动默认最多审 2 轮，第 2 轮仍不通过就把剩下的问题交给用户决定。
 - Muse 的订阅额度拒绝覆盖整个订阅，不再只算当前模型：`muse-wonder-1.0` 和 `muse-wonder-full-1.0` 被拒时给的是同一个重置时间。
 - 容量排队写入 `capacity-waits.jsonl`：等了 1 秒以上才入场的和最终被拒的，含当时谁占着名额。此前半小时采样看不出等了多久、谁放弃了。
 
