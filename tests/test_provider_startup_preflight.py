@@ -138,6 +138,15 @@ class SocketPreflightTests(unittest.TestCase):
         self.assertGreater(run.call_args.kwargs["timeout"], 0)
         self.assertLessEqual(run.call_args.kwargs["timeout"], 1)
 
+    def test_probe_waits_out_a_brief_host_stall(self):
+        with patch("makewand.sandbox.run_subprocess", return_value=(0, "", "", None)) as run:
+            sandbox._provider_socket_preflight(["fixture"], ["fixture"], cwd=str(self.root), allow_network=True)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        with execution_context(deadline_unix_ms=int((time.time() + 600) * 1000)):
+            with patch("makewand.sandbox.run_subprocess", return_value=(0, "", "", None)) as run:
+                sandbox._provider_socket_preflight(["fixture"], ["fixture"], cwd=str(self.root), allow_network=True)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
     def test_probe_timeout_is_a_launch_environment_failure(self):
         with patch("makewand.sandbox.run_subprocess", return_value=(-9, "", "", "fixture timeout")):
             with self.assertRaisesRegex(sandbox.SandboxConfigError, "启动环境检查失败.*timeout"):

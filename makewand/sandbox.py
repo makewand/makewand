@@ -3387,6 +3387,9 @@ class ProviderAccountChangedError(RuntimeError):
     """A dispatched host CLI changed login; its remote outcome is unknown."""
 
 
+# Normally done in milliseconds; the limit only matters when the host stalls.
+# 3 s failed during a roughly 20 s stall (2026-11-08) and the model never started.
+_SOCKET_PROBE_TIMEOUT = 30.0
 _SOCKET_PROBE = (
     "import socket,sys\n"
     "errors=[]\n"
@@ -3416,7 +3419,9 @@ def _provider_socket_preflight(command, provider_command, *, cwd, allow_network,
         raise ProviderStartupError("启动环境检查失败：无法隔离 provider 命令，拒绝执行探针")
     from makewand.execution_runtime import auxiliary_process_scope, current_context
     remaining = current_context().get("_deadline_monotonic")
-    timeout = min(3.0, max(0, remaining - time.monotonic())) if remaining is not None else 3.0
+    timeout = _SOCKET_PROBE_TIMEOUT
+    if remaining is not None:
+        timeout = min(timeout, max(0, remaining - time.monotonic()))
     if timeout <= 0:
         raise ProviderStartupError("启动环境检查失败：socket 检查前派发期限已到，模型尚未启动")
     interpreter = _trusted_system_binary("python3") or os.path.realpath(sys.executable)

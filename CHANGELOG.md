@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 派发前的 socket 探针时限从 3 秒放宽到 30 秒：机器瞬时卡顿时它会超时，模型没启动，这次调用却照样计入请求的次数（11-06 到 11-08 出现 3 次）。
 - `outcome` 不填 `--seconds`/`--calls` 时，如果这个工具在本请求里只调用过一次、还没记过成绩，且账本里这个请求的调用都还在（没被压缩），就从调用账本补上测得的秒数并提示；手填的调用次数不是 1、指定的模型对不上或缺实测秒数时都不补，带裁决的成绩照旧要求自己填。此前漏填就报错，两周 7 次。
 - `outcome` 的档位也认 fast、standard、deep（写错时提示正确写法）；`budget` 不写动作时给出用法，`show`、`status` 等同 `request`。两周里这两处写错 16 次。
 - 没启动模型就失败时（启动预检失败、沙箱建不起来）把 makewand 自己的原因写进 `unclassified-cli-failures.jsonl`（带 `kind`）；Agy 额度被拒时也存它的原话尾部，看它有没有给重置时间。此前这类 0.1 秒内结束的失败什么都没留下。
