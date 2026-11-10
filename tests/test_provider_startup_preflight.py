@@ -4,7 +4,9 @@ try:
 except ImportError:
     from tests import _isolation  # noqa: F401
 
+import contextlib
 import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -13,7 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from makewand import sandbox
+from makewand import providers, sandbox
 from makewand.execution_contract import ExecutionRequest
 from makewand.execution_runtime import current_context, execute, execution_context
 from makewand.providers.base import run_subprocess
@@ -218,6 +220,38 @@ class SocketPreflightTests(unittest.TestCase):
                 code, out, err, error = run_subprocess(launch.cmd, timeout=10, pass_fds=launch.pass_fds,
                                                      extra_env=launch.env, separate_stderr=True)
         self.assertEqual((code, out, error), (0, "provider-fixture", None), err)
+
+
+class SymlinkedWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.repo = self.root / "moved" / "clone"
+        (self.repo / ".git").mkdir(parents=True)
+        (self.repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+        (self.root / "link").symlink_to(self.root / "moved")
+
+    def test_every_provider_starts_from_the_mounted_spelling(self):
+        # bwrap mounts the resolved repository; a symlinked spelling does not exist inside.
+        spelled = self.root / "link" / "clone"
+        for provider in ("claude", "codex", "grok", "muse", "agy"):
+            with self.subTest(provider=provider):
+                seen = {}
+
+                def launch(name, command, cwd, **kwargs):
+                    seen.update(command=list(command), cwd=cwd, repo_root=kwargs.get("repo_root"))
+                    raise sandbox.SandboxUnavailableError("stop before launch")
+
+                task = getattr(providers, f"execute_{provider}_task")
+                with patch("makewand.sandbox.provider_sandbox_launch", side_effect=launch), \
+                     patch("makewand.model_quota.before_cli_launch", return_value=None), \
+                     patch("makewand.providers.muse.detect_muse_guard", return_value=(False, "")), \
+                     patch("makewand.health.load_status_cache", return_value={}), \
+                     contextlib.redirect_stderr(io.StringIO()):
+                    task("hi", cwd=str(spelled), readonly=True)
+                self.assertEqual((seen["cwd"], seen["repo_root"]), (str(self.repo), str(self.repo)))
+                self.assertNotIn(str(self.root / "link"), " ".join(seen["command"]))
 
 
 if __name__ == "__main__":
