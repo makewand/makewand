@@ -158,11 +158,11 @@ def execute_agy_task(
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:
         cwd = os.getcwd()
-    cwd = os.path.abspath(cwd)
+    cwd = os.path.realpath(cwd)
 
     if not repo_root:
         repo_root = find_git_root(cwd) or cwd
-    repo_root = os.path.abspath(repo_root)
+    repo_root = os.path.realpath(repo_root)
 
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
