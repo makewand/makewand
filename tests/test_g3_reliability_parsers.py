@@ -117,6 +117,25 @@ class TestAgyFailureClassification(unittest.TestCase):
         self.assertFalse(parse_agy_quota(stderr)[0])
         self.assertEqual(agy.classify_agy_failure("Error: authentication required. Run 'agy' to log in.")[0], "needs_auth")
 
+    def test_agy_sign_in_timeout_is_its_own_line_not_a_login_failure(self):
+        stderr = (
+            "I1111 07:41:10.100000       1 printmode.go:403] Print mode: not authenticated, trying silent auth\n"
+            "W1111 07:41:10.300000       1 printmode.go:410] Print mode: silent auth failed\n"
+            "I1111 07:41:10.300100       1 printmode.go:415] Waiting for authentication (timeout 60s)...\n"
+            "error: authentication failed or timed out\n"
+        )
+        self.assertTrue(agy._agy_sign_in_timed_out(stderr))
+        # Intermittent, so it never marks agy as needing a new login.
+        self.assertIsNone(agy.classify_agy_failure("", stderr))
+        self.assertIsNone(agy.classify_agy_failure(stderr))
+        # Only agy's own last line: not quoted text, not a glog entry, not an earlier line.
+        self.assertFalse(agy._agy_sign_in_timed_out("the log said: error: authentication failed or timed out\n"))
+        self.assertFalse(agy._agy_sign_in_timed_out("E1111 07:41:10.100000 1 x.go:1] error: authentication failed or timed out\n"))
+        self.assertFalse(agy._agy_sign_in_timed_out(stderr + "Error: authentication required. Please sign in.\n"))
+        self.assertEqual(agy._agy_sign_in_log(stderr), [
+            "Print mode: not authenticated, trying silent auth", "Print mode: silent auth failed",
+            "Waiting for authentication (timeout 60s)...", "error: authentication failed or timed out"])
+
 
 if __name__ == "__main__":
     unittest.main()

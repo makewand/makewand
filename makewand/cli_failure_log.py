@@ -5,6 +5,8 @@ reset time, so its own words show whether one was printed and missed), and
 makewand's own reason when a provider never started (``startup``) or its
 sandbox could not be built (``sandbox``). Those ended UNVERIFIED or
 SANDBOX_UNAVAILABLE within a tenth of a second with nothing kept to explain them.
+An Antigravity sign-in that failed or timed out (``auth``) keeps agy's sign-in
+lines from stderr as well: its silent-auth reason is only logged there.
 
 A provider CLI that exits nonzero without a catalogued message (quota, rate,
 auth) is recorded as UNKNOWN, and nothing kept what it printed, so a missing
@@ -89,10 +91,10 @@ def record(engine, code, stderr, kind=None):
         return
 
 
-def record_message(engine, kind, message):
+def record_message(engine, kind, message, max_lines=5):
     """Append makewand's own reason for a dispatch that started no model; ignore every error."""
     try:
-        lines = [line.strip() for line in str(message or "").splitlines() if line.strip()][-5:]
+        lines = [line.strip() for line in str(message or "").splitlines() if line.strip()][-max_lines:]
         lines = [redact(line[:4 * MAX_LINE_CHARS])[:MAX_LINE_CHARS] for line in lines]
         if not lines:
             return

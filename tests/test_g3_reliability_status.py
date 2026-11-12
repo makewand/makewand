@@ -141,14 +141,14 @@ class TestNeedsAuthHint(_IsolatedStatus):
 class TestAgyDispatchWriteBack(_IsolatedStatus):
     """runtime-state#3 / replay-0926-memory#17 / py-reliability#3."""
 
-    def _dispatch(self, stderr_text):
+    def _dispatch(self, stderr_text, stdout_text=""):
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
              patch("makewand.sandbox._agy_host_credits_disabled", return_value=True), \
              patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
              patch("makewand.sandbox.audit_unsafe_host_exec"), \
-             patch("makewand.providers.agy.run_subprocess", return_value=(1, "", stderr_text, None)) as run:
+             patch("makewand.providers.agy.run_subprocess", return_value=(1, stdout_text, stderr_text, None)) as run:
             # no bwrap: the read-only host run needs the recorded authorization (H1)
             result = execute_agy_task("审查这段代码", cwd=self._tmp.name, readonly=True)
             run.assert_called_once()
@@ -176,6 +176,39 @@ class TestAgyDispatchWriteBack(_IsolatedStatus):
         ok, _, _ = self._dispatch("Traceback: SyntaxError in generated file")
         self.assertFalse(ok)
         self.assertEqual(load_status_cache()["agy"]["status"], "unknown")
+
+    # agy 1.5.5 on 11-11: silent auth failed, then it waited 60 s for a login
+    # and exited before sending the prompt.
+    SIGN_IN_TIMEOUT = (
+        "I1111 07:41:10.100000       1 printmode.go:403] Print mode: not authenticated, trying silent auth\n"
+        "W1111 07:41:10.300000       1 auth.go:157] ChainedAuth: all sources failed (context deadline exceeded)\n"
+        "I1111 07:41:10.300100       1 printmode.go:415] Waiting for authentication (timeout 60s)...\n"
+        "error: authentication failed or timed out\n"
+    )
+
+    def test_sign_in_timeout_is_unverified_and_keeps_agy_usable(self):
+        from makewand import cli_failure_log
+        from makewand.workflow import is_startup_environment_failure
+        result = self._dispatch(self.SIGN_IN_TIMEOUT)
+        self.assertFalse(result[0])
+        self.assertEqual((result.status, result.error_kind, result.outcome_known), ("UNVERIFIED", "provider_auth", True))
+        self.assertIn("模型尚未启动", result.error)
+        self.assertFalse(is_startup_environment_failure(result))  # a review moves on to the next reviewer
+        self.assertEqual(load_status_cache()["agy"]["status"], "unknown")
+        entry = json.loads(cli_failure_log.log_path().read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(entry["kind"], "auth")
+        self.assertIn("ChainedAuth: all sources failed (context deadline exceeded)", entry["message_tail"])
+        self.assertIn("模型尚未启动", entry["message_tail"][-1])
+
+    def test_sign_in_timeout_after_an_answer_stays_unknown(self):
+        result = self._dispatch(self.SIGN_IN_TIMEOUT, stdout_text="partial review text\n")
+        self.assertEqual(result.status, "UNKNOWN")
+
+    def test_login_failure_reported_last_still_needs_auth(self):
+        # agy's final report decides: a catalogued login failure stays needs_auth.
+        ok, _, _ = self._dispatch(self.SIGN_IN_TIMEOUT + "Error: authentication required. Please sign in.\n")
+        self.assertFalse(ok)
+        self.assertEqual(load_status_cache()["agy"]["status"], "needs_auth")
 
     def test_version_probe_is_unverified_and_keeps_dispatch_failure(self):
         self._dispatch("Error: this service is not available in your country")
