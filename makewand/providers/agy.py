@@ -5,7 +5,7 @@ Antigravity CLI provider adapter (Google AI Pro / Gemini 3.8 Flash & Pro).
 import os
 import re
 from functools import lru_cache
-from typing import Tuple, Optional
+from typing import List, Tuple, Optional
 from makewand.config import c, COLOR_GREEN
 from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
 
@@ -130,6 +130,55 @@ def classify_agy_failure(output: str, stderr: Optional[str] = None) -> Optional[
         from makewand.health import get_reauth_hint
         return "needs_auth", f"Antigravity 认证失败 (真实派发) · {get_reauth_hint('agy')}", None
     return None
+
+
+# Lines of agy's sign-in it logs to stderr ("Print mode: silent auth failed",
+# "ChainedAuth: ..."): the only record of why it could not sign in.
+_AGY_SIGN_IN_LOG_RE = re.compile(r"auth", re.IGNORECASE)
+
+
+def _agy_sign_in_timed_out(stderr: Optional[str]) -> bool:
+    """agy gave up signing in, before it sent the prompt.
+
+    In print mode agy tries silent auth, then waits for a login ("Waiting for
+    authentication (timeout 60s)...") and ends with this message of its own:
+    the last line of stderr captured apart, once its glog entries, status lines
+    and notices are left out (catalog providers.agy.sign_in_failure).
+    """
+    from makewand.health import normalize_cli_line
+    own = [line for line in _agy_user_facing(stderr or "").splitlines() if line.strip()]
+    return bool(own) and _agy_catalog_match("sign_in_failure", normalize_cli_line(own[-1]))
+
+
+def _agy_sign_in_log(stderr: Optional[str]) -> List[str]:
+    """agy's sign-in lines in stderr captured apart, without glog headers."""
+    from makewand.health import GLOG_HEADER_RE, _ANSI_ESCAPE_RE
+    lines = []
+    for raw in (stderr or "").splitlines():
+        line = _ANSI_ESCAPE_RE.sub("", raw).strip()
+        header = GLOG_HEADER_RE.match(line)
+        if header:
+            line = line[header.end():].strip()
+        if line and _AGY_SIGN_IN_LOG_RE.search(line):
+            lines.append(line)
+    return lines
+
+
+def _agy_sign_in_failure(output: str, stderr: Optional[str], readonly: bool):
+    """A sign-in that failed or timed out: no model ran, and agy stays usable.
+
+    UNVERIFIED with a known outcome rather than UNKNOWN, so the caller may retry
+    or hand the task to another tool. Its own error_kind lets a review move on
+    to the next reviewer (startup_environment stops the ladder). The status
+    cache is left alone: on 11-11 such runs failed and passed within the hour.
+    """
+    from makewand import cli_failure_log
+    from makewand.execution_contract import ExecutionResult
+    reason = "Antigravity 登录失败或超时，模型尚未启动；可以稍后重试或改派其他工具"
+    cli_failure_log.record_message("agy", "auth", "\n".join(_agy_sign_in_log(stderr) + [reason]), max_lines=10)
+    return ExecutionResult(False, output, reason, status="UNVERIFIED", engine="agy", readonly=readonly,
+                           outcome_known=True, error_kind="provider_auth")
+
 
 def execute_agy_task(
     prompt: str,
@@ -337,6 +386,9 @@ def execute_agy_task(
             except Exception:
                 pass
             return False, combined, fail_reason
+        # Only with no answer at all, and the line on agy's own stream.
+        if apart and not (out or "").strip() and _agy_sign_in_timed_out(own_err):
+            return _agy_sign_in_failure(combined, own_err, readonly)
     if is_limited:
         # agy names no reset time; keep its own words to see whether one was printed and missed.
         from makewand import cli_failure_log

@@ -321,6 +321,9 @@
         "error ?: unknown (?:flag|shorthand flag): \\S+(?: in \\S+)?$",
         "error ?: unknown command \\\"[^\\\"]*\\\" for \\\"[^\\\"]*\\\"",
         "error ?: [\\w.-]+ has no \\\"[^\\\"]+\\\" effort"
+      ],
+      "sign_in_failure": [
+        "error ?: authentication failed or timed out\\.?$"
       ]
     },
     "gemini": {
