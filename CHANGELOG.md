@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 技能补充续审的依据（站主 11-13 定）：加次数之前，先用 `makewand outcome … review pass --candidate-verdict fail --request-id <ID> --candidate-hash <SHA256>` 记下上一轮，没有这条记录不续审。11-12 后有两个请求提高了上限却没有每轮验收记录，无法核对。代码没有改。
 - 技能里的审查轮数改为按收益决定，取消 11-06 定的“同一改动最多审 2 轮”（站主 11-12 定）。上一轮判 fail 且核实出新的实质缺陷，就修好后再审；判 pass、一轮没有核实出新的实质缺陷，或同一缺陷修过两次仍被指出时停。续审沿用同一请求 ID，用 `makewand budget request --set-limit` 每次只加下一轮需要的次数，不另开请求 ID。代码没有改。
 - agy 登录失败或超时（`error: authentication failed or timed out`，agy 1.5.5 起 11-11 出现 5 次）改记为未能验证（11），不再记成结果未知（17）。这时模型还没启动，调用方可以直接重试或改派，`makewand review` 会换下一个审查方；Agy 不会被标成需要重新登录。失败日志会留下 agy 的登录步骤（`kind: auth`）。这次调用仍计入请求的次数。
 - 工作目录经软链接到达（如 Agy 放在 `~/.gemini` 下的克隆）时，各工具改用真实路径启动。此前沙箱按真实路径挂载仓库，却按软链接的写法进入目录，模型启动不了，这次调用还计入请求的次数（11-09 到 11-10 出现 3 次）。
