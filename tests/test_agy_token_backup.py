@@ -25,6 +25,8 @@ except ImportError:
     from tests import test_fix_writeback_identity as vectors
     from tests import test_fix_writeback_r4 as r4
 
+import contextlib
+import fcntl
 import os
 import shlex
 import shutil
@@ -181,6 +183,83 @@ class TestBackupSource(unittest.TestCase):
             self.assertIn("makewand 保管的凭据副本", warnings[0])
             _finalize(h)
 
+    def test_backup_resolving_outside_home_is_not_used(self):
+        """A symlinked backup directory pointing where a sandbox's read-only root
+        shows it (outside HOME and the masked roots) is neither written nor read."""
+        outside = Path(tempfile.mkdtemp(prefix="agybackup-outside-"))
+        self.addCleanup(shutil.rmtree, outside, True)
+        with vectors.fake_home() as home:
+            host, backup = _paths(home)
+            backup.parent.parent.parent.mkdir(parents=True)
+            backup.parent.parent.symlink_to(outside)  # credential-backups -> outside
+            _write(outside / "agy" / "antigravity-oauth-token", OTHER_LOGIN)
+            _write(host, LOGIN)
+            h, cred, priv, warnings = _materialize(home)
+            self.assertEqual(cred.host_path, str(host))
+            self.assertEqual(priv.read_bytes(), LOGIN)
+            self.assertEqual((outside / "agy" / "antigravity-oauth-token").read_bytes(), OTHER_LOGIN)
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(str(outside), warnings[0])
+            _finalize(h)
+            host.unlink()
+            h, cred, priv, _warnings = _materialize(home)
+            self.assertEqual(cred.host_path, str(host))
+            self.assertFalse(os.path.lexists(priv))
+            _finalize(h)
+
+    def test_launch_copy_rereads_the_host_file_under_the_lock(self):
+        """A host login replaced while the launch waits for the backup lock is
+        what the backup gets, not the content read before the lock."""
+        with vectors.fake_home() as home:
+            host, backup = _paths(home)
+            _write(host, LOGIN)
+            real_lock = sandbox._credential_lock
+
+            @contextlib.contextmanager
+            def lock_while_host_changes(path):
+                _write(host, OTHER_LOGIN)
+                with real_lock(path) as locked:
+                    yield locked
+
+            with patch("makewand.sandbox._credential_lock", lock_while_host_changes):
+                h, _cred, priv, _warnings = _materialize(home)
+            self.assertEqual(priv.read_bytes(), LOGIN)
+            self.assertEqual(backup.read_bytes(), OTHER_LOGIN)
+            _finalize(h)
+
+    def test_busy_backup_lock_leaves_the_copy_to_its_holder(self):
+        with vectors.fake_home() as home:
+            host, backup = _paths(home)
+            _write(backup, OTHER_LOGIN)
+            _write(host, LOGIN)
+            fd = os.open(sandbox._credential_lock_path(str(backup)), os.O_RDWR | os.O_CREAT, 0o600)
+            self.addCleanup(os.close, fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with patch("makewand.sandbox._CRED_LOCK_WAIT", 0.2):
+                h, cred, priv, warnings = _materialize(home)
+            self.assertEqual(warnings, [])
+            self.assertEqual(cred.host_path, str(host))
+            self.assertEqual(priv.read_bytes(), LOGIN)
+            self.assertEqual(backup.read_bytes(), OTHER_LOGIN)
+            _finalize(h)
+
+    def test_backup_replaced_by_a_symlink_during_the_run_is_not_written_through(self):
+        with vectors.fake_home() as home:
+            _host, backup = _paths(home)
+            _write(backup, LOGIN)
+            h, cred, priv, _warnings = _materialize(home)
+            self.assertTrue(cred.backup)
+            target = home / "elsewhere"
+            _write(target, LOGIN)  # same content as the launch snapshot
+            backup.unlink()
+            backup.symlink_to(target)
+            priv.write_bytes(REFRESHED)
+            warnings = _finalize(h)
+            self.assertEqual(target.read_bytes(), LOGIN)
+            self.assertTrue(backup.is_symlink())
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn("符号链接", warnings[0])
+
     def test_only_agy_keeps_backups(self):
         kept = {name: list(p.get("credential_backups", {})) for name, p in sandbox.PROVIDER_PROFILES.items()
                 if p.get("credential_backups")}
@@ -206,6 +285,37 @@ class TestBackupMask(unittest.TestCase):
                     bind = max(i for i, a in enumerate(cmd[:-2])
                                if a in ("--bind", "--ro-bind") and cmd[i + 2] == str(ws))
                     self.assertGreater(mask, bind, cmd)
+
+    def test_backups_not_made_yet_are_created_and_masked(self):
+        """A copy this launch or another one makes after the mounts are planned
+        must land under the mask."""
+        with vectors.fake_home() as home:
+            (home / ".config").mkdir()
+            backups = home / sandbox.CREDENTIAL_BACKUP_DIR
+            cmd = self._cmd(home / ".config")
+            self.assertIn(str(backups), _tmpfs(cmd), cmd)
+            self.assertTrue(backups.is_dir())
+            for d in (backups, backups.parent):
+                self.assertEqual(stat.S_IMODE(d.stat().st_mode) & 0o077, 0, d)
+
+    def test_symlinked_workspace_masks_the_backups_where_it_shows_them(self):
+        with vectors.fake_home() as home:
+            _host, backup = _paths(home)
+            _write(backup, LOGIN)
+            link = home / "cfg-link"
+            link.symlink_to(home / ".config")
+            cmd = self._cmd(link)
+            self.assertIn(str(link / "makewand" / "credential-backups"), _tmpfs(cmd), cmd)
+
+    def test_workspace_inside_the_backups_is_refused(self):
+        with vectors.fake_home() as home:
+            _host, backup = _paths(home)
+            _write(backup, LOGIN)
+            link = home / "agy-link"
+            link.symlink_to(backup.parent)
+            for ws in (backup.parent, backup.parent.parent, link):
+                with self.subTest(ws=str(ws)), self.assertRaises(sandbox.SandboxConfigError):
+                    self._cmd(ws)
 
     def test_workspace_elsewhere_adds_no_mask(self):
         with vectors.fake_home() as home:
