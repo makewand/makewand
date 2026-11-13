@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- makewand 自己保管一份 agy 的文件令牌（`~/.config/makewand/credential-backups/agy/antigravity-oauth-token`），宿主文件被删掉时改用它。agy 1.5.5 起把登录存在桌面密钥环里，沙箱连不到，只能读文件令牌；宿主上的 agy 每次刷新密钥环登录都会删掉这个文件（11-13 用 strace 看到），之后经 makewand 派给 agy 的调用全部卡在登录，等满 60 秒失败，还扣次数（11-11 22:18 起 6 次全失败）。现在每次启动时宿主文件和副本不同就复制过去，宿主文件不在就拷入副本，刷新后的令牌写回副本，写回规则不变。副本在所有沙箱里都看不到。在宿主退出 agy 登录不会删掉它，要停用就删这个文件。
 - 技能补充续审的依据（站主 11-13 定）：加次数之前，先用 `makewand outcome … review pass --candidate-verdict fail --request-id <ID> --candidate-hash <SHA256>` 记下上一轮，没有这条记录不续审。11-12 后有两个请求提高了上限却没有每轮验收记录，无法核对。代码没有改。
 - 技能里的审查轮数改为按收益决定，取消 11-06 定的“同一改动最多审 2 轮”（站主 11-12 定）。上一轮判 fail 且核实出新的实质缺陷，就修好后再审；判 pass、一轮没有核实出新的实质缺陷，或同一缺陷修过两次仍被指出时停。续审沿用同一请求 ID，用 `makewand budget request --set-limit` 每次只加下一轮需要的次数，不另开请求 ID。代码没有改。
 - agy 登录失败或超时（`error: authentication failed or timed out`，agy 1.5.5 起 11-11 出现 5 次）改记为未能验证（11），不再记成结果未知（17）。这时模型还没启动，调用方可以直接重试或改派，`makewand review` 会换下一个审查方；Agy 不会被标成需要重新登录。失败日志会留下 agy 的登录步骤（`kind: auth`）。这次调用仍计入请求的次数。

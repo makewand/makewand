@@ -195,6 +195,11 @@ SAFE_HOME_BIN_DIRS = [
 #                  refresh, see _credential_writeback_merge and
 #                  _atomic_write_host)
 #   "seed"         harmless caches/ids the CLI expects; never written back
+#   "credential_backups"  {(root, relative path): backup path} for credentials
+#                  the provider CLI deletes on the host while still logged in:
+#                  makewand keeps its own copy below CREDENTIAL_BACKUP_DIR and
+#                  uses it while the host file is gone
+#                  (ProviderHome._credential_source)
 # A root missing on the host that holds credential files gets an empty private
 # directory at its path inside the sandbox (nothing is created on the host), so
 # a login made in the sandbox is reported after the run instead of vanishing;
@@ -268,6 +273,13 @@ PROVIDER_PROFILES: Dict[str, dict] = {
             (".gemini", "google_accounts.json"),
             (".gemini", "antigravity-cli/antigravity-oauth-token"),
         ],
+        # agy >= 1.5.5 keeps its login in the desktop keyring (Secret Service
+        # over D-Bus), which the sandbox cannot reach; there agy reads this
+        # file token instead. A host agy run that refreshes the keyring login
+        # deletes the file, so makewand keeps its own copy.
+        "credential_backups": {
+            (".gemini", "antigravity-cli/antigravity-oauth-token"): "agy/antigravity-oauth-token",
+        },
         "seed": [
             # A browser cookie jar (a JSON array of name/value/domain/path/
             # expires/... cookies): its values are opaque session cookies that
@@ -1052,6 +1064,12 @@ def _mask_mount_args(path: str) -> List[str]:
 
 PRIVATE_HOME_SUBDIR = os.path.join("makewand", "provider-homes")
 CREDENTIAL_MAX_BYTES = 4 * 1024 * 1024
+
+# makewand's own credential copies (PROVIDER_PROFILES "credential_backups"),
+# relative to HOME: hidden in every sandbox by the HOME tmpfs and the
+# .config/makewand entry of SENSITIVE_HOME_DIRS, and masked explicitly where a
+# workspace or repo_root mount below HOME contains them.
+CREDENTIAL_BACKUP_DIR = ".config/makewand/credential-backups"
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -1291,6 +1309,49 @@ def _atomic_write_host(path: str, data: bytes, mode: int, expect: tuple) -> str:
             except OSError:
                 pass
     return status
+
+
+def _store_credential_backup(path: str, data: bytes) -> None:
+    """
+    Makes makewand's backup copy at path (credential_backups) hold data when it
+    differs: written 0600 into 0700 directories, synced, and renamed into place
+    under the credential lock (_credential_lock), replacing a symlink rather
+    than following it. When another makewand process holds the lock the copy is
+    left to that writer. A failure is reported and never stops the launch,
+    which still reads the host file.
+    """
+    current = _read_host_state(path)
+    if current is not None and current[0] == data:
+        return
+    tmp = None
+    try:
+        parent = os.path.dirname(path)
+        # makedirs applies its mode to the last directory only.
+        missing = []
+        d = parent
+        while not os.path.isdir(d):
+            missing.append(d)
+            d = os.path.dirname(d)
+        for d in reversed(missing):
+            os.mkdir(d, 0o700)
+        fd, tmp = tempfile.mkstemp(prefix=".makewand-wb-", dir=parent)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        with _credential_lock(path) as locked:
+            if locked:
+                os.replace(tmp, path)
+                tmp = None
+    except OSError as exc:
+        _warn(f"无法更新 makewand 保管的凭据副本 {path}: {exc}")
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _digest(data: Optional[bytes]) -> Optional[str]:
@@ -2023,6 +2084,26 @@ class ProviderHome:
             raise SandboxConfigError(f"无法复制 provider 凭据到私有目录 ({exc})，拒绝启动 (fail closed)") from exc
         return found
 
+    def _credential_source(self, host_p: str, backup_rel: Optional[str]) -> str:
+        """
+        The file a credential is copied in from and written back to: the host
+        file, unless the profile keeps a backup of it (credential_backups). Then
+        a host file present at launch stays the source and is first copied into
+        the backup; while the host file is gone, the backup (a regular file, no
+        symlink) is the source, so the run reads and refreshes makewand's copy.
+        """
+        if not backup_rel:
+            return host_p
+        backup = os.path.join(self.user_home, CREDENTIAL_BACKUP_DIR, backup_rel)
+        if os.path.lexists(host_p):
+            found = _read_host_regular(host_p)
+            if found is not None:
+                _store_credential_backup(backup, found[0])
+            return host_p
+        if _read_host_state(backup) is not None:
+            return backup
+        return host_p
+
     def _private_root(self, idx: int) -> str:
         priv = os.path.join(self._ensure_private_dir(), f"root{idx}")
         try:
@@ -2108,6 +2189,9 @@ class ProviderHome:
                     if e_root != root_rel:
                         continue
                     host_p = os.path.join(real, rel)
+                    if kind == "credentials":
+                        host_p = self._credential_source(
+                            host_p, profile.get("credential_backups", {}).get((e_root, rel)))
                     found = self._copy_in(host_p, priv, rel)
                     if kind == "credentials":
                         self.credentials.append(_CredentialCopy(
@@ -2753,6 +2837,15 @@ def wrap_bwrap(
                             bwrap_cmd.extend(_mask_mount_args(sp))
         except OSError:
             pass
+    else:
+        # makewand's credential backups also stay hidden from a mount below
+        # HOME that contains them (e.g. a workspace at ~/.config), under the
+        # spelled and the resolved path alike.
+        backups = os.path.join(user_home, CREDENTIAL_BACKUP_DIR)
+        if os.path.lexists(backups):
+            for b in dict.fromkeys((backups, os.path.realpath(backups))):
+                if any(_is_within(b, p) for p in (mount_root, ws, repo_abs) if p and p != "/"):
+                    bwrap_cmd.extend(_mask_mount_args(b))
 
     # Active provider's state directory (after the workspace so it always wins)
     provider_scan_roots: List[str] = []
