@@ -1320,16 +1320,29 @@ def _make_private_dirs(path: str) -> None:
         missing.append(d)
         d = os.path.dirname(d)
     for d in reversed(missing):
-        os.mkdir(d, 0o700)
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(d):  # a concurrent launch made the directory
+                raise
 
 
 def _credential_backup_path(user_home: str, backup_rel: str) -> Optional[str]:
     """
-    Path of makewand's backup copy (credential_backups), or None when its
-    directory resolves outside HOME and the masked host roots: a sandbox's
-    read-only root would show it there (reported).
+    Path of makewand's backup copy (credential_backups), or None (reported)
+    when a sandbox could see it: a directory makewand makes below HOME/
+    CREDENTIAL_BACKUP_DIR is a symlink or no directory (wrap_bwrap masks that
+    directory by its own path only), or the directory resolves outside HOME and
+    the masked host roots, where a sandbox's read-only root shows it.
     """
-    path = os.path.join(user_home, CREDENTIAL_BACKUP_DIR, backup_rel)
+    root = os.path.join(user_home, CREDENTIAL_BACKUP_DIR)
+    path = os.path.join(root, backup_rel)
+    d = root
+    for part in [""] + os.path.dirname(backup_rel).split("/"):
+        d = os.path.join(d, part) if part else d
+        if os.path.islink(d) or (os.path.lexists(d) and not os.path.isdir(d)):
+            _warn(f"makewand 保管的凭据副本目录 {d} 是符号链接或不是目录，沙箱可能看得到，不使用这份副本")
+            return None
     real_parent = os.path.realpath(os.path.dirname(path))
     if not _hidden_on_host_view(real_parent, user_home, _effective_masked_roots()):
         _warn(f"makewand 保管的凭据副本目录 {os.path.dirname(path)} 实际位于 {real_parent}，沙箱可能看得到，不使用这份副本")
@@ -1344,8 +1357,7 @@ def _mirror_credential_backup(host_p: str, backup: str) -> None:
     lock, which write-backs to the backup take as well, so racing launches leave
     the host's current content. The copy is written 0600 into 0700 directories,
     synced and renamed into place (a symlink there is replaced, not followed).
-    A busy lock leaves the copy to its holder; a failure is reported and never
-    stops the launch.
+    A busy lock or a failure is reported and never stops the launch.
     """
     tmp = None
     try:
@@ -1353,6 +1365,7 @@ def _mirror_credential_backup(host_p: str, backup: str) -> None:
         _make_private_dirs(parent)
         with _credential_lock(backup) as locked:
             if not locked:
+                _warn(f"makewand 保管的凭据副本 {backup} 正由另一个 makewand 进程写入（等待锁超时），这次没有从宿主文件更新")
                 return
             found = _read_host_regular(host_p)
             current = _read_host_state(backup)
@@ -2176,9 +2189,16 @@ class ProviderHome:
             # tmpfs at the bin path (nothing exists on the host to seed it).
             args.extend(["--tmpfs", os.path.join(root_path, AGY_BIN_REL)])
         minted = profile.get("minted_keys", {})
+        backups = profile.get("credential_backups", {})
         for rel in rels:
-            self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=os.path.join(root_path, rel),
-                                                    initial_digest=None, minted=tuple(minted.get((root_rel, rel), ()))))
+            # makewand's backup of a credential (credential_backups) stands in
+            # for the missing host file here too.
+            host_p, found, is_backup = self._credential_source(
+                os.path.join(root_path, rel), None, priv, rel, backups.get((root_rel, rel)))
+            self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=host_p,
+                                                    initial_digest=_digest(found[0]) if found else None,
+                                                    mode=found[1] if found else 0o600,
+                                                    minted=tuple(minted.get((root_rel, rel), ())), backup=is_backup))
 
     def _build(self, profile: dict, project_paths: Sequence[str],
                absent_root_ok: Optional[Callable[[str], bool]] = None) -> None:

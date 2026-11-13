@@ -184,20 +184,22 @@ class TestBackupSource(unittest.TestCase):
             _finalize(h)
 
     def test_backup_resolving_outside_home_is_not_used(self):
-        """A symlinked backup directory pointing where a sandbox's read-only root
-        shows it (outside HOME and the masked roots) is neither written nor read."""
+        """A symlinked ~/.config/makewand pointing where a sandbox's read-only
+        root shows the copy (outside HOME and the masked roots): the copy is
+        neither written nor read."""
         outside = Path(tempfile.mkdtemp(prefix="agybackup-outside-"))
         self.addCleanup(shutil.rmtree, outside, True)
         with vectors.fake_home() as home:
             host, backup = _paths(home)
-            backup.parent.parent.parent.mkdir(parents=True)
-            backup.parent.parent.symlink_to(outside)  # credential-backups -> outside
-            _write(outside / "agy" / "antigravity-oauth-token", OTHER_LOGIN)
+            (home / ".config").mkdir()
+            (home / ".config" / "makewand").symlink_to(outside)
+            outside_copy = outside / "credential-backups" / "agy" / "antigravity-oauth-token"
+            _write(outside_copy, OTHER_LOGIN)
             _write(host, LOGIN)
             h, cred, priv, warnings = _materialize(home)
             self.assertEqual(cred.host_path, str(host))
             self.assertEqual(priv.read_bytes(), LOGIN)
-            self.assertEqual((outside / "agy" / "antigravity-oauth-token").read_bytes(), OTHER_LOGIN)
+            self.assertEqual(outside_copy.read_bytes(), OTHER_LOGIN)
             self.assertEqual(len(warnings), 1, warnings)
             self.assertIn(str(outside), warnings[0])
             _finalize(h)
@@ -237,11 +239,69 @@ class TestBackupSource(unittest.TestCase):
             fcntl.flock(fd, fcntl.LOCK_EX)
             with patch("makewand.sandbox._CRED_LOCK_WAIT", 0.2):
                 h, cred, priv, warnings = _materialize(home)
-            self.assertEqual(warnings, [])
             self.assertEqual(cred.host_path, str(host))
             self.assertEqual(priv.read_bytes(), LOGIN)
             self.assertEqual(backup.read_bytes(), OTHER_LOGIN)
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn(str(backup), warnings[0])
             _finalize(h)
+
+    def test_symlinked_backup_directory_is_not_used(self):
+        """credential-backups or its agy directory linked into HOME (a later
+        workspace) would put the copy where the mask does not reach."""
+        for depth in (1, 2):
+            with self.subTest(depth=depth), vectors.fake_home() as home:
+                host, backup = _paths(home)
+                link = backup.parent if depth == 1 else backup.parent.parent
+                project = home / "project"
+                (project / "agy").mkdir(parents=True)
+                link.parent.mkdir(parents=True)
+                link.symlink_to(project)
+                _write(host, LOGIN)
+                h, cred, priv, warnings = _materialize(home)
+                self.assertEqual(cred.host_path, str(host))
+                self.assertEqual(priv.read_bytes(), LOGIN)
+                self.assertEqual([p.name for p in project.rglob("antigravity-oauth-token")], [])
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn("符号链接", warnings[0])
+                _finalize(h)
+
+    def test_backup_stands_in_when_the_whole_provider_root_is_missing(self):
+        with vectors.fake_home() as home:
+            host, backup = _paths(home)
+            _write(backup, LOGIN)
+            h = ProviderHome("agy", str(home))
+            with patch("makewand.sandbox._warn") as warn:
+                h.materialize([])
+            self.assertEqual(warn.call_args_list, [])
+            cred = next(c for c in h.credentials if c.rel == REL)
+            priv = Path(cred.private_root, REL)
+            self.assertTrue(cred.backup)
+            self.assertEqual(cred.host_path, str(backup))
+            self.assertEqual(priv.read_bytes(), LOGIN)
+            priv.write_bytes(REFRESHED)
+            self.assertEqual(_finalize(h), [])
+            self.assertEqual(backup.read_bytes(), REFRESHED)
+            self.assertFalse(os.path.lexists(home / ".gemini"))
+
+    def test_concurrently_made_backup_directory_is_accepted(self):
+        with vectors.fake_home() as home:
+            target = home / sandbox.CREDENTIAL_BACKUP_DIR / "agy"
+            target.mkdir(parents=True)
+            real_isdir = os.path.isdir
+            seen = []
+
+            def isdir_racing(path):
+                # The first check misses the directory another launch is making.
+                if str(path) == str(target) and not seen:
+                    seen.append(path)
+                    return False
+                return real_isdir(path)
+
+            with patch("makewand.sandbox.os.path.isdir", isdir_racing):
+                sandbox._make_private_dirs(str(target))
+            self.assertTrue(seen)
+            self.assertTrue(target.is_dir())
 
     def test_backup_replaced_by_a_symlink_during_the_run_is_not_written_through(self):
         with vectors.fake_home() as home:
