@@ -34,7 +34,7 @@ makewand route review normal --self <你> --not <实现方> --request-id <ID> --
 
 带请求 ID 时，route 输出保留同一 ID、发起工具和请求**总上限**，不是每条命令各一份上限。默认单任务输出中的 `--max-model-calls 1` 不能另建 ID 来绕过总预算。旧版没有 `--request-id` 时，用每条命令显式传同一个 `MAKEWAND_TASK_ID` 和同一总上限；不能依赖一次 shell 的 export 跨工具调用持久化。
 
-`makewand budget request --request-id <ID> --json` 查看已用计数。用户明确扩大额度后，或按上面的规则续审时，才可用 `makewand budget request --request-id <ID> --set-limit <N> --max-model-calls <N>` 调整原上限；续审每次只加下一轮需要的次数（通常 1 次）。之后的 route 和派发命令都带新总额 `--max-model-calls <N>`，带旧总额会把上限压回去；保留 ID 和已用计数，不退款、不另建请求，也不为续审另开请求 ID。
+`makewand budget request --request-id <ID> --json` 查看已用计数。用户明确扩大额度后，或按上面的规则续审时，才可用 `makewand budget request --request-id <ID> --set-limit <N> --max-model-calls <N>` 调整原上限；续审每次只加下一轮需要的次数（通常 1 次）。加之前先用 `makewand outcome <审查方> <档> review pass --candidate-verdict fail --request-id <ID> --candidate-hash <SHA256>`（另带 `--model`、`--effort` 和实测 `--seconds`/`--calls`）记下上一轮：审查工作记 pass 表示你核实了它找到的缺陷，候选记 fail；没有这条记录不续审。之后的 route 和派发命令都带新总额 `--max-model-calls <N>`，带旧总额会把上限压回去；保留 ID 和已用计数，不退款、不另建请求，也不为续审另开请求 ID。
 
 始终指定 `--cwd`；照抄 route 的 timeout/total-timeout，审查保持 readonly。review/test/research/doc 三档为 900/1800/5400 秒，implement 为 1200/3600/10800 秒。只给 total-timeout 时单次跟随；都不给时默认 300 秒（ensemble 900）。后台等待完成，不重复派同一任务。同一仓库只跑一个写任务；同一账号并发 1 时，额外审查只会排队。
 
