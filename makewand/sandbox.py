@@ -1330,22 +1330,23 @@ def _make_private_dirs(path: str) -> None:
 def _credential_backup_path(user_home: str, backup_rel: str) -> Optional[str]:
     """
     Path of makewand's backup copy (credential_backups), or None (reported)
-    when a sandbox could see it: a directory makewand makes below HOME/
-    CREDENTIAL_BACKUP_DIR is a symlink or no directory (wrap_bwrap masks that
-    directory by its own path only), or the directory resolves outside HOME and
-    the masked host roots, where a sandbox's read-only root shows it.
+    when a sandbox could see it. No directory on its path below HOME may be a
+    symlink, so the copy sits exactly at HOME/CREDENTIAL_BACKUP_DIR, which no
+    toolchain bind contains and which wrap_bwrap masks wherever a mount shows
+    it; a symlink there could move it into a workspace or a directory every
+    sandbox mounts (~/.local/bin). It must also be hidden by the HOME tmpfs or
+    a masked host root, where a sandbox's read-only root does not show it.
     """
-    root = os.path.join(user_home, CREDENTIAL_BACKUP_DIR)
-    path = os.path.join(root, backup_rel)
-    d = root
-    for part in [""] + os.path.dirname(backup_rel).split("/"):
-        d = os.path.join(d, part) if part else d
-        if os.path.islink(d) or (os.path.lexists(d) and not os.path.isdir(d)):
-            _warn(f"makewand 保管的凭据副本目录 {d} 是符号链接或不是目录，沙箱可能看得到，不使用这份副本")
-            return None
-    real_parent = os.path.realpath(os.path.dirname(path))
+    path = os.path.join(user_home, CREDENTIAL_BACKUP_DIR, backup_rel)
+    parent = os.path.dirname(path)
+    real_parent = os.path.realpath(parent)
+    expected = os.path.normpath(os.path.join(os.path.realpath(user_home), CREDENTIAL_BACKUP_DIR,
+                                             os.path.dirname(backup_rel)))
+    if real_parent != expected:
+        _warn(f"makewand 保管的凭据副本目录 {parent} 的路径上有符号链接（实际位于 {real_parent}），沙箱可能看得到，不使用这份副本")
+        return None
     if not _hidden_on_host_view(real_parent, user_home, _effective_masked_roots()):
-        _warn(f"makewand 保管的凭据副本目录 {os.path.dirname(path)} 实际位于 {real_parent}，沙箱可能看得到，不使用这份副本")
+        _warn(f"makewand 保管的凭据副本目录 {parent} 实际位于 {real_parent}，沙箱可能看得到，不使用这份副本")
         return None
     return path
 

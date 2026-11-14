@@ -266,6 +266,24 @@ class TestBackupSource(unittest.TestCase):
                 self.assertIn("符号链接", warnings[0])
                 _finalize(h)
 
+    def test_symlinked_ancestor_inside_home_is_not_used(self):
+        """~/.config/makewand linked into ~/.local/bin, which every sandbox
+        mounts read-only, would put the copy where the sandboxes see it."""
+        with vectors.fake_home() as home:
+            host, _backup = _paths(home)
+            state = home / ".local" / "bin" / "makewand-state"
+            state.mkdir(parents=True)
+            (home / ".config").mkdir()
+            (home / ".config" / "makewand").symlink_to(state)
+            _write(host, LOGIN)
+            h, cred, priv, warnings = _materialize(home)
+            self.assertEqual(cred.host_path, str(host))
+            self.assertEqual(priv.read_bytes(), LOGIN)
+            self.assertEqual(list(state.rglob("antigravity-oauth-token")), [])
+            self.assertEqual(len(warnings), 1, warnings)
+            self.assertIn("符号链接", warnings[0])
+            _finalize(h)
+
     def test_backup_stands_in_when_the_whole_provider_root_is_missing(self):
         with vectors.fake_home() as home:
             host, backup = _paths(home)
