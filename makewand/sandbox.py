@@ -2879,28 +2879,33 @@ def wrap_bwrap(
         readonly_masks.append(mdir)
 
     # makewand's credential backups (CREDENTIAL_BACKUP_DIR) must stay hidden
-    # from every mount, spelled and resolved: a mount inside them is refused;
-    # where a mount contains them the directory is created first, so a copy
-    # this launch or another one makes later stays under the mask below.
+    # from every bind made so far below the host root (workspace, repo_root,
+    # extra binds, toolchain and Python environment re-binds, ...), spelled and
+    # resolved: a bind inside them is refused; where a bind shows them the
+    # directory is created first, so a copy this launch or another one makes
+    # later stays under the mask below. The provider mounts that follow never
+    # contain HOME/.config/makewand.
     backups = os.path.join(user_home, CREDENTIAL_BACKUP_DIR)
+    bind_ops = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try", "--dev-bind", "--dev-bind-try")
 
     def _backup_masks() -> List[str]:
-        """Where each mount shows the backups inside the sandbox."""
+        """Where each bind made so far shows the backups inside the sandbox."""
         real = os.path.realpath(backups)
         found: List[str] = []
-        for p in (mount_root, ws, repo_abs, *(extra_ro_binds or [])):
-            if not p or _norm(p) == "/":
+        for i in range(len(bwrap_cmd) - 2):
+            if bwrap_cmd[i] not in bind_ops:
                 continue
-            p = _norm(p)
-            p_real = os.path.realpath(p)
-            if any(_is_within(q, b) for q in (p, p_real) for b in (backups, real)):
+            src, dest = bwrap_cmd[i + 1], _norm(bwrap_cmd[i + 2])
+            if dest == "/":
+                continue
+            src_real = os.path.realpath(src)
+            if any(_is_within(q, b) for q in (dest, src_real) for b in (backups, real)):
                 raise SandboxConfigError(
-                    f"工作目录或挂载路径 {p} 位于 makewand 保管凭据副本的目录 {backups} 内，拒绝构建沙箱 (fail closed)")
-            for b in (backups, real):
-                if _is_within(b, p):
-                    found.append(b)
-            if _is_within(real, p_real):
-                found.append(_norm(os.path.join(p, os.path.relpath(real, p_real))))
+                    f"挂载路径 {dest} 位于 makewand 保管凭据副本的目录 {backups} 内，拒绝构建沙箱 (fail closed)")
+            if _is_within(backups, dest):
+                found.append(backups)
+            if _is_within(real, src_real):
+                found.append(_norm(os.path.join(dest, os.path.relpath(real, src_real))))
         return list(dict.fromkeys(found))
 
     backup_masks = _backup_masks()

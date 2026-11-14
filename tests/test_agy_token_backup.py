@@ -395,6 +395,21 @@ class TestBackupMask(unittest.TestCase):
                 with self.subTest(ws=str(ws)), self.assertRaises(sandbox.SandboxConfigError):
                     self._cmd(ws)
 
+    def test_python_environment_rebind_containing_the_backups_masks_them(self):
+        """makewand's Python environment at ~/.config/makewand is re-bound into
+        every sandbox; the backups below it must still be masked."""
+        with vectors.fake_home() as home:
+            _host, backup = _paths(home)
+            _write(backup, LOGIN)
+            (home / ".config" / "makewand" / "bin").mkdir(parents=True, exist_ok=True)
+            ws = home / "project"
+            ws.mkdir()
+            with patch("makewand.sandbox.sys.executable", str(home / ".config" / "makewand" / "bin" / "python")):
+                cmd = self._cmd(ws)
+            env_root = str(home / ".config" / "makewand")
+            self.assertIn(("--ro-bind", env_root, env_root), list(zip(cmd, cmd[1:], cmd[2:])), cmd)
+            self.assertIn(str(home / sandbox.CREDENTIAL_BACKUP_DIR), _tmpfs(cmd), cmd)
+
     def test_workspace_elsewhere_adds_no_mask(self):
         with vectors.fake_home() as home:
             _host, backup = _paths(home)
