@@ -297,8 +297,11 @@ class TestLoginWithoutHostRoot(unittest.TestCase):
             # A read-only review of HOME itself shows HOME read-only.
             cmd = self._wrap(home, "claude", home, readonly=True)
             self.assertNotIn(str(home / ".claude"), [dst for _, dst in _binds(cmd)])
-            # A read-only bind of ~/.config covers ~/.config/muse.
-            (home / ".config").mkdir()
+            # A read-only bind of ~/.config covers ~/.config/muse. (The review of
+            # HOME above already made makewand's own credential backup directory
+            # below ~/.config, so it could be masked.)
+            self.assertTrue((home / sandbox.CREDENTIAL_BACKUP_DIR).is_dir())
+            (home / ".config").mkdir(exist_ok=True)
             ws = _workspace(self)
             self.assertIn(str(home / ".config/muse"), [dst for _, dst in _binds(self._wrap(home, "muse", ws))])
             cmd = self._wrap(home, "muse", ws, extra_ro_binds=[str(home / ".config")])
