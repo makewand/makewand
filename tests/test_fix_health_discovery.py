@@ -329,6 +329,22 @@ class TestAgyModelCacheRefresh(_TempHome):
         self.assertEqual(cache.read_text(encoding="utf-8"), before)
         self.assertFalse(self.marker.exists())
 
+    def test_route_offers_only_agy_ids_that_agy_lists(self):
+        # agy 1.5.8 lists the orchestrator models without a reasoning suffix; route
+        # used to offer gemini-pro-orchestrator-high, which agy rejects.
+        listed = ["gemini-4-argon-medium", "gemini-4-argon-high", "gpt-oss-120b-medium",
+                  "gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"]
+        self.write(self.CACHE, {"updated_at": time.time(),
+                                "models": [{"id": slug, "description": slug} for slug in listed]})
+        with patch("shutil.which", return_value="/usr/local/bin/agy"), \
+             patch("subprocess.run") as run:
+            found = discovery.discover_model_efforts()
+        run.assert_not_called()
+        self.assertEqual(sorted(found["agy"]), ["gemini-4-argon-high", "gemini-4-argon-medium", "gpt-oss-120b-medium"])
+        from makewand.routing_catalog import build_full_catalog
+        offered = {item.model for rows in build_full_catalog(found).values() for item in rows if item.provider == "agy"}
+        self.assertEqual(offered, {"gemini-4-argon-medium", "gemini-4-argon-high", "gpt-oss-120b-medium"})
+
 
 @unittest.skipIf(os.name == "nt", "uses a POSIX shell script as the fake agy")
 class TestAgyModelCacheConcurrentRefresh(unittest.TestCase):

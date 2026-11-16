@@ -1249,10 +1249,11 @@ def _agy_effort_map() -> Dict[str, List[str]]:
         if not _valid_model_id(slug):
             continue
         _base, suffix = _split_agy_suffix(slug)
+        # agy lists a model without a suffix when it has no reasoning-depth
+        # variants (gemini-pro-orchestrator). The catalog would append one and
+        # route would offer a name agy rejects, so only suffixed ids are listed.
         if suffix:
             found[str(slug)] = [suffix]
-        elif slug not in found:
-            found[str(slug)] = []
     return found
 
 
