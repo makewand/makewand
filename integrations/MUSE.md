@@ -1,9 +1,5 @@
 # Muse Code 接入指南
 
-Muse Code 是 Meta 生态的终端编码助手，支持 OS 沙箱隔离与 Meta 开源大模型。
+使用 `muse login` 配置订阅。在 Muse 中发起协作时，遵循 [makewand-orchestrator skill](../skills/makewand-orchestrator/SKILL.md)。
 
-## 在 Muse Code 中使用 Makewand
-1. **凭据配置**：
-   运行 `muse login` 完成 OAuth 授权，或者在 `~/.config/muse/env` 中配置 `export META_API_KEY="..."`。
-2. **在 Muse 中调用 Makewand**：
-   使用 Bash 运行 `makewand status`、`makewand route` 或 `makewand review` 即可与 Antigravity、Claude、Codex 联合协作。
+独立审查从 `makewand route review normal --self muse --not <实现方>` 开始，高风险使用 `hard --risk high`。沿用同一请求 ID、`--caller muse` 和请求总上限。收到订阅额度拒绝时按已知时间标记。被 makewand 派发的 Muse 直接完成子任务。

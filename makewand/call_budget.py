@@ -216,7 +216,13 @@ def _save(path, data):
 def reserve(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=None,
             stage="provider", account_ref=None, api_policy="subscription_only",
             budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False,
-            wait_for_capacity=True, working_directory=None):
+            wait_for_capacity=True, working_directory=None, caller=None, retry_approved=False):
+    if caller is not None:
+        from makewand.outcome_ledger import CALLERS
+        if not isinstance(caller, str) or caller not in CALLERS:
+            raise BudgetConfigError("invalid caller metadata")
+    if type(retry_approved) is not bool:
+        raise BudgetConfigError("invalid retry approval metadata")
     deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
     capacity_policy = shared_capacity.policy()
     ticket_id = uuid.uuid4().hex
@@ -236,7 +242,7 @@ def reserve(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=
             stage=stage, account_ref=account_ref, api_policy=api_policy, budget_file=budget_file,
             max_model_calls=max_model_calls, deadline_monotonic=deadline_monotonic, pending=pending,
             capacity_policy=capacity_policy, ticket_id=ticket_id, wait_until=wait_until, scope=scope,
-            working_directory=working_directory)
+            working_directory=working_directory, caller=caller, retry_approved=retry_approved)
     except (ConcurrencyBusyError, BudgetDeadlineError) as error:
         refusal = error
         raise
@@ -311,7 +317,7 @@ def _check_admission_cancelled():
 def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, task_id=None,
             stage="provider", account_ref=None, api_policy="subscription_only",
             budget_file=None, max_model_calls=None, deadline_monotonic=None, pending=False,
-            capacity_gate=None, capacity_policy=None):
+            capacity_gate=None, capacity_policy=None, caller=None, retry_approved=False):
     attempt, ledger_path, write_attempted = None, None, False
     try:
         deadline_monotonic = _admission_deadline() if deadline_monotonic is None else deadline_monotonic
@@ -362,6 +368,10 @@ def _reserve_once(engine, tier, model=None, readonly=False, *, lease_id=None, ta
                                      "account_ref": account_ref, "api_policy": api_policy,
                                      "result_status": None, "outcome_known": None,
                                      "tokens": None, "monetary_cost": None})
+            if caller is not None:
+                data["attempts"][-1]["caller"] = caller
+            if retry_approved:
+                data["attempts"][-1]["retry_approved_by_caller"] = True
             if capacity_gate is not None:
                 data["attempts"][-1].update(capacity_project=capacity_gate.ticket["project"],
                                             capacity_label=capacity_gate.ticket["label"])

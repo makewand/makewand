@@ -61,6 +61,26 @@ class RoutingCliTests(unittest.TestCase):
             self.assertIn("--caller codex", candidate["command"])
             self.assertIn("--max-model-calls 5", candidate["command"])
 
+    def test_untrusted_repo_survives_candidates_and_escalation(self):
+        import shlex
+        result = self.run_cli("route", "review", "normal", "--tier", "1", "--simple",
+                              "--repo-trust", "untrusted", quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        hint = next(line.split("：", 1)[1] for line in result.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        self.assertIn("--repo-trust untrusted", hint)
+        for line in result.stdout.splitlines():
+            if " -C <目录>" in line:
+                self.assertIn("--repo-trust untrusted", line)
+        follow = self.run_cli(*shlex.split(hint)[1:], "--json", quota={})
+        self.assertEqual(follow.returncode, 0, follow.stderr)
+        payload = json.loads(follow.stdout)
+        self.assertEqual(payload["repo_trust"], "untrusted")
+        self.assertTrue(payload["candidates"])
+        for candidate in payload["candidates"]:
+            self.assertEqual(candidate["repo_trust"], "untrusted")
+            self.assertIn("--repo-trust untrusted", candidate["command"])
+            self.assertIn("--readonly", candidate["command"])
+
     def test_review_rejection_is_a_valid_review_and_has_separate_metadata(self):
         result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
                               "--seconds", "12.5", "--calls", "1", "--request-id", "review-42",
@@ -99,12 +119,34 @@ class RoutingCliTests(unittest.TestCase):
                                 "--request-id", "blocked-42", "--seconds", "1", "--calls", "1")
         self.assertEqual(recorded.returncode, 0, recorded.stderr)
         blocked = self.route_json("review", "hard", "--simple", "--request-id", "blocked-42", quota={})
+        self.assertTrue(blocked["retry_approval_required"])
         self.assertNotIn("codex", [c["provider"] for c in blocked["candidates"]])
         self.assertTrue(any("retry-approved" in s["reason"] for s in blocked["skipped"] if s["provider"] == "codex"))
         other = self.route_json("review", "hard", "--simple", "--request-id", "other-42", quota={})
         self.assertIn("codex", [c["provider"] for c in other["candidates"]])
         approved = self.route_json("review", "hard", "--simple", "--request-id", "blocked-42", "--retry-approved", quota={})
+        self.assertNotIn("retry_approval_required", approved)
         self.assertIn("codex", [c["provider"] for c in approved["candidates"]])
+
+    def test_unrecorded_timeout_warns_from_selected_call_ledger(self):
+        ledger = self.base / "custom.json"
+        ledger.write_text(json.dumps({"attempts": [
+            {"task_id": "retry-42", "status": "completed", "id": "attempt-1",
+             "engine": "codex", "result_status": "TIMEOUT"},
+            {"task_id": "retry-42", "status": "released", "id": "attempt-2",
+             "engine": "muse", "result_status": "TIMEOUT"},
+        ]}))
+        args = ("route", "review", "normal", "--simple", "--request-id", "retry-42", "--call-budget-file", str(ledger))
+        text = self.run_cli(*args, quota={})
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("先核对用户授权", text.stdout)
+        self.assertNotIn("验收不过就升一档", text.stdout)
+        payload = self.route_json(*args[1:], quota={})
+        self.assertTrue(payload["retry_approval_required"])
+        self.assertIsNone(payload["escalate_tier"])
+        self.assertEqual(payload["uncertain_attempts"], [
+            {"attempt_id": "attempt-1", "provider": "codex", "status": "TIMEOUT"}
+        ])
 
     def test_inherited_request_cannot_be_replaced(self):
         result = self.run_cli("route", "review", "hard", "--request-id", "escape", "--json",

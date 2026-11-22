@@ -104,6 +104,18 @@ class ExecutionRuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.ledger()["attempts"]), 3)
         self.assertTrue(all(entry["result_status"] == "FAILED" for entry in self.ledger()["attempts"]))
 
+    def test_attempt_records_caller_and_explicit_retry_declaration(self):
+        callback = lambda timeout: (True, "ok", None)
+        with execution_context(caller="agy", retry_approved=True):
+            result = execute(self.request(), callback)
+        self.assertEqual(result.status, "PASSED")
+        execute(self.request(), callback)
+        annotated, ordinary = self.ledger()["attempts"]
+        self.assertEqual(annotated["id"], result.attempt_id)
+        self.assertEqual(annotated["caller"], "agy")
+        self.assertIs(annotated["retry_approved_by_caller"], True)
+        self.assertNotIn("caller", ordinary)
+        self.assertNotIn("retry_approved_by_caller", ordinary)
     def test_unknown_exception_records_attempt_without_replay_or_secrets(self):
         called = []
         def provider(timeout):

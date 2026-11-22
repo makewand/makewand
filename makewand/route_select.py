@@ -141,6 +141,7 @@ class RouteResult:
     candidates: list
     skipped: list
     escalate_tier: Optional[int]
+    retry_approval_required: bool = False
 
 
 def default_policy_path() -> Path:
@@ -225,11 +226,13 @@ def quota_argv():
     return (binary, "quota", "--json") if binary else None
 
 
-def default_quota_reader() -> dict:
+def default_quota_reader(*, repo_trust="trusted") -> dict:
     """运行官方 quota 命令并解析。失败时返回空 dict，不抛异常。"""
     argv = quota_argv()
     if argv is None:
         return {}
+    if repo_trust == "untrusted":
+        argv = (*argv, "--repo-trust", "untrusted")
     try:
         completed = subprocess.run(
             argv,
@@ -315,7 +318,8 @@ def select(
         if isinstance(name, str) and name.strip():
             marks[name.strip().lower()] = mark
 
-    request_blocks = ledger.request_cooldowns(request_id, now=moment) if request_id and not retry_approved else {}
+    blocks = ledger.request_blocks(request_id, now=moment) if request_id and not retry_approved else {}
+    request_blocks = {provider: reason for provider, (_, reason) in blocks.items()}
 
     task_skips = TASK_TYPE_SKIPS.get(task_type, {})
     blocked_early = []
@@ -428,6 +432,7 @@ def select(
         candidates=chosen,
         skipped=skipped,
         escalate_tier=escalate(tier),
+        retry_approval_required=any(kind in ("unknown", "timeout") for kind, _ in blocks.values()),
     )
 
 

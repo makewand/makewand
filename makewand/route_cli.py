@@ -1,7 +1,7 @@
 """route / mark / outcome 子命令的实现。
 
 - ``route`` 默认在完整目录里选（``select(full=True)``）。候选来自 discovery
-  已经落盘的缓存，不跑 ``agy models``，也不写状态、不调用模型。
+  已经落盘的缓存，额度读取可以刷新快照。可信模式也可按策略兑现 Codex 赠送的额度重置。
   ``--simple`` 退回精简三档表；``--legacy`` 把旧版本模型纳入完整目录的排序。
   文本最多列这一档的前 5 个候选。
 - ``mark`` 把一家工具标记为额度受限，到期前路由跳过它；
@@ -25,10 +25,11 @@ import sys
 import tempfile
 import time
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 from makewand.outcome_ledger import OutcomeLedger
-from makewand.route_select import _family_reason, _mark_reason, _pause_reason, load_policy, select
+from makewand.route_select import _family_reason, _mark_reason, _pause_reason, default_quota_reader, load_policy, select
 from makewand.routing_catalog import PROVIDER_FAMILIES, TASK_TYPES
 
 __all__ = [
@@ -55,6 +56,7 @@ _UNIT_ORDER = {"d": 0, "h": 1, "m": 2, "s": 3}
 _DURATION_HINT = "时长格式不对：只用 d/h/m/s 组合，例如 6h、93h17m、2d、45m"
 _MAX_DURATION_SECONDS = 365 * 86400
 _MAX_DURATION_HINT = "时长太长：最长支持 365 天（例如 365d、8760h）"
+_RETRY_HINT = "本请求有 UNKNOWN/超时记录；同一子任务换工具也属于重试，先核对用户授权。"
 
 
 def _fail(message: str):
@@ -200,6 +202,8 @@ def _command_for(candidate, execution_options) -> str:
               "--total-timeout", str(timeout or execution_options["total_timeout"])]
     if execution_options["readonly"]:
         parts.append("--readonly")
+    if execution_options.get("repo_trust") == "untrusted":
+        parts.extend(("--repo-trust", "untrusted"))
     return " ".join(parts)
 
 
@@ -255,6 +259,9 @@ def cmd_route(args) -> None:
     risk = risk_raw if risk_raw in ("low", "high") else "low"
     self_tool = getattr(args, "self_tool", None)
     not_tool = getattr(args, "not_tool", None)
+    repo_trust = getattr(args, "repo_trust", "trusted")
+    request_id = getattr(args, "request_id", None)
+    retry_approved = bool(getattr(args, "retry_approved", False))
     if self_tool is not None:
         try:
             self_tool = _validate_provider(self_tool)
@@ -266,23 +273,26 @@ def cmd_route(args) -> None:
         policy = load_policy()
     except ValueError as error:
         _fail(f"错误：{error}")
+    quota_reader = _quota_reader_from_env()
+    if quota_reader is None and repo_trust == "untrusted":
+        quota_reader = partial(default_quota_reader, repo_trust=repo_trust)
     options = dict(
         risk=risk,
         self_tool=self_tool,
         not_tool=not_tool,
         tier_override=getattr(args, "route_tier", None),
         policy=policy,
-        quota_reader=_quota_reader_from_env(),
+        quota_reader=quota_reader,
         full=not simple,
         include_legacy=bool(getattr(args, "legacy", False)) and not simple,
-        request_id=getattr(args, "request_id", None),
-        retry_approved=bool(getattr(args, "retry_approved", False)),
+        request_id=request_id,
+        retry_approved=retry_approved,
         status_reader=load_status_cache,
     )
     try:
         try:
             result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
-            if _restore_codex_reset(policy, result, not_tool):
+            if repo_trust == "trusted" and _restore_codex_reset(policy, result, not_tool):
                 result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
         except PermissionError:
             if getattr(args, "request_id", None):
@@ -295,6 +305,7 @@ def cmd_route(args) -> None:
         _fail(f"错误：{error}")
     budget = int(getattr(policy, "request_budget", 3) or 3)
     execution_options = _execution_options(task_type, difficulty, result.tier, getattr(args, "total_timeout", None))
+    execution_options["repo_trust"] = repo_trust
     if getattr(args, "request_id", None):
         budget = int(os.environ.get("MAKEWAND_MAX_MODEL_CALLS") or budget)
         execution_options.update(request_id=args.request_id, request_budget=budget)
@@ -303,6 +314,11 @@ def cmd_route(args) -> None:
     if getattr(args, "caller", None):
         execution_options["caller"] = args.caller
 
+    uncertain = []
+    if request_id and not retry_approved:
+        from makewand.budget_watch import uncertain_attempts
+        uncertain = uncertain_attempts(request_id, execution_options.get("budget_file"))
+    retry_required = bool(uncertain or result.retry_approval_required)
     if getattr(args, "json", False):
         payload = {
             "tier": result.tier,
@@ -312,9 +328,11 @@ def cmd_route(args) -> None:
                 {"provider": provider, "reason": reason}
                 for provider, reason in result.skipped
             ],
-            "escalate_tier": result.escalate_tier,
+            "escalate_tier": None if retry_required else result.escalate_tier,
             "budget": budget,
         }
+        if retry_required:
+            payload.update(retry_approval_required=True, retry_warning=_RETRY_HINT, uncertain_attempts=uncertain)
         forecasts = weekly_forecasts(policy)
         if forecasts:
             payload["quota_warnings"] = list(forecasts.values())
@@ -330,6 +348,8 @@ def cmd_route(args) -> None:
         f"子任务：{task_type} / {difficulty} → 第 {result.tier} 档"
         f"（1 便宜快，3 强且推理深）；每个请求默认最多 {budget} 次调用"
     ]
+    if retry_required:
+        lines.append(f"  注意：{_RETRY_HINT}")
     for index, item in enumerate(shown, 1):
         line = f"  {index}. {_command_for(item, execution_options)}   # {item.label}"
         if item.is_self:
@@ -341,12 +361,12 @@ def cmd_route(args) -> None:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
     lines.extend(f"  注意：{note}" for note in weekly_forecasts(policy).values())
-    if not result.candidates:
+    if not result.candidates and not retry_required:
         if result.escalate_tier is not None:
             lines.append("  没有可用候选：可以升一档，或等额度恢复、暂停结束后再试。")
         else:
             lines.append("  没有可用候选：已是最高档，等额度恢复、暂停结束后再试。")
-    if result.escalate_tier is not None:
+    if result.escalate_tier is not None and not retry_required:
         # Carry the constraints that shaped this answer, so following the
         # hint re-runs the same selection one tier up instead of silently
         # dropping --risk/--self/--not/--simple/--legacy.
@@ -355,6 +375,8 @@ def cmd_route(args) -> None:
             escalate_cmd += f" --total-timeout {args.total_timeout:g}"
         if risk == "high":
             escalate_cmd += " --risk high"
+        if repo_trust == "untrusted":
+            escalate_cmd += " --repo-trust untrusted"
         if self_tool:
             escalate_cmd += f" --self {self_tool}"
         if not_tool and str(not_tool).strip():
