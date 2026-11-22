@@ -41,7 +41,7 @@ def git(path, *args):
 class TestRunReviewVerdict(unittest.TestCase):
     DIFF = "diff --git a/app.py b/app.py\n+x = 1"
 
-    def review(self, outputs, output_json=False):
+    def review(self, outputs, output_json=False, final_diff=None):
         outputs = list(outputs)
         seen = []
 
@@ -50,7 +50,7 @@ class TestRunReviewVerdict(unittest.TestCase):
             return True, nonced(prompt, outputs.pop(0)) if outputs else "", None
 
         buf = io.StringIO()
-        with patch.object(orch, "get_git_diff", return_value=self.DIFF), \
+        with patch.object(orch, "get_git_diff", side_effect=[self.DIFF, self.DIFF if final_diff is None else final_diff]), \
              patch.object(orch, "get_or_update_status", return_value={"codex": {"status": "healthy"}}), \
              patch("makewand.config.is_provider_enabled", return_value=True), \
              patch.object(orch, "execute_codex_task", side_effect=codex), \
@@ -63,12 +63,26 @@ class TestRunReviewVerdict(unittest.TestCase):
     def test_bug_but_lgtm_is_unverified_exit_11(self):
         code, seen, _ = self.review(["The code has a bug in line 3 but overall LGTM", "still LGTM"])
         self.assertEqual(code, orch.EXIT_UNVERIFIED)
-        self.assertEqual(len(seen), 2, "the reviewer is asked exactly once more")
+        self.assertEqual(len(seen), 1)
         self.assertIn("MAKEWAND_VERDICT", seen[0])
 
-    def test_followup_verdict_passes(self):
-        code, seen, _ = self.review(["LGTM", PASS_LINE])
-        self.assertEqual(code, orch.EXIT_PASSED)
+    def test_missing_verdict_never_dispatches_a_format_only_followup(self):
+        prose = "First checks.\n" + "a" * 6500 + "\nA defect in the middle.\n" + "b" * 6500
+        code, seen, _ = self.review([prose, PASS_LINE])
+        self.assertEqual(code, orch.EXIT_UNVERIFIED)
+        self.assertEqual(len(seen), 1)
+
+    def test_changed_candidate_invalidates_json_verdict(self):
+        for reply in (PASS_LINE, FAIL_LINE):
+            with self.subTest(reply=reply):
+                code, seen, out = self.review([reply], output_json=True, final_diff=self.DIFF + "2")
+                result = json.loads(out)
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(code, orch.EXIT_UNVERIFIED)
+                self.assertEqual(result["exit_code"], code)
+                self.assertFalse(result["pass"])
+                self.assertEqual(result["verdict_status"], "unverified")
+                self.assertIn("sha256 mismatch", result["error"])
 
     def test_explicit_failure_exit_10(self):
         code, seen, _ = self.review(["looks good to me\n" + FAIL_LINE])

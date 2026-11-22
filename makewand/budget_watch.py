@@ -39,6 +39,19 @@ def _number(value):
         return None
 
 
+def uncertain_attempts(request_id, path=None):
+    """Recent settled UNKNOWN/TIMEOUT receipts in the request's selected ledger."""
+    data = _load(path or layered_budget.default_path()) or {}
+    attempts = data.get("attempts", [])
+    if not isinstance(attempts, list):
+        return []
+    return [{"attempt_id": row["id"], "provider": row.get("engine"), "status": row["result_status"]}
+            for row in attempts
+            if isinstance(row, dict) and row.get("task_id") == request_id
+            and isinstance(row.get("id"), str) and row.get("status") == "completed"
+            and row.get("result_status") in _FAILED]
+
+
 def _ended(attempt):
     """When an attempt ended, from finished_at or started_at + seconds; None if unknown."""
     finished = _number(attempt.get("finished_at"))
@@ -84,8 +97,10 @@ def flags(window_seconds=86400, now=None):
                     continue
                 later = [a for a in runs[index + 1:] if a["started_at"] >= ended + RETRY_GAP_SECONDS]
                 if later and max(ended, later[-1]["started_at"]) >= cutoff:
+                    declared = sum(a.get("retry_approved_by_caller") is True for a in later)
                     found.append({"task": task, "ledger": str(path), "kind": "retry_after_failure",
                                   "detail": f"{failed.get('engine')} {failed.get('result_status')} 后又派 {len(later)} 次"
-                                            f"（{', '.join(sorted({str(a.get('engine')) for a in later}))}）"})
+                                            f"（{', '.join(sorted({str(a.get('engine')) for a in later}))}）"
+                                            + (f"，其中 {declared} 次由调用方标注已获批准" if declared else "")})
                     break
     return found

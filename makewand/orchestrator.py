@@ -42,9 +42,9 @@ from makewand.execution_contract import EXIT_PASSED, EXIT_FAILED, EXIT_UNVERIFIE
 from makewand.engine_selection import API_ONLY_ENGINES, _engine_usable, forced_engine_name, forced_engine_refusal, forced_engine_error, forced_engine_refusal_lines
 
 
-from makewand.review_contract import review_verdict_output_spec, generate_review_nonce, prepare_review_diff, review_digest, dispatched_size, reviewer_prompt_limit, reviewer_receives_whole_prompt, REVIEW_PASSED, REVIEW_FAILED, REVIEW_UNVERIFIED
+from makewand.review_contract import review_verdict_output_spec, generate_review_nonce, prepare_review_diff, review_digest, dispatched_size, reviewer_prompt_limit, reviewer_receives_whole_prompt, evaluate_review_verdict, REVIEW_PASSED, REVIEW_FAILED, REVIEW_UNVERIFIED
 
-from makewand.review_verdict import resolve_review_verdict, extract_review_verdict_dict
+from makewand.review_verdict import extract_review_verdict_dict
 
 
 # A verdict approves only the exact, complete diff it saw. A larger diff is never
@@ -283,7 +283,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         if current_context().get("_deadline_monotonic", float("inf")) > time.monotonic():
             return False
         if output_json:
-            _print_json({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT,
+            _print_json({"pass": False, "engine": None, "exit_code": EXIT_TIMEOUT, "verdict_status": REVIEW_UNVERIFIED,
                                "error": "review task deadline expired"})
         return True
     if timed_out():
@@ -298,6 +298,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
                 _print_json({
                     "pass": False,
                     "exit_code": EXIT_UNVERIFIED,
+                    "verdict_status": REVIEW_UNVERIFIED,
                     "engine": None,
                     "defects": ["当前仓库为 untrusted 且 Bubblewrap 沙箱不可用，根据安全防御原则阻断审查"],
                     "error": "Untrusted repository requires Bubblewrap sandbox"
@@ -311,6 +312,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
         if refusal:
             if output_json:
                 _print_json({"pass": False, "exit_code": EXIT_UNVERIFIED, "engine": None, "defects": [refusal],
+                             "verdict_status": REVIEW_UNVERIFIED,
                                    "error": forced_engine_error(forced, refusal)})
             else:
                 for line in forced_engine_refusal_lines(forced, refusal):
@@ -332,6 +334,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             _print_json({
                 "pass": False,
                 "exit_code": EXIT_UNVERIFIED,
+                "verdict_status": REVIEW_UNVERIFIED,
                 "engine": None,
                 "defects": [f"Git diff 提取失败 ({diff_err})"],
                 "error": diff_err
@@ -345,6 +348,7 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             _print_json({
                 "pass": True,
                 "exit_code": EXIT_PASSED,
+                "verdict_status": "no_changes",
                 "engine": None,
                 "defects": [],
                 "message": "当前工作区没有检测到未提交的改动 (git diff 为空)"
@@ -357,7 +361,11 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
     review_cap = review_diff_max_bytes()
     if diff_bytes > review_cap:
         reason = _review_cap_exceeded(diff_bytes, review_cap)
-        _print_json({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED, "error": reason}) if output_json else _print(reason)
+        if output_json:
+            _print_json({"pass": False, "engine": None, "exit_code": EXIT_UNVERIFIED,
+                         "verdict_status": REVIEW_UNVERIFIED, "error": reason})
+        else:
+            _print(reason)
         return EXIT_UNVERIFIED
     cache = get_or_update_status()
 
@@ -456,44 +464,30 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             _print(c(f"❌ [Makewand Quality Gate] {reason}，拒绝交付。", COLOR_RED + COLOR_BOLD))
         return STATUS_CODES[terminal_status]
 
-    review_res, verdict = resolve_review_verdict(review_res, reviewer_engine, cwd=cwd, timeout=timeout,
-                                                 repo_trust=repo_trust, quiet=output_json, nonce=review_nonce)
-    if verdict.get("execution_status"):
-        from makewand.execution_contract import STATUS_CODES
-        exit_code = STATUS_CODES[verdict["execution_status"]]
-    elif verdict["status"] == REVIEW_PASSED:
-        exit_code = EXIT_PASSED
-    elif verdict["status"] == REVIEW_FAILED:
-        exit_code = EXIT_FAILED
-    else:
-        exit_code = EXIT_UNVERIFIED
-    if current_context().get("_deadline_monotonic", float("inf")) <= time.monotonic():
-        exit_code = EXIT_TIMEOUT
-    # A verdict approves only the exact diff it saw: re-extract and compare.
-    digest_error = None
-    if exit_code == EXIT_PASSED:
+    verdict = evaluate_review_verdict(review_res, nonce=review_nonce)
+    deadline = current_context().get("_deadline_monotonic", float("inf"))
+    if verdict["status"] != REVIEW_UNVERIFIED and time.monotonic() < deadline:
         try:
             after_diff, after_err = extract_review_diff()
         except OSError as exc:
             after_diff, after_err = None, str(exc)
         if after_err or review_digest(after_diff) != reviewed_digest:
-            exit_code = EXIT_UNVERIFIED
-            digest_error = "审查期间改动发生变化，裁决与当前候选摘要不一致 (reviewed sha256 mismatch)"
-            verdict = dict(verdict, status=REVIEW_UNVERIFIED, reason=digest_error)
+            verdict = dict(status=REVIEW_UNVERIFIED, defects=[],
+                           reason="审查期间改动发生变化，裁决与当前候选摘要不一致 (reviewed sha256 mismatch)")
+    if time.monotonic() >= deadline:
+        verdict = dict(status=REVIEW_UNVERIFIED, defects=[], reason="review task deadline expired")
+        exit_code = EXIT_TIMEOUT
+    else:
+        exit_code = {REVIEW_PASSED: EXIT_PASSED, REVIEW_FAILED: EXIT_FAILED,
+                     REVIEW_UNVERIFIED: EXIT_UNVERIFIED}[verdict["status"]]
 
     if output_json:
-        v_dict = extract_review_verdict_dict(review_res, nonce=review_nonce)
+        v_dict = extract_review_verdict_dict(review_res, verdict=verdict)
         v_dict["exit_code"] = exit_code
         v_dict["engine"] = reviewer_engine
         v_dict["reviewed_sha256"] = reviewed_digest
-        if digest_error:
-            v_dict["pass"] = False
         v_dict["raw_summary"] = review_res.strip()
-        if verdict.get("execution_status"):
-            v_dict.update({"pass": False, "error": verdict["reason"]})
-        if exit_code == EXIT_TIMEOUT:
-            v_dict.update({"pass": False, "error": "review task deadline expired"})
-        if exit_code == EXIT_UNVERIFIED:
+        if verdict["status"] == REVIEW_UNVERIFIED:
             v_dict["error"] = verdict["reason"]
         _print_json(v_dict)
         return exit_code

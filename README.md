@@ -89,7 +89,7 @@ makewand quota
 makewand probe
 ```
 
-已启用的引擎都处于错误状态，或处于限额、需重新登录、未安装且没有 API 策略允许转用的 API key 时（默认的 `subscription_only` 下 key 从不转用），任何任务都不派发，并逐个列出原因（退出码 11）。用 `--provider X` 指定的引擎在工作区准备与任何派发之前先检查：不可用时同样不派发（退出码 11，`Requested engine X is not usable: <原因>`）；可用时即使其他引擎都不可用也会运行，审查请求则只由它审查。
+状态命令会显示各引擎的安装、登录和额度情况。默认策略 `subscription_only` 只使用订阅。需要挑选独立审查方时，用 `route review` 排除实现方，再按候选命令派发。
 
 ### 2. 动态模型发现
 ```bash
@@ -103,7 +103,7 @@ makewand models
 makewand review
 ```
 
-审查 diff 超过 256 KiB（用 `MAKEWAND_REVIEW_DIFF_MAX_BYTES` 调整，单位字节）时不做截断审查，结论为未验证（退出码 11），完整补丁保存为可直接 `git apply` 的 `unverified.patch`。超过 31 KiB 的审查提示不交给 agy（它只能分页读取提示文件），流水线改由下一位可用的审查方接替；cursor、copilot 等占位引擎从不审查；本地模型的只读回答须由 token 计数证明读到了完整提示，否则为未验证。详见 [执行约定](docs/EXECUTION_CONTRACT.md#reviewer-capacity)。
+该命令审查未提交的改动，默认顺序为 Codex、AGY。diff 超过 256 KiB（可用 `MAKEWAND_REVIEW_DIFF_MAX_BYTES` 调整）、缺少有效裁决或审查期间候选发生变化时，结论为未验证（退出码 11）。超过 31 KiB 的审查提示会跳过 AGY。JSON 中的 `verdict_status` 表示最终裁决，`no_changes` 表示没有待审改动。调用方验收时须核对完整候选及 nonce。详见 [执行约定](docs/EXECUTION_CONTRACT.md#reviewer-capacity)。
 
 ### 4. 带预算安全搜索 (避免冷归档与大库 I/O 卡死)
 ```bash
@@ -133,7 +133,7 @@ makewand muse "检查系统配置项"
 ### 7. 自动派活选型：route / mark / outcome
 
 ```bash
-# 为子任务挑选工具、模型与推理深度，打印可照抄的派活命令（只读本地缓存与成绩账本，不调用模型）
+# 为子任务挑选工具、模型与推理深度
 makewand route implement normal --self claude
 makewand route review hard --self claude --not codex --json
 
@@ -154,6 +154,8 @@ makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
 
 `makewand observe` 会提示超过默认上限的请求及 UNKNOWN/超时后的后续调用，供核对授权；这些提示本身不证明违规。未分类 CLI 失败的脱敏诊断保存在用户缓存 `makewand/unclassified-cli-failures.jsonl`：仅保留已知 CLI 自身独立 stderr 的末尾，不收集模型回答或 Codex 会话内容，文件有容量上限；诊断写入失败不影响调用结果。
 
+`route` 会保留仓库信任级别。可信模式可能刷新额度缓存并按既有策略兑现 Codex 赠送的额度重置。出现 UNKNOWN 或超时时，同一子任务换工具也需要用户授权。获得授权后，分别给路由和实际派发传入 `--retry-approved`，调用账本会记录调用方的声明。
+
 ### 调用与资源预算
 
 `--max-model-calls` 按 Makewand 派发任务计数。官方 CLI 在一次派发内可能进行多轮内部模型调用，这些内部调用不计入。
@@ -173,14 +175,7 @@ makewand codex --model gpt-6-astra --effort medium -C <目录> -f <任务文件>
 
 ## 🤖 主流 AI 协同接入 (AI Integrations)
 
-Makewand 原生设计为不仅面向人类终端开发者，更作为所有 AI 代理的“外挂魔杖”：
-- **Antigravity (AGY)**：推荐作为调用中心，安装 `makewand-orchestrator` skill；skill 规定只有用户明确要求时才运行 `run`/`race`/`ensemble`，高风险改动可主动运行只读 `review`。
-- **Claude Code**：在 `CLAUDE.md` 中加入简短说明，用户明确要求时运行 `makewand review` 做跨模型审查。
-- **Codex CLI**：在 `AGENTS.md` 中加入同样的简短说明。
-- 被 makewand 派发的 CLI 带有 `MAKEWAND_PROVIDER_WORKER=1`，不能再调用 makewand，嵌套调用不会递归。
-- **Muse Code**：支持在 Meta 生态中联动调度其它模型。
-
-详细指引见 [integrations/](integrations/) 目录。
+日常任务优先使用当前官方 CLI 和项目 CI。Codex、Claude Code、Antigravity 和 Muse 按同一份 skill 进行按需协作。独立审查应按风险选档，并排除实现方的实际模型家族。被派发的 worker 直接完成子任务。接入方式见 [各工具指南](integrations/) 和 [统一调度说明](skills/makewand-orchestrator/SKILL.md)。
 
 ---
 

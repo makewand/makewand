@@ -505,6 +505,9 @@ class OutcomeLedger:
         return iter(self._read_rows())
 
     def request_cooldowns(self, request_id, now=None):
+        return {provider: reason for provider, (_, reason) in self.request_blocks(request_id, now).items()}
+
+    def request_blocks(self, request_id, now=None):
         """Only recorded operational failures cool a provider in this request.
 
         Unknown outcomes/timeouts need explicit retry approval, not a timer.
@@ -533,9 +536,9 @@ class OutcomeLedger:
         for provider, row in latest.items():
             kind = row.get("failure_kind")
             if not row["passed"] and kind in ("unknown", "timeout"):
-                blocked[provider] = f"本请求上次结果为 {kind}；需用户批准后使用 --retry-approved"
+                blocked[provider] = (kind, f"本请求上次结果为 {kind}；需用户批准后使用 --retry-approved")
             elif not row["passed"] and kind in ("startup", "auth", "quota") and moment < row["ts"] + 300:
-                blocked[provider] = f"本请求上次 {kind} 失败；冷却 5 分钟"
+                blocked[provider] = (kind, f"本请求上次 {kind} 失败；冷却 5 分钟")
         return blocked
 
     def stats(

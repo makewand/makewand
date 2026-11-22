@@ -62,7 +62,9 @@
     "--request-id",
     "--caller"
   ],
-  "python_boolean_flags": [],
+  "python_boolean_flags": [
+    "--retry-approved"
+  ],
   "worker_static_args": [
     "-h",
     "--help",

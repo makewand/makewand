@@ -978,6 +978,9 @@ def _main():
                              help="Risk of this task, recorded with the run")
         options.add_argument("--total-timeout", type=float, default=default,
                              help="Shared wall-clock deadline for every task stage, in seconds")
+        options.add_argument("--retry-approved", action="store_true",
+                             default=False if default is None else default,
+                             help="Record explicit user approval for this retry (route also lifts request cooldowns)")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -1106,7 +1109,7 @@ def _main():
     p_clean.add_argument("--all", action="store_true", default=False, help="Clean all temporary makewand caches and artifacts")
 
     # route / mark / outcome (automatic dispatch bookkeeping; never call a model)
-    p_route = subparsers.add_parser("route", allow_abbrev=False, help="为子任务在完整模型目录里选派活工具（只读账本和本地缓存，不调用模型）", parents=[sub_common_parser])
+    p_route = subparsers.add_parser("route", allow_abbrev=False, help="按账本与订阅额度选择派活工具，不发送生成请求", parents=[sub_common_parser])
     p_route.add_argument("task_type", metavar="TYPE", help="子任务类型：review, implement, test, research, doc")
     p_route.add_argument("difficulty", metavar="DIFFICULTY", help="难度：mechanical, normal, hard")
     p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
@@ -1115,7 +1118,6 @@ def _main():
     p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
     p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
-    p_route.add_argument("--retry-approved", action="store_true", help="用户已批准重试，忽略本请求记录的操作失败冷却；不绕过额度、预算或暂停")
 
     p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
@@ -1221,6 +1223,8 @@ def _main():
         # budgets, daemon dispatch and observer initialization (all may write).
         args.cwd = os.path.abspath(args.cwd or os.getcwd())
         return {"search": cmd_search, "repomap": cmd_repomap}[args.subcommand](args)
+    if args.retry_approved and args.subcommand not in PROMPT_COMMANDS | {"review", "route"}:
+        parser.error("--retry-approved requires route, review or a provider command")
     # Validate policy before discovery, daemon dispatch or orchestration.
     # Those paths may catch transport errors, so policy validity must already
     # be established before any provider can be started.
@@ -1317,7 +1321,8 @@ def _main():
     remember_result(None)
     deadline = math.ceil(time.time() * 1000 + args.total_timeout * 1000) if args.total_timeout is not None else None
     workflow = "review" if args.subcommand == "review" else "direct"
-    with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk):
+    with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk,
+                           caller=args.caller, retry_approved=args.retry_approved):
         # Publish the deadline after preflight/prompt reads, immediately before
         # dispatch. With no total budget, allow 30s for workflow startup/teardown.
         if args.subcommand != "sandbox":

@@ -36,11 +36,11 @@ makewand route review normal --self <你> --not <实现方> --request-id <ID> --
 
 `makewand budget request --request-id <ID> --json` 查看已用计数。用户明确扩大额度后，或按上面的规则续审时，才可用 `makewand budget request --request-id <ID> --set-limit <N> --max-model-calls <N>` 调整原上限；续审每次只加下一轮需要的次数（通常 1 次）。加之前先用 `makewand outcome <审查方> <档> review pass --candidate-verdict fail --request-id <ID> --candidate-hash <SHA256>`（另带 `--model`、`--effort` 和实测 `--seconds`/`--calls`）记下上一轮：审查工作记 pass 表示你核实了它找到的缺陷，候选记 fail；没有这条记录不续审。之后的 route 和派发命令都带新总额 `--max-model-calls <N>`，带旧总额会把上限压回去；保留 ID 和已用计数，不退款、不另建请求，也不为续审另开请求 ID。
 
-始终指定 `--cwd`；照抄 route 的 timeout/total-timeout，审查保持 readonly。review/test/research/doc 三档为 900/1800/5400 秒，implement 为 1200/3600/10800 秒。只给 total-timeout 时单次跟随；都不给时默认 300 秒（ensemble 900）。后台等待完成，不重复派同一任务。同一仓库只跑一个写任务；同一账号并发 1 时，额外审查只会排队。
+始终指定 `--cwd`，沿用 route 的 timeout、total-timeout 和仓库信任级别，审查保持 readonly。review/test/research/doc 三档为 900/1800/5400 秒，implement 为 1200/3600/10800 秒。Codex 审查默认最多 1800 秒，显式总时限优先。只给 total-timeout 时单次跟随，都不给时默认 300 秒。按实际模型和推理深度选够用的档位。已有同一任务在运行时，后台等它完成。同项目或账号已占满时，避免重复排队。
 
 ## 判定与记账
 
-`review` 的 0/10/11 分别是通过/发现缺陷/未验证；直接工具 CLI 的 0 只表示执行完成，必须检查真实回答中的 nonce 裁决与完整覆盖，不能采纳回显提示中的示例。裁决缺失、截断或工具拒绝均未验证。代码合并门禁独立于调度成绩。
+`review` 的 0/10/11 分别是通过或无改动/发现缺陷/未验证。自动化调用核对 JSON 的 `verdict_status` 和 `reviewed_sha256`。直接工具 CLI 的 0 只表示执行完成，必须检查真实回答中的 nonce 裁决与完整覆盖。裁决缺失、截断或工具拒绝均未验证。代码合并门禁独立于调度成绩。
 
 审查找到了经核实的真实缺陷：**审查工作 pass，候选代码 fail**。只有裁决缺失、覆盖不足、无效输出或结论未被验收时才给审查工具记 fail；不要因代码被打回惩罚准确的审查者。保留历史记录，不猜测和重写旧成绩。
 
@@ -54,7 +54,7 @@ makewand outcome codex 3 review pass --candidate-verdict fail --candidate-hash <
 
 实现/测试任务的 pass/fail 仍是其结果是否通过验收。操作失败另带 `--failure-kind startup|auth|quota|timeout|unknown|invalid_output|verification`；只有 startup/auth/quota 在本请求冷却 5 分钟，unknown/timeout 要用户批准重试。候选测试失败或有效审查拒绝不触发提供方冷却。429/额度耗尽还应 `makewand mark <工具> <剩余时长>`；只是某个模型被拒时加 `--model <模型>`：Agy 的 Gemini、Claude、GPT-OSS 额度分开算，Gemini 用完不要标记整个 agy。不要猜测失败原因。
 
-退出码 12/16/17 分别为取消/超时/未知：告知用户，未经授权不自动重试，UNKNOWN 可能已产生花费。13 是预算耗尽，14 是应用冲突，15 是沙箱不可用。模型恢复、冷却时间经过或预选推荐项都不构成重试授权；用户已批准后才使用 route 的 `--retry-approved`。`status --probe` 可能产生真实模型调用，不能当廉价健康检查。
+退出码 12/16/17 分别为取消/超时/未知。遇到这类结果，告知用户并等待重试授权，UNKNOWN 可能已产生花费。换工具重跑同一子任务也需要授权。授权范围明确后，在 route 使用 `--retry-approved`。如果已安装版本的实际派发命令也支持此参数，则显式带上，让账本保留调用方声明。13 是预算耗尽，14 是应用冲突，15 是沙箱不可用。健康检查用 `status`，`status --probe` 可能产生真实模型调用。
 
 ## 权限与交付
 

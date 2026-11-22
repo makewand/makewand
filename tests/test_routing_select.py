@@ -245,6 +245,11 @@ class QuotaTextTests(unittest.TestCase):
         self.assertEqual(parsed["codex"], (91.0, "resets 10-21 08:00"))
         self.assertEqual(parsed["claude"][0], 84.0)
 
+    def test_untrusted_quota_reader_passes_trust_to_go(self):
+        with patch("makewand.route_select.subprocess.run", side_effect=FileNotFoundError) as run:
+            self.assertEqual(default_quota_reader(repo_trust="untrusted"), {})
+        self.assertEqual(run.call_args.args[0], (*FAKE_QUOTA_ARGV, "--repo-trust", "untrusted"))
+
 
 class SelectTests(unittest.TestCase):
     def setUp(self):

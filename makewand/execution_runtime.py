@@ -116,7 +116,8 @@ def initialize_cli_task():
 @contextmanager
 def execution_context(**values):
     context = current_context()
-    allowed = {"task_id", "stage", "deadline_unix_ms", "workflow", "risk", "readonly", "lease_id", "wait_for_capacity"}
+    allowed = {"task_id", "stage", "deadline_unix_ms", "workflow", "risk", "readonly", "lease_id",
+               "wait_for_capacity", "caller", "retry_approved"}
     if set(values) - allowed:
         raise ValueError("unsupported execution context field")
     # None inherits the parent, except lease_id where None explicitly releases
@@ -266,7 +267,8 @@ def execute(request, callback):
             account_ref=request.account_ref, api_policy=request.api_policy,
             budget_file=request.budget_file, max_model_calls=request.max_model_calls,
             deadline_monotonic=deadline, pending=True,
-            wait_for_capacity=context.get("wait_for_capacity", True), working_directory=request.cwd)
+            wait_for_capacity=context.get("wait_for_capacity", True), working_directory=request.cwd,
+            caller=context.get("caller"), retry_approved=context.get("retry_approved", False))
     except call_budget.BudgetCancelledError as error:
         return _result(request, "CANCELLED", error=str(error), error_kind="cancelled", outcome_known=True)
     except call_budget.BudgetDeadlineError:

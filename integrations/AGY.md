@@ -1,13 +1,5 @@
 # Antigravity (AGY) 接入指南
 
-推荐把 Antigravity 作为调用 makewand 的中心工具：它的额度通常最充裕，可以把 Claude 与 Codex 的额度留给 makewand 派发的实际实现和审查。
+源码安装将 [makewand-orchestrator skill](../skills/makewand-orchestrator/SKILL.md) 复制到 `~/.gemini/config/skills/makewand-orchestrator/`，可用 `MAKEWAND_SKILLS_DIR` 指定目录。日常工作使用 Antigravity 和项目 CI。
 
-## 安装 skill
-
-源码安装会把 `skills/makewand-orchestrator/SKILL.md` 复制到 `~/.gemini/config/skills/makewand-orchestrator/`（可用 `MAKEWAND_SKILLS_DIR` 改目录）。手动更新时直接覆盖该文件即可。
-
-skill 规定了何时调用、各命令的成本、如何按退出码判断结果、影子工作树交付需要征得用户同意后再应用补丁，以及禁止递归调用。agy 自己的全局准则（`GEMINI.md`）不要再写"优先激活 makewand"之类会让 agy 自动发起多模型任务的规则。
-
-## 注意
-
-- makewand 派发 agy 时会带 `MAKEWAND_PROVIDER_WORKER=1`；被派发的 agy 不能再调用 makewand。
+独立审查从 `makewand route review normal --self agy --not <实现方>` 开始，高风险使用 `hard --risk high`。沿用同一请求 ID、`--caller agy` 和请求总上限，核对代理模型的实际家族。单个模型额度受限时，按已知重置时间用 `mark --model` 标记。AGY credits 保持关闭。被 makewand 派发的 AGY 直接完成子任务。

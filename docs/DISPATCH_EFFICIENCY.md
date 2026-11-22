@@ -78,9 +78,14 @@ request history stops routing rather than pretending there were no failures.
 Operational state follows append order across clock rollback; future timestamps
 never remove UNKNOWN/timeout restrictions. Timed cooling is conservative when the
 wall clock moves backward.
-candidate rejection and verification failures do not trigger operational cooling.
-This is routing feedback from recorded outcomes, not a replacement for admission
-or a blanket ban on explicitly requested direct CLI calls.
+Candidate rejection and verification failures do not trigger operational cooling.
+Route warns about UNKNOWN/TIMEOUT receipts in the selected call ledger even before
+an outcome is recorded. The JSON sets `retry_approval_required` and includes
+available attempt IDs. The warning applies to retries of the same subtask across
+providers. Other candidates may represent separate work in the request. When a
+retry is authorized, pass `--retry-approved` explicitly on the dispatch as well.
+The call ledger records its attempt ID, the supplied caller, and the caller's
+declaration of approval. Budget and concurrency admission still apply.
 
 For quota exhaustion also use `makewand mark` with the observed reset interval.
 Do not infer quota exhaustion merely from a quick failure. Avoid repeated model
