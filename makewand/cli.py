@@ -76,11 +76,12 @@ def _execute_direct_task(engine, execute, prompt, **kwargs):
     from makewand.workflow import remember_result
     context = execution_runtime.current_context()
     maximum = os.environ.get("MAKEWAND_MAX_MODEL_CALLS")
+    api_policy = "subscription_only" if context.get("review_dispatch") is not None else get_api_policy()
     request = ExecutionRequest(task_id=execution_runtime.task_id(),
         stage=context.get("stage") or "direct", engine=engine,
         tier=kwargs.get("tier", "standard"), model=kwargs.get("model"),
         readonly=kwargs.get("readonly", False), repo_trust=kwargs.get("repo_trust", "trusted"),
-        api_policy=get_api_policy(), deadline_unix_ms=context.get("deadline_unix_ms"),
+        api_policy=api_policy, deadline_unix_ms=context.get("deadline_unix_ms"),
         timeout_ms=max(1, math.ceil(kwargs.get("timeout", 300) * 1000)),
         budget_file=os.environ.get("MAKEWAND_CALL_BUDGET_FILE"),
         max_model_calls=int(maximum) if maximum else None,
@@ -971,6 +972,11 @@ def _main():
     sub_common_parser.add_argument("--caller", choices=["claude", "codex", "agy", "grok", "muse", "human", "automation"], default=argparse.SUPPRESS, help="Initiating tool (metadata only)")
     sub_common_parser.add_argument("--call-budget-file", default=argparse.SUPPRESS, help="Shared model task admission ledger")
     sub_common_parser.add_argument("--effort", "--reasoning-effort", dest="effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default=argparse.SUPPRESS, help="Set reasoning effort across AI models (low, medium, high, xhigh, max, ultra)")
+    sub_common_parser.add_argument("--review-author", help="Actual implementing model or its family for a high-risk review")
+    sub_common_parser.add_argument("--exclude-review-family", action="append", default=[],
+                                   help="Exclude a model family from high-risk review")
+    sub_common_parser.add_argument("--allow-same-family-review", action="store_true",
+                                   help="The user approved a same-family reviewer in an independent read-only context")
 
     for options, default in ((common_parser, None), (sub_common_parser, argparse.SUPPRESS)):
         options.add_argument("--risk", choices=["auto", "low", "high"],
@@ -981,6 +987,9 @@ def _main():
         options.add_argument("--retry-approved", action="store_true",
                              default=False if default is None else default,
                              help="Record explicit user approval for this retry (route also lifts request cooldowns)")
+        options.add_argument("--no-capacity-wait", action="store_true",
+                             default=False if default is None else default,
+                             help="Try admission once instead of waiting for a free model slot")
 
     parser = argparse.ArgumentParser(
         prog="makewand",
@@ -1223,8 +1232,11 @@ def _main():
         # budgets, daemon dispatch and observer initialization (all may write).
         args.cwd = os.path.abspath(args.cwd or os.getcwd())
         return {"search": cmd_search, "repomap": cmd_repomap}[args.subcommand](args)
-    if args.retry_approved and args.subcommand not in PROMPT_COMMANDS | {"review", "route"}:
-        parser.error("--retry-approved requires route, review or a provider command")
+    if args.subcommand not in PROMPT_COMMANDS | {"review", "route"}:
+        for enabled, flag in ((args.retry_approved, "--retry-approved"),
+                              (args.no_capacity_wait, "--no-capacity-wait")):
+            if enabled:
+                parser.error(f"{flag} requires route, review or a provider command")
     # Validate policy before discovery, daemon dispatch or orchestration.
     # Those paths may catch transport errors, so policy validity must already
     # be established before any provider can be started.
@@ -1307,6 +1319,30 @@ def _main():
     elif not getattr(args, "cwd", None):
         args.cwd = os.getcwd()
 
+    high_risk = args.risk == "high"
+    review_dispatch = None
+    if high_risk and args.subcommand == "review":
+        parser.error("高风险审查请使用 route review hard --risk high --not <实现方>，然后派发精确型号")
+    if args.subcommand != "route":
+        review_options = any(getattr(args, name, None) for name in
+                             ("review_author", "exclude_review_family", "allow_same_family_review"))
+        protected_review = high_risk and args.subcommand in PROMPT_COMMANDS and getattr(args, "readonly", False)
+        if review_options and not protected_review:
+            parser.error("审查约束需要提供方命令同时使用 --risk high 和 --readonly")
+        if protected_review:
+            from makewand.config import get_api_policy
+            from makewand.discovery import discover_model_efforts
+            from makewand.review_policy import ReviewPolicy, validate_review_dispatch
+            try:
+                policy = ReviewPolicy.from_options(args.review_author, args.exclude_review_family,
+                                                   args.allow_same_family_review)
+                if get_api_policy() != "subscription_only":
+                    raise ValueError("高风险审查需要 subscription_only，关闭 Makewand 的 API 接力")
+                effort = validate_review_dispatch(policy, args.subcommand, args.model, args.effort, discover_model_efforts(strict_catalogs=True))
+                review_dispatch = (args.subcommand, args.model, None if args.subcommand == "agy" else effort)
+            except ValueError as error:
+                parser.error(str(error))
+
     if not args.subcommand:
         parser.print_help()
         sys.exit(0)
@@ -1322,7 +1358,8 @@ def _main():
     deadline = math.ceil(time.time() * 1000 + args.total_timeout * 1000) if args.total_timeout is not None else None
     workflow = "review" if args.subcommand == "review" else "direct"
     with execution_context(deadline_unix_ms=deadline, workflow=workflow, risk=selected.risk,
-                           caller=args.caller, retry_approved=args.retry_approved):
+                           caller=args.caller, retry_approved=args.retry_approved, review_dispatch=review_dispatch,
+                           wait_for_capacity=False if args.no_capacity_wait else None):
         # Publish the deadline after preflight/prompt reads, immediately before
         # dispatch. With no total budget, allow 30s for workflow startup/teardown.
         if args.subcommand != "sandbox":

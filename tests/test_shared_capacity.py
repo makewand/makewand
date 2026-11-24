@@ -55,10 +55,11 @@ class SharedCapacityTests(unittest.TestCase):
 
         self.addCleanup(join_settlements)
 
-    def reserve(self, name, engine="agy", task_id=None, project=None):
+    def reserve(self, name, engine="agy", task_id=None, project=None, **options):
         os.environ["MAKEWAND_PROJECT_ROOT"] = str(self.root / (project or name))
         Path(os.environ["MAKEWAND_PROJECT_ROOT"]).mkdir(exist_ok=True)
-        return budget.reserve(engine, "fast", task_id=task_id or name, budget_file=str(self.root / (name + ".json")))
+        return budget.reserve(engine, "fast", task_id=task_id or name, budget_file=str(self.root / (name + ".json")),
+                              **options)
 
     def finish(self, name, attempt):
         budget.complete(attempt, True, 0, budget_file=str(self.root / (name + ".json")))
@@ -88,6 +89,17 @@ class SharedCapacityTests(unittest.TestCase):
         self.finish("a", a)
         b = self.reserve("b", "agy", project="project")
         self.finish("b", b)
+
+    def test_no_wait_refusal_leaves_no_pending_ticket_or_charged_call(self):
+        first = self.reserve("a", "codex")
+        with patch.dict(os.environ, MAKEWAND_LEASE_WAIT_SECONDS="300"), \
+                patch.object(capacity, "report_busy") as report:
+            with self.assertRaises(budget.ConcurrencyBusyError):
+                self.reserve("b", "codex", wait_for_capacity=False)
+        report.assert_not_called()
+        self.assertFalse((self.root / "b.json").exists())
+        self.assertEqual(json.loads((self.root / capacity.STATE_NAME).read_text())["queue"], [])
+        self.finish("a", first)
 
     def test_expiry_alone_and_missing_active_source_do_not_release(self):
         a = self.reserve("a", "codex")

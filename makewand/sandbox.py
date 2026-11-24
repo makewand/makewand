@@ -2065,6 +2065,19 @@ class ProviderHome:
         self._materialized = False
         self._lock = threading.Lock()
         self._private_roots: Dict[str, str] = {}
+        self._muse_review_snapshot: Optional[Tuple[Path, Path, str]] = None
+
+    def muse_review_snapshot_is_current(self) -> bool:
+        if self._muse_review_snapshot is None:
+            return False
+        from makewand.discovery import _muse_current_catalog
+        source, private, digest = self._muse_review_snapshot
+        if _muse_current_catalog(self.user_home) != source:
+            return False
+        host_state = _read_host_state(str(source))
+        private_state = _read_host_state(str(private))
+        return bool(host_state and private_state
+                    and _digest(host_state[0]) == _digest(private_state[0]) == digest)
 
     def materialize(self, project_paths: Sequence[str] = (),
                     absent_root_ok: Optional[Callable[[str], bool]] = None) -> List[str]:
@@ -2260,6 +2273,17 @@ class ProviderHome:
             if (self.provider == "claude" and os.environ.get("CLAUDE_CONFIG_DIR")
                     and real == os.path.realpath(os.path.join(self.user_home, ".claude"))):
                 self._copy_in(os.path.join(self.user_home, ".claude.json"), priv, ".claude.json")
+            if self.provider == "muse" and root_rel == ".local/share/muse":
+                from makewand.execution_runtime import current_context
+                if current_context().get("review_dispatch") is not None:
+                    from makewand.discovery import _muse_current_catalog, muse_review_uses_sandbox_profile
+                    if muse_review_uses_sandbox_profile(self.user_home):
+                        source = _muse_current_catalog(self.user_home)
+                        if source is not None:
+                            rel = os.path.join("model-catalog", source.name)
+                            copied = self._copy_in(str(source), priv, rel, follow_symlinks=False)
+                            if copied is not None:
+                                self._muse_review_snapshot = (source, Path(priv) / rel, _digest(copied[0]))
 
         for root_rel, sub, _kind, _placeholder in profile.get("protected", []):
             real = real_roots.get(root_rel)

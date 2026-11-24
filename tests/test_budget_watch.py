@@ -58,6 +58,18 @@ class BudgetWatchTest(unittest.TestCase):
         self.assertEqual({(f["kind"], f["task"]) for f in budget_watch.flags(now=now)},
                          {("retry_after_failure", "finished")})
 
+    def test_retry_report_counts_dispatched_attempts_and_approval_declarations(self):
+        now = 100000.0
+        self.write(self.config / "call-budget.json", {}, [
+            attempt("request", "codex", now - 500, 30, "UNKNOWN"),
+            attempt("request", "codex", now - 450, 30, "PASSED") | {"status": "released"},
+            attempt("request", "agy", now - 400, 30, "PASSED") | {"retry_approved_by_caller": True},
+            attempt("request", "muse", now - 350, 30, "PASSED"),
+        ])
+        flag, = budget_watch.flags(now=now)
+        self.assertIn("后又派 2 次", flag["detail"])
+        self.assertIn("1 次带调用方批准声明，1 次无声明", flag["detail"])
+
     def test_malformed_ledgers_do_not_crash(self):
         for data in ({"scopes": []}, {"scopes": 1}, {"scopes": {"tasks": {"t": {"maximum": float("inf"), "last_used": 1}}}},
                      {"attempts": [{"task_id": ["x"], "started_at": 1}, {"task_id": "t", "started_at": float("nan")}, 3]},

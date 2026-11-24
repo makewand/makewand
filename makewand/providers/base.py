@@ -31,6 +31,9 @@ class ProviderAPIRelay:
     @property
     def available(self):
         from makewand.config import api_relay_available
+        from makewand.execution_runtime import current_context
+        if current_context().get("review_dispatch") is not None:
+            return False
         return api_relay_available(self.provider)
 
     def unavailable(self, reason, hint):

@@ -284,6 +284,7 @@ def select(
     request_id: Optional[str] = None,
     retry_approved: bool = False,
     status_reader=None,
+    review_policy=None,
 ) -> RouteResult:
     """选择这一档要派的候选。
 
@@ -308,10 +309,15 @@ def select(
     tier = _resolve_tier(task_type, difficulty, risk, tier_override)
     if full:
         if discovered is None:
-            discovered = _load_discovered_efforts()
+            discovered = _load_discovered_efforts(strict_catalogs=True) if review_policy is not None else _load_discovered_efforts()
         rows = candidates(tier, full=True, include_legacy=include_legacy, discovered=discovered)
     else:
         rows = candidates(tier)
+
+    verified_models = None
+    if review_policy is not None:
+        from makewand.review_policy import review_model_family, review_models
+        verified_models = review_models(discovered or {})
 
     marks = {}
     for name, mark in ledger.active_marks(moment).items():
@@ -336,6 +342,19 @@ def select(
     cached_status = status_reader() if status_reader is not None else {}
     if not isinstance(cached_status, Mapping):
         cached_status = {}
+    unavailable = {}
+    if review_policy is not None:
+        from makewand.config import has_subscription_configured
+        from makewand.engine_selection import _engine_usable
+        for provider in {row.provider for row in rows}:
+            # Scope quota refusals to the actual model below.
+            info = cached_status.get(provider) or {}
+            health = {} if isinstance(info, dict) and info.get("status") == "limited" else cached_status
+            usable, reason = _engine_usable(provider, health)
+            if not usable:
+                unavailable[provider] = reason
+            elif not has_subscription_configured(provider):
+                unavailable[provider] = "本机未找到可用的提供方 CLI"
 
     skipped = []
     seen_skipped = set()
@@ -350,12 +369,17 @@ def select(
             or _pause_reason(policy, row.provider, moment)
             or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
+            or unavailable.get(row.provider)
         )
         # The quota gate comes first: a redeemable Codex reset is keyed on its reason.
         quota_reason = None if provider_reason else (
             _quota_reason(row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
             or _model_mark_reason(marks, row.provider, _row_model(row), moment))
         reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
+        if not reason and review_policy is not None:
+            reason = review_policy.check_family(row.provider, row.model)
+            if not reason and (row.provider, row.model, row.effort) not in verified_models:
+                reason = "型号未列入当前目录的最新强档，或缺少高推理档证据"
         if quota_reason:
             quota_models.setdefault(row.provider, set()).add(_row_model(row))
         elif not provider_reason:
@@ -371,6 +395,10 @@ def select(
                 family_models[row.provider].append(model)
             continue
         available.append((index, row))
+    if review_policy is not None:
+        cross_family = [(i, row) for i, row in available
+                        if review_model_family(row.provider, row.model) != review_policy.author_family]
+        available = cross_family or available
     # 按 provider 计的原因同一家所有组合都一样；按模型家族跳过的列出具体模型。
     skipped = [
         (provider, reason or _model_family_reason(family_models[provider], not_tool))
@@ -436,7 +464,7 @@ def select(
     )
 
 
-def _load_discovered_efforts():
+def _load_discovered_efforts(*, strict_catalogs=False):
     """本地缓存里的模型 → 推理深度。读不到或为空时返回 None，目录用内置默认。
 
     只读已经落盘的缓存，不跑 ``agy models``，也不走网络。
@@ -444,7 +472,7 @@ def _load_discovered_efforts():
     try:
         from makewand.discovery import discover_model_efforts
 
-        found = discover_model_efforts()
+        found = discover_model_efforts(strict_catalogs=strict_catalogs) if strict_catalogs else discover_model_efforts()
     except Exception:
         return None
     if not isinstance(found, Mapping) or not found:

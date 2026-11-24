@@ -63,7 +63,8 @@
     "--caller"
   ],
   "python_boolean_flags": [
-    "--retry-approved"
+    "--retry-approved",
+    "--no-capacity-wait"
   ],
   "worker_static_args": [
     "-h",

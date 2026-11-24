@@ -304,9 +304,26 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     return None
 
 
-def before_cli_launch(provider, model, *, relay=None, cwd=None):
+def review_launch_refusal(provider, model, effort):
+    """Keep the selected high-risk model check at every launch boundary."""
+    from makewand.execution_runtime import current_context
+    expected = current_context().get("review_dispatch")
+    if expected is None:
+        return None
+    from makewand.discovery import discover_model_efforts
+    from makewand.review_policy import review_model_is_current
+    if expected != (provider, model, effort) or not review_model_is_current(
+            provider, model, effort, discover_model_efforts(strict_catalogs=True)):
+        return refuse_before_launch("高风险审查的型号或推理档已变化，请重新核对目录")
+    return None
+
+
+def before_cli_launch(provider, model, *, relay=None, cwd=None, effort=None):
     """Record the CLI resolution; enforce quota or use an explicitly allowed relay."""
     from makewand.execution_runtime import current_context
+    refusal = review_launch_refusal(provider, model, effort)
+    if refusal is not None:
+        return refusal
     context = current_context()
     evidence = context.get("_evidence")
     if isinstance(model, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,199}", model):

@@ -63,8 +63,9 @@ claude
         Sonnet high stays on the middle tier. Tier 3 is opus/fable high/max.
     strong (opus) / fable, low → 1; medium → 2; high → 3
         fable sorts after opus: it draws the subscription down faster.
-agy  (suffixed model id, no ``--effort``; credits are forced off, so a proxied
+agy  (exact model id, no ``--effort``; credits are forced off, so a proxied
       opus is allowed and simply fails when that pool is empty)
+    native bare IDs confirmed by the CLI → 3, using the CLI's default effort
     flash, low or medium → 1; high → 2
     argon, low → 1; medium → 2; high → 3
     proxied haiku, any effort → 1
@@ -125,6 +126,13 @@ PROVIDER_MODEL_FAMILIES = {
     "agy": "gemini",
     "grok": "grok",
     "muse": "muse",
+}
+MIN_CURRENT_MODEL_VERSIONS = {
+    "gpt": (6, 0, 0),
+    "claude": (5, 0, 0),
+    "gemini": (4, 0, 0),
+    "grok": (4, 7, 0),
+    "muse-spark": (1, 3, 0),
 }
 
 _DIFFICULTY_TIER = {"mechanical": 1, "normal": 2, "hard": 3}
@@ -509,26 +517,26 @@ def _is_legacy(provider: str, model: str) -> bool:
         name, _suffix = _split_effort_suffix(name)
         if name.startswith("claude-"):
             major = _claude_major(name)
-            return major is not None and major <= 4
+            return major is not None and major < MIN_CURRENT_MODEL_VERSIONS["claude"][0]
         if name.startswith("gpt-"):
             major = _gpt_major(name)
-            return major is not None and major < 6
+            return major is not None and major < MIN_CURRENT_MODEL_VERSIONS["gpt"][0]
         if name.startswith("gemini-") or name.startswith("google-"):
             version = _first_version(name)
-            return version is not None and version[0] < 4
+            return version is not None and version[0] < MIN_CURRENT_MODEL_VERSIONS["gemini"][0]
         return False
     if provider == "codex":
         major = _gpt_major(name)
-        return major is not None and major < 6
+        return major is not None and major < MIN_CURRENT_MODEL_VERSIONS["gpt"][0]
     if provider == "claude":
         major = _claude_major(name)
-        return major is not None and major <= 4
+        return major is not None and major < MIN_CURRENT_MODEL_VERSIONS["claude"][0]
     if provider == "grok":
         version = _first_version(name)
-        return version is not None and version < (4, 7)
+        return version is not None and version < MIN_CURRENT_MODEL_VERSIONS["grok"][:2]
     if provider == "muse" and "spark" in name:
         version = _first_version(name)
-        return version is not None and version < (1, 3)
+        return version is not None and version < MIN_CURRENT_MODEL_VERSIONS["muse-spark"][:2]
     return False
 
 
@@ -593,6 +601,8 @@ def _bare_model_id(text: str) -> str:
 
 
 def _efforts_for(provider: str, model: str, efforts) -> tuple:
+    if provider == "agy" and efforts == ["none"] and _is_native_gemini(model):
+        return ("none",)
     cleaned = _clean_efforts(efforts)
     if cleaned:
         return cleaned
@@ -668,32 +678,35 @@ def _resolve_model_efforts(discovered: Optional[Mapping]) -> dict:
 def _expand_combos(provider: str, model: str, efforts) -> list:
     """Yield (model id passed to the CLI, effort) pairs.
 
-    agy always uses the suffixed id and never a separate effort flag.
+    agy uses the exact listed ID for a fixed-effort model.
     """
     if provider == "agy":
         base, suffix = _split_effort_suffix(model)
         if suffix:
             return [(model, suffix)]
+        if efforts == ("none",):
+            return [(model, None)]
         return [(f"{base}-{effort}", effort) for effort in efforts]
     return [(model, effort) for effort in efforts]
 
 
-def _make_full_candidate(provider: str, model: str, effort: str) -> TierCandidate:
+def _make_full_candidate(provider: str, model: str, effort: Optional[str]) -> TierCandidate:
     if provider == "agy":
         args = ("--model", model)
     else:
         args = ("--model", model, "--effort", effort)
-    tier = _tier_class(provider, model, effort)
+    # A bare ID carries no evidence that it is suitable for a cheaper tier.
+    tier = 3 if effort is None else _tier_class(provider, model, effort)
     legacy = _is_legacy(provider, model)
     prefix = "旧版 · " if legacy else ""
-    label = f"{prefix}{_TIER_LABEL[tier]} · {provider} {model} · {effort}"
+    label = f"{prefix}{_TIER_LABEL[tier]} · {provider} {model} · {effort or '默认推理'}"
     return TierCandidate(
         provider=provider,
         args=args,
         label=label,
         model=model,
         effort=effort,
-        candidate_id=f"{provider}/{model}/{effort}",
+        candidate_id=f"{provider}/{model}/{effort or 'default'}",
         tier_class=tier,
         legacy=legacy,
     )
