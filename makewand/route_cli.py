@@ -192,8 +192,14 @@ def _request_arguments(execution_options, *, include_maximum=False):
     return parts
 
 
+def _is_same_review_family(candidate, options):
+    from makewand.review_policy import review_model_family
+    return review_model_family(candidate.provider, candidate.model) == options.get("review_author_family")
+
+
 def _command_for(candidate, execution_options) -> str:
-    parts = ["makewand", candidate.provider, *candidate.args,
+    model_args = [shlex.quote(value) for value in candidate.args] if execution_options.get("review_author") else candidate.args
+    parts = ["makewand", candidate.provider, *model_args,
              "-C", "<目录>", "-f", "<子任务文件>", "--max-model-calls",
              str(execution_options.get("request_budget", 1))]
     parts += _request_arguments(execution_options)
@@ -202,6 +208,14 @@ def _command_for(candidate, execution_options) -> str:
               "--total-timeout", str(timeout or execution_options["total_timeout"])]
     if execution_options["readonly"]:
         parts.append("--readonly")
+    if execution_options.get("review_author"):
+        parts.extend(("--risk", "high", "--review-author", shlex.quote(execution_options["review_author"])))
+        for family in execution_options["exclude_review_family"]:
+            parts.extend(("--exclude-review-family", family))
+        if execution_options.get("allow_same_family_review") and _is_same_review_family(candidate, execution_options):
+            parts.append("--allow-same-family-review")
+    if execution_options.get("no_capacity_wait"):
+        parts.append("--no-capacity-wait")
     if execution_options.get("repo_trust") == "untrusted":
         parts.extend(("--repo-trust", "untrusted"))
     return " ".join(parts)
@@ -268,6 +282,23 @@ def cmd_route(args) -> None:
         except ValueError as error:
             _fail(f"错误：--self {error}")
     simple = bool(getattr(args, "simple", False))
+    review_policy = None
+    author = getattr(args, "review_author", None)
+    excludes = getattr(args, "exclude_review_family", [])
+    allow_same = bool(getattr(args, "allow_same_family_review", False))
+    if task_type == "review" and risk == "high":
+        from makewand.review_policy import ReviewPolicy, review_family
+        try:
+            if author and not_tool and review_family(author) != review_family(not_tool):
+                raise ValueError("代理实现方请用 --review-author 替换 --not，两者同时提供时家族须一致")
+            author = author or not_tool
+            review_policy = ReviewPolicy.from_options(author, excludes, allow_same)
+            if simple or getattr(args, "legacy", False) or getattr(args, "route_tier", None) not in (None, 3):
+                raise ValueError("高风险审查需要完整目录和第 3 档")
+        except ValueError as error:
+            _fail(f"错误：{error}。可用 --not 或 --review-author 指定实现方")
+    elif author or excludes or allow_same:
+        _fail("错误：审查约束需要 route review --risk high")
     from makewand.health import load_status_cache
     try:
         policy = load_policy()
@@ -279,7 +310,8 @@ def cmd_route(args) -> None:
     options = dict(
         risk=risk,
         self_tool=self_tool,
-        not_tool=not_tool,
+        not_tool=not_tool if review_policy is None else None,
+        review_policy=review_policy,
         tier_override=getattr(args, "route_tier", None),
         policy=policy,
         quota_reader=quota_reader,
@@ -292,7 +324,7 @@ def cmd_route(args) -> None:
     try:
         try:
             result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
-            if repo_trust == "trusted" and _restore_codex_reset(policy, result, not_tool):
+            if review_policy is None and repo_trust == "trusted" and _restore_codex_reset(policy, result, not_tool):
                 result = select(task_type, difficulty, ledger=OutcomeLedger(), **options)
         except PermissionError:
             if getattr(args, "request_id", None):
@@ -306,6 +338,13 @@ def cmd_route(args) -> None:
     budget = int(getattr(policy, "request_budget", 3) or 3)
     execution_options = _execution_options(task_type, difficulty, result.tier, getattr(args, "total_timeout", None))
     execution_options["repo_trust"] = repo_trust
+    if review_policy is not None:
+        execution_options.update(review_author=author, review_author_family=review_policy.author_family,
+                                 exclude_review_family=sorted(review_policy.excluded_families),
+                                 allow_same_family_review=allow_same)
+    no_capacity_wait = bool(getattr(args, "no_capacity_wait", False))
+    if no_capacity_wait:
+        execution_options["no_capacity_wait"] = True
     if getattr(args, "request_id", None):
         budget = int(os.environ.get("MAKEWAND_MAX_MODEL_CALLS") or budget)
         execution_options.update(request_id=args.request_id, request_budget=budget)
@@ -333,6 +372,10 @@ def cmd_route(args) -> None:
         }
         if retry_required:
             payload.update(retry_approval_required=True, retry_warning=_RETRY_HINT, uncertain_attempts=uncertain)
+        if review_policy is not None:
+            payload["same_family_fallback"] = any(_is_same_review_family(row, execution_options) for row in result.candidates)
+            if not result.candidates:
+                payload["review_policy_warning"] = "无符合约束的候选，核对本机目录、额度和排除项。只有用户明确允许时才启用同家族回退。"
         forecasts = weekly_forecasts(policy)
         if forecasts:
             payload["quota_warnings"] = list(forecasts.values())
@@ -361,8 +404,12 @@ def cmd_route(args) -> None:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
     lines.extend(f"  注意：{note}" for note in weekly_forecasts(policy).values())
+    if review_policy is not None and any(_is_same_review_family(row, execution_options) for row in shown):
+        lines.append("  本次候选使用了明确批准的同家族回退。")
     if not result.candidates and not retry_required:
-        if result.escalate_tier is not None:
+        if review_policy is not None:
+            lines.append("  无符合约束的候选。核对目录、额度和排除项，再确认是否允许同家族回退。")
+        elif result.escalate_tier is not None:
             lines.append("  没有可用候选：可以升一档，或等额度恢复、暂停结束后再试。")
         else:
             lines.append("  没有可用候选：已是最高档，等额度恢复、暂停结束后再试。")
@@ -377,6 +424,8 @@ def cmd_route(args) -> None:
             escalate_cmd += " --risk high"
         if repo_trust == "untrusted":
             escalate_cmd += " --repo-trust untrusted"
+        if no_capacity_wait:
+            escalate_cmd += " --no-capacity-wait"
         if self_tool:
             escalate_cmd += f" --self {self_tool}"
         if not_tool and str(not_tool).strip():

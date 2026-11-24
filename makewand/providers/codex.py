@@ -175,8 +175,8 @@ def execute_codex_task(
     else:
         cmd.append(prompt)
 
-    from makewand.model_quota import before_cli_launch
-    quota_refusal = before_cli_launch('codex', target_model, relay=relay, cwd=cwd)
+    from makewand.model_quota import before_cli_launch, review_launch_refusal
+    quota_refusal = before_cli_launch('codex', target_model, relay=relay, cwd=cwd, effort=target_effort)
     if quota_refusal is not None:
         return quota_refusal
 
@@ -193,6 +193,9 @@ def execute_codex_task(
         ) as launch:
             import sys
             print(c(f"[Makewand -> Codex] 派发任务 (Tier: {tier}, {target_model})...", COLOR_CYAN), file=sys.stderr)
+            refusal = review_launch_refusal("codex", target_model, target_effort)
+            if refusal is not None:
+                return refusal
             note_dispatch_route("cli")
             mark_provider_invocation()
             code, out, err, ex = run_subprocess(

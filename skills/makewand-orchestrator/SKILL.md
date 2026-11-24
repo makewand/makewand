@@ -30,7 +30,15 @@ makewand route review hard --risk high --self <你> --not <实现方> --request-
 makewand route review normal --self <你> --not <实现方> --request-id <ID> --caller <你> --max-model-calls <N>
 ```
 
+高风险审查先看 `makewand models --json` 和带同一请求约束的 `route --json`。实现方经代理调用时，用 `--review-author <实现方的实际模型 ID>` 替换 `--not <实现方>`。站主要求排除的家族用 `--exclude-review-family <家族>`，包含经 AGY 代理的同家族型号。照抄候选中的精确型号、实际推理档和审查约束。只有用户明确批准同家族回退才加 `--allow-same-family-review`。
+
+改用独立子代理时也先核对该入口当前可用的型号和推理档。高风险选当前强档并使用独立只读上下文。同家族的不同代际仍属同一家族；获准回退时也选择当前强档。交付时记录派发型号、推理档和回退依据，并核对完整候选哈希与 nonce。实际执行型号以可取得的运行证据为准。
+
 类型可为 review/implement/test/research/doc，难度为 mechanical/normal/hard。先选够用的最便宜档，验收失败再升档；高风险直接强档，审查尽量跨模型家族。route 不调用模型，会避开暂停、额度过线、429 标记及本请求已记录的操作失败；审查不派 Grok（`makewand review` 也不再默认用它）；agy credits 保持禁用。
+
+用户指定最新型号时，先用 `makewand models --json` 核对当前账号的可见模型，再看 `route --json` 中符合档位、额度和家族约束的候选。路由顺序考虑档位、额度和历史验收。显式的 `--model` 会固定型号，复用旧命令前先核对这一项。AGY 型号用 CLI 列出的完整 ID；必要时用 `makewand models --refresh` 更新 AGY 列表。
+
+普通审查已有其他符合要求的候选，或可以稍后派发时，若已安装版本支持，在 `route` 加 `--no-capacity-wait`。名额已满会立即报告容量占用，模型尚未启动。确认同一任务是否已经在运行，或选择其他符合要求的候选。UNKNOWN/超时后重跑同一子任务仍需用户授权。
 
 带请求 ID 时，route 输出保留同一 ID、发起工具和请求**总上限**，不是每条命令各一份上限。默认单任务输出中的 `--max-model-calls 1` 不能另建 ID 来绕过总预算。旧版没有 `--request-id` 时，用每条命令显式传同一个 `MAKEWAND_TASK_ID` 和同一总上限；不能依赖一次 shell 的 export 跨工具调用持久化。
 

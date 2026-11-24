@@ -153,8 +153,8 @@ def execute_claude_task(
     if target_effort and target_effort != "none":
         cmd.extend(["--effort", target_effort])
 
-    from makewand.model_quota import before_cli_launch
-    quota_refusal = before_cli_launch('claude', target_model, relay=relay, cwd=cwd)
+    from makewand.model_quota import before_cli_launch, review_launch_refusal
+    quota_refusal = before_cli_launch('claude', target_model, relay=relay, cwd=cwd, effort=target_effort)
     if quota_refusal is not None:
         return quota_refusal
 
@@ -172,6 +172,9 @@ def execute_claude_task(
             log_desc = "只读解析任务 (工具只读约束)" if readonly else "代码任务 (无头权限自动穿透)"
             import sys
             print(c(f"[Makewand -> Claude] 派发{log_desc} (Tier: {tier})...", COLOR_BLUE), file=sys.stderr)
+            refusal = review_launch_refusal("claude", target_model, target_effort)
+            if refusal is not None:
+                return refusal
             note_dispatch_route("cli")
             mark_provider_invocation()
             code, out, err, ex = run_subprocess(

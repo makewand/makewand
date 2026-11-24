@@ -1,0 +1,155 @@
+"""Model constraints for explicitly high-risk reviews."""
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+from makewand.discovery import _split_agy_suffix
+from makewand.routing_catalog import MIN_CURRENT_MODEL_VERSIONS, PROVIDER_MODEL_FAMILIES, _tier_class, candidates
+
+HIGH_EFFORTS = frozenset(("high", "xhigh", "max", "ultra"))
+NATIVE_PROVIDERS = {family: provider for provider, family in PROVIDER_MODEL_FAMILIES.items()}
+VENDOR_FAMILIES = {
+    "anthropic": {"claude"},
+    "openai": {"gpt"},
+    "google": {"gemini", "gemma"},
+    "xai": {"grok"},
+}
+CLAUDE_SERIES = r"haiku|sonnet|opus|fable|mythos"
+VERSION = r"[0-9]{1,2}(?:[.-][0-9]{1,2}){0,2}"
+VERSION_END = r"(?=$|[-._:\[])"
+MODEL_FAMILY = re.compile(
+    r"^(gpt|gemini|gemma|grok|muse|qwen|llama|deepseek|glm|kimi)(?=$|[-._0-9])"
+)
+
+
+@dataclass(frozen=True)
+class ReviewModelIdentity:
+    family: str
+    model: str
+    series: str = ""
+    version: tuple = ()
+
+
+def review_model_identity(provider, model) -> Optional[ReviewModelIdentity]:
+    """Interpret the underlying model while leaving the provider's ID intact."""
+    name = (model or "").lower()
+    if provider == "agy":
+        name = _split_agy_suffix(name)[0]
+    vendor, separator, name = name.rpartition("/")
+    if separator and vendor not in VENDOR_FAMILIES:
+        return None
+    # Claude has used both product-before-version and version-before-product.
+    historical = re.match(rf"^claude-({VERSION})-({CLAUDE_SERIES}){VERSION_END}", name)
+    if historical:
+        version, series = historical.groups()
+        name = f"claude-{series}-{version}" + name[historical.end():]
+    claude = re.match(rf"^(?:claude-)?({CLAUDE_SERIES}){VERSION_END}", name)
+    muse = re.match(r"^muse-([a-z]+)(?=-|$)", name)
+    series = ""
+    if claude:
+        family, series = "claude", claude[1]
+        version_text = name[claude.end():].removeprefix("-")
+        if not name.startswith("claude-"):
+            name = "claude-" + name
+    elif muse:
+        family, series = "muse", muse[1]
+        version_text = name[muse.end():].removeprefix("-")
+    else:
+        if re.match(r"^google-(?:gemini-|[0-9])", name):
+            name = "gemini-" + name.removeprefix("google-").removeprefix("gemini-")
+        match = MODEL_FAMILY.match(name)
+        if match:
+            family = match[1]
+            version_text = name[match.end():].removeprefix("-")
+        elif name == "claude" or re.match(r"^(?:o[134]|codex)(?=$|-)", name):
+            family = "claude" if name == "claude" else "gpt"
+            version_text = ""
+        else:
+            return None
+    if separator and family not in VENDOR_FAMILIES[vendor]:
+        return None
+    version_match = re.match(rf"^({VERSION}){VERSION_END}", version_text)
+    version = ()
+    if version_match:
+        parts = tuple(int(part) for part in re.split(r"[.-]", version_match[1]))
+        version = parts + (0,) * (3 - len(parts))
+    return ReviewModelIdentity(family, name, series, version)
+
+
+def review_model_family(provider, model):
+    identity = review_model_identity(provider, model)
+    return identity.family if identity else None
+
+
+def review_family(name):
+    if not name:
+        raise ValueError("高风险审查需要指定实际实现方")
+    family = PROVIDER_MODEL_FAMILIES.get(name.lower()) or review_model_family(None, name)
+    if family is None:
+        raise ValueError("无法确认实现方或排除项的模型家族")
+    return family
+
+
+@dataclass(frozen=True)
+class ReviewPolicy:
+    author_family: str
+    excluded_families: frozenset
+    allow_same_family: bool = False
+
+    @classmethod
+    def from_options(cls, author, excludes, allow_same_family):
+        return cls(review_family(author), frozenset(review_family(name) for name in excludes), allow_same_family)
+
+    def check_family(self, provider, model):
+        family = review_model_family(provider, model)
+        if provider == "grok" or family == "grok":
+            return "高风险审查排除 Grok"
+        if not family or family in self.excluded_families:
+            return "模型家族未知或已排除"
+        if family == self.author_family and not self.allow_same_family:
+            return "与实现方同模型家族，需要明确批准回退"
+        return None
+
+
+def review_models(discovered):
+    """Newest discovered strong generation per model lineage, including proxies."""
+    rows = []
+    newest = {}
+    for row in candidates(3, full=True, discovered=discovered):
+        if row.effort not in HIGH_EFFORTS or row.effort not in discovered.get(row.provider, {}).get(row.model, ()):
+            continue
+        identity = review_model_identity(row.provider, row.model)
+        if not identity or not identity.version or identity.version == (0, 0, 0):
+            continue
+        version_key = "muse-spark" if identity.family == "muse" and identity.series == "spark" else identity.family
+        if identity.version < MIN_CURRENT_MODEL_VERSIONS.get(version_key, (0, 0, 0)):
+            continue
+        native = NATIVE_PROVIDERS.get(identity.family, row.provider)
+        if _tier_class(native, identity.model, row.effort) != 3:
+            continue
+        group = (identity.family, identity.series)
+        version = identity.version
+        newest[group] = max(newest.get(group, version), version)
+        rows.append((row, group, version))
+    return {(row.provider, row.model, row.effort) for row, group, version in rows if version == newest[group]}
+
+
+def validate_review_dispatch(policy, provider, model, effort, discovered):
+    if provider == "agy":
+        suffix = _split_agy_suffix(model or "")[1]
+        # AGY carries its effective effort in the model ID.
+        if effort and effort != suffix:
+            raise ValueError("AGY 的推理档必须与模型 ID 后缀一致")
+        effort = suffix
+    reason = policy.check_family(provider, model)
+    if reason:
+        raise ValueError(reason)
+    if not review_model_is_current(provider, model, effort, discovered):
+        raise ValueError("型号或推理档未通过高风险审查校验。请核对本机目录并重新运行 route review hard --risk high")
+    return effort
+
+
+def review_model_is_current(provider, model, effort, discovered):
+    if provider == "agy":
+        effort = _split_agy_suffix(model or "")[1]
+    return (provider, model, effort) in review_models(discovered)

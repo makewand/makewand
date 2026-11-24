@@ -117,11 +117,13 @@ def initialize_cli_task():
 def execution_context(**values):
     context = current_context()
     allowed = {"task_id", "stage", "deadline_unix_ms", "workflow", "risk", "readonly", "lease_id",
-               "wait_for_capacity", "caller", "retry_approved"}
+               "wait_for_capacity", "caller", "retry_approved", "review_dispatch"}
     if set(values) - allowed:
         raise ValueError("unsupported execution context field")
     # None inherits the parent, except lease_id where None explicitly releases
     # a stage-local hold before entering an unreserved stage.
+    if context.get("wait_for_capacity") is False and values.get("wait_for_capacity") is True:
+        values["wait_for_capacity"] = False
     context.update({key: value for key, value in values.items() if value is not None or key == "lease_id"})
     if "task_id" not in context:
         context["task_id"] = task_id()

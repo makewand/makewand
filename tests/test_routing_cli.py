@@ -81,6 +81,18 @@ class RoutingCliTests(unittest.TestCase):
             self.assertIn("--repo-trust untrusted", candidate["command"])
             self.assertIn("--readonly", candidate["command"])
 
+    def test_no_capacity_wait_survives_candidates_and_escalation(self):
+        args = ("review", "normal", "--tier", "1", "--simple", "--no-capacity-wait")
+        result = self.run_cli("route", *args, quota={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--no-capacity-wait", next(
+            line for line in result.stdout.splitlines() if line.startswith("验收不过就升一档：")))
+        payload = self.route_json(*args, quota={})
+        self.assertIs(payload["no_capacity_wait"], True)
+        self.assertTrue(payload["candidates"])
+        for candidate in payload["candidates"]:
+            self.assertIn("--no-capacity-wait", candidate["command"].split())
+
     def test_review_rejection_is_a_valid_review_and_has_separate_metadata(self):
         result = self.run_cli("outcome", "codex", "3", "review", "pass", "--candidate-verdict", "fail",
                               "--seconds", "12.5", "--calls", "1", "--request-id", "review-42",
@@ -761,7 +773,7 @@ class RoutingCliTests(unittest.TestCase):
     # ---------- mark ----------
 
     def test_mark_on_one_model_leaves_its_siblings_routable(self):
-        before = self.route_json("review", "hard", "--risk", "high", quota={})["candidates"]
+        before = self.route_json("review", "hard", quota={})["candidates"]
         models = sorted({item["model"] for item in before if item["provider"] == "agy"})
         self.assertGreater(len(models), 1)
         result = self.run_cli("mark", "agy", "6h", "--model", models[0], "--reason", "周额度", quota={})
@@ -769,25 +781,260 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn(f"agy 的 {models[0]}", result.stdout)
         marks = json.loads((self.routing_dir / "marks.json").read_text(encoding="utf-8"))
         self.assertEqual(list(marks), [f"agy:{models[0]}"])
-        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        payload = self.route_json("review", "hard", quota={})
         left = {item["model"] for item in payload["candidates"] if item["provider"] == "agy"}
         self.assertEqual(left, set(models[1:]))
         reasons = {item["provider"]: item["reason"] for item in payload["skipped"]}
         self.assertIn(f"部分模型受限（{models[0]}）", reasons["agy"])
 
     def test_a_codex_review_gets_a_shorter_time_limit(self):
-        payload = self.route_json("review", "hard", "--risk", "high", quota={})
+        payload = self.route_json("review", "hard", quota={})
         self.assertEqual(payload["timeout"], 5400)
         by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
         self.assertIn("--timeout 1800 --total-timeout 1800", by_tool["codex"])
         self.assertIn("--timeout 5400 --total-timeout 5400", by_tool["agy"])
 
     def test_a_requested_time_limit_applies_to_codex_too(self):
-        payload = self.route_json("review", "hard", "--risk", "high", "--total-timeout", "4000", quota={})
+        payload = self.route_json("review", "hard", "--total-timeout", "4000", quota={})
         by_tool = {item["provider"]: item["command"] for item in payload["candidates"]}
         self.assertIn("--timeout 4000 --total-timeout 4000", by_tool["codex"])
         implement = self.route_json("implement", "hard", quota={})
         self.assertNotIn("provider_timeouts", implement)
+
+    def test_high_risk_review_uses_discovered_models_and_carries_constraints(self):
+        self.write_discovery_cache()
+        codex_cache = self.home / ".codex" / "models_cache.json"
+        codex_cache.write_text(json.dumps({"models": [
+            {"slug": model, "supported_reasoning_levels": [{"effort": "high"}]}
+            for model in ("gpt-5.6-terra", "gpt-6.1-terra", "gpt-6.2-astra")
+        ]}))
+        options = ("review", "hard", "--risk", "high", "--not", "agy",
+                   "--exclude-review-family", "claude")
+        payload = self.route_json(*options, quota={})
+        self.assertEqual({c["model"] for c in payload["candidates"]}, {"gpt-6.2-astra"})
+        command = payload["candidates"][0]["command"]
+        self.assertIn("--risk high --review-author agy", command)
+        self.assertIn("--exclude-review-family claude", command)
+        self.assertFalse(payload["same_family_fallback"])
+        invalid = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
+                               "--model", "gpt-6.1-terra", "--effort", "high", "fixture")
+        self.assertEqual(invalid.returncode, 2, invalid.stderr)
+        self.assertIn("未通过高风险审查校验", invalid.stderr)
+        self.assertFalse(self.stub_lines())
+
+        same = ("review", "hard", "--risk", "high", "--not", "codex", "--exclude-review-family", "agy",
+                "--exclude-review-family", "claude", "--exclude-review-family", "muse")
+        denied = self.route_json(*same, quota={})
+        self.assertFalse(denied["candidates"])
+        fallback = self.route_json(*same, "--allow-same-family-review", quota={})
+        self.assertTrue(fallback["same_family_fallback"])
+        self.assertTrue(fallback["candidates"])
+        self.assertIn("--allow-same-family-review", fallback["candidates"][0]["command"])
+        preferred = self.route_json(*options, "--allow-same-family-review", quota={})
+        self.assertFalse(preferred["same_family_fallback"])
+        self.assertNotIn("--allow-same-family-review", preferred["candidates"][0]["command"])
+
+    def test_high_risk_review_cannot_use_slim_catalog_or_default_dispatch(self):
+        for args in (("route", "review", "hard", "--risk", "high"),
+                     ("route", "review", "hard", "--risk", "high", "--not", "codex", "--simple"),
+                     ("review", "--risk", "high"),
+                     ("codex", "--readonly", "--risk", "high", "fixture")):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_cli(*args, quota={}).returncode, 2)
+        self.assertFalse(self.stub_lines())
+
+    def test_high_risk_review_ignores_agy_display_name_without_cli_id(self):
+        settings = self.home / ".gemini" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text(json.dumps({"available_models": ["Gemini 4 Argon (High)"]}))
+        options = ("review", "hard", "--risk", "high", "--not", "codex")
+        self.assertFalse(self.route_json(*options, quota={})["candidates"])
+        result = self.run_cli("agy", "--readonly", "--risk", "high", "--review-author", "codex",
+                              "--model", "gemini-4-argon-high", "fixture")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("未通过高风险审查校验", result.stderr)
+        self.assertFalse(self.stub_lines())
+
+    def test_high_risk_review_compares_model_versions_across_proxies(self):
+        from makewand.review_policy import review_models
+        discovered = {
+            "agy": {"claude-opus-5-4-high": ["high"]},
+            "claude": {"claude-opus-5-5": ["high"], "claude-fable-5-2": ["high"], "opus": ["high"]},
+        }
+        self.assertEqual(review_models(discovered), {
+            ("claude", "claude-opus-5-5", "high"),
+            ("claude", "claude-fable-5-2", "high"),
+        })
+
+    def test_high_risk_review_preserves_model_tier_across_proxies(self):
+        from makewand.review_policy import review_models
+
+        discovered = {
+            "agy": {"gpt-6.2-luna-high": ["high"], "gpt-6.2-astra-high": ["high"]},
+            "muse": {"gpt-6.2-luna": ["high"], "claude-sonnet-5-5": ["high"],
+                     "gemini-4-flash": ["high"], "gpt-5.6-astra": ["high"],
+                     "gpt-6.2-astra": ["high"]},
+        }
+        self.assertEqual(review_models(discovered), {
+            ("agy", "gpt-6.2-astra-high", "high"),
+            ("muse", "gpt-6.2-astra", "high"),
+        })
+
+    def test_high_risk_review_compares_namespaced_and_bare_model_lineages(self):
+        from makewand.review_policy import ReviewPolicy, review_models, validate_review_dispatch
+
+        discovered = {
+            "muse": {"google/gemini-3.1-pro": ["high"], "opus-4-6": ["high"],
+                     "anthropic/opus-5-4": ["high"], "anthropic/claude-opus-5-5": ["high"],
+                     "openai/gpt-5.6-astra": ["high"], "claude-3-opus-20240229": ["high"],
+                     "openai/gpt5.6-astra": ["high"], "google/gemini3.1-pro": ["high"],
+                     "anthropic/claude-3-5-sonnet-20241022": ["high"],
+                     "claude-5-4-opus-20261022": ["high"]},
+            "claude": {"claude-opus-5-5": ["high"]},
+        }
+        self.assertEqual(review_models(discovered), {
+            ("claude", "claude-opus-5-5", "high"),
+            ("muse", "anthropic/claude-opus-5-5", "high"),
+        })
+        for model in ("claude-3-opus-20240229", "openai/gpt5.6-astra", "google/gemini3.1-pro"):
+            with self.subTest(model=model), self.assertRaisesRegex(ValueError, "未通过高风险审查校验"):
+                validate_review_dispatch(ReviewPolicy.from_options("muse", (), False), "muse",
+                                         model, "high", {"muse": {model: ["high"]}})
+
+    def test_high_risk_gemma_namespace_uses_same_family_in_route_and_dispatch(self):
+        model = "google/gemma-3-27b-it"
+        profile = self.home / ".local" / "share" / "muse"
+        catalog = profile / "model-catalog"
+        catalog.mkdir(parents=True)
+        (catalog / "catalog.json").write_text(json.dumps({"rows": [
+            {"model_id": model, "reasoning_effort_variants": ["high"]},
+        ]}))
+        env = {"MUSE_DATA_DIR": str(profile)}
+        route = ("review", "hard", "--risk", "high", "--review-author", "gemma-3-27b-it")
+        self.assertFalse(self.route_json(*route, quota={}, extra_env=env)["candidates"])
+        approved = self.route_json(*route, "--allow-same-family-review", quota={}, extra_env=env)
+        self.assertTrue(approved["same_family_fallback"])
+        self.assertEqual([row["model"] for row in approved["candidates"]], [model])
+        command = approved["candidates"][0]["command"]
+        self.assertIn("--model google/gemma-3-27b-it", command)
+        self.assertIn("--allow-same-family-review", command)
+        excluded = self.route_json("review", "hard", "--risk", "high", "--review-author", "codex",
+                                   "--exclude-review-family", "gemma", quota={}, extra_env=env)
+        self.assertFalse(excluded["candidates"])
+
+        direct = self.run_cli("muse", "--readonly", "--risk", "high", "--review-author", "gemma-3-27b-it",
+                              "--model", model, "--effort", "high", "fixture", extra_env=env)
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertIn("与实现方同模型家族", direct.stderr)
+        self.assertFalse(self.stub_lines())
+
+    def test_incompatible_muse_profile_does_not_hide_approved_fallback(self):
+        from unittest.mock import patch
+        from makewand.outcome_ledger import OutcomeLedger
+        from makewand.review_policy import ReviewPolicy
+        from makewand.route_select import Policy, select
+
+        profile = self.base / "custom-muse"
+        catalog = profile / "model-catalog"
+        catalog.mkdir(parents=True)
+        (catalog / "catalog.json").write_text(json.dumps({"rows": [
+            {"model_id": "muse-wonder-1.0", "reasoning_effort_variants": ["high"]},
+        ]}))
+        codex = {"gpt-6.2-astra": ["high"]}
+        with patch.dict(os.environ, {"HOME": str(self.home), "MUSE_DATA_DIR": str(profile)}), \
+                patch("makewand.discovery._codex_effort_map", return_value=codex), \
+                patch("makewand.config.has_subscription_configured", return_value=True), \
+                patch("makewand.engine_selection._engine_usable", return_value=(True, "")), \
+                patch("makewand.sandbox.is_bwrap_available", return_value=True):
+            result = select("review", "hard", risk="high", full=True, policy=Policy(),
+                            ledger=OutcomeLedger(self.routing_dir), quota_reader=lambda: {},
+                            status_reader=lambda: {}, review_policy=ReviewPolicy.from_options("codex", (), True))
+        self.assertEqual({row.provider for row in result.candidates}, {"codex"})
+
+    def test_missing_cross_family_cli_does_not_hide_approved_fallback(self):
+        from unittest.mock import patch
+        from makewand.outcome_ledger import OutcomeLedger
+        from makewand.review_policy import ReviewPolicy
+        from makewand.route_select import Policy, select
+
+        discovered = {"codex": {"gpt-6.2-astra": ["high"]},
+                      "agy": {"gemini-4-argon-high": ["high"]}}
+        with patch("makewand.config.has_subscription_configured", side_effect=lambda provider: provider == "agy"):
+            result = select("review", "hard", risk="high", full=True, discovered=discovered,
+                            policy=Policy(), ledger=OutcomeLedger(self.routing_dir),
+                            quota_reader=lambda: {}, status_reader=lambda: {},
+                            review_policy=ReviewPolicy.from_options("agy", (), True))
+        self.assertEqual({row.provider for row in result.candidates}, {"agy"})
+        self.assertIn("未找到可用", dict(result.skipped)["codex"])
+
+    def test_high_risk_review_does_not_restore_hidden_muse_model_from_fallback(self):
+        active = self.base / "muse-active"
+        older = self.home / ".local" / "share" / "muse"
+        model = {"model_id": "muse-wonder-1.0", "reasoning_effort_variants": ["high"]}
+        for directory, entry in ((active, dict(model, visibility="hidden")), (older, model)):
+            (directory / "model-catalog").mkdir(parents=True)
+            (directory / "model-catalog" / "catalog.json").write_text(json.dumps({"rows": [entry]}))
+        result = self.run_cli("route", "review", "hard", "--risk", "high", "--review-author",
+                              "claude-opus-5-5-high", "--json", quota={}, extra_env={"MUSE_DATA_DIR": str(active)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["review_author_family"], "claude")
+        self.assertFalse(any(row["provider"] == "muse" for row in payload["candidates"]))
+        (active / "model-catalog" / "catalog.json").unlink()
+        result = self.run_cli("route", "review", "hard", "--risk", "high", "--review-author",
+                              "claude-opus-5-5-high", "--json", quota={}, extra_env={"MUSE_DATA_DIR": str(active)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(row["provider"] == "muse" for row in json.loads(result.stdout)["candidates"]))
+
+    def test_high_risk_muse_requires_latest_snapshot_in_selected_profile(self):
+        active = self.base / "active-muse"
+        selected = active / "model-catalog"
+        selected.mkdir(parents=True)
+        default = self.home / ".local" / "share" / "muse" / "model-catalog"
+        default.mkdir(parents=True)
+        model = {"model_id": "muse-wonder-1.0", "reasoning_effort_variants": ["high"]}
+        visible = json.dumps({"rows": [model]})
+        (default / "catalog.json").write_text(visible)
+        route = ("route", "review", "hard", "--risk", "high", "--not", "codex", "--json")
+        missing = self.base / "empty-xdg"
+        missing.mkdir()
+        for overrides in ({"MUSE_DATA_DIR": ""}, {"MUSE_DATA_DIR": "relative"}, {"MUSE_DATA_DIR": "~/muse"},
+                          {"XDG_DATA_HOME": str(missing)}, {"MUSE_DATA_DIR": str(active)}):
+            with self.subTest(overrides=overrides):
+                result = self.run_cli(*route, quota={}, extra_env=overrides)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(any(row["provider"] == "muse" for row in json.loads(result.stdout)["candidates"]))
+
+        (default / "catalog.json").unlink()
+        selected = default
+        old = selected / "older.json"
+        old.write_text(visible)
+        os.utime(old, (1_000_000, 1_000_000))
+        latest = selected / "latest.json"
+        env = {"MUSE_DATA_DIR": str(default.parent)}
+        for content in ("", "{broken", json.dumps({"rows": [dict(model, visibility="hidden")]}), visible):
+            with self.subTest(content=content):
+                latest.write_text(content)
+                result = self.run_cli(*route, quota={}, extra_env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(any(row["provider"] == "muse" for row in json.loads(result.stdout)["candidates"]),
+                                 content == visible)
+        (selected / "directory.json").mkdir()
+        os.utime(latest, (1_100_000, 1_100_000))
+        result = self.run_cli(*route, quota={}, extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(row["provider"] == "muse" for row in json.loads(result.stdout)["candidates"]))
+        from makewand.sandbox import CREDENTIAL_MAX_BYTES
+        latest.write_text(visible + " " * CREDENTIAL_MAX_BYTES)
+        result = self.run_cli(*route, quota={}, extra_env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(row["provider"] == "muse" for row in json.loads(result.stdout)["candidates"]))
+        latest.write_text("")
+        direct = self.run_cli("muse", "--readonly", "--risk", "high", "--review-author", "codex",
+                              "--model", "muse-wonder-1.0", "--effort", "high", "fixture", extra_env=env)
+        self.assertEqual(direct.returncode, 2, direct.stderr)
+        self.assertIn("未通过高风险审查校验", direct.stderr)
+        self.assertFalse(self.stub_lines())
 
     def test_mark_rejects_a_blank_or_ambiguous_model(self):
         for model in ("", " ", "a:b"):

@@ -43,6 +43,35 @@ admission. A missing request is reported, not silently created or reset.
 
 ## Review quality differs from code approval
 
+For high-risk reviews, `route review hard --risk high --not <tool>` verifies
+an exact, strong model and a high reasoning effort from the local catalog.
+Replace `--not <tool>` with `--review-author <actual-model>` when a CLI carries
+another vendor's model. Repeat `--exclude-review-family` for project exclusions. The
+generated read-only provider command carries those checks. The provider
+command validates the selected model again before dispatch and requires
+`subscription_only` to disable Makewand's paid API relay. The provider CLI's
+own login and billing configuration govern its invocation. Use `--allow-same-family-review` only for an explicitly
+authorized fallback. Routing offers an eligible cross-family reviewer first.
+
+Model versions are compared within the same model lineage using the local
+catalog. Routing and dispatch interpret recognized vendor namespaces and model
+name formats in the same way, while sending the exact catalog ID to the CLI.
+Refresh older AGY catalogs with `makewand models --refresh` to make the
+exact CLI spellings available for high-risk review.
+For Muse, high-risk review uses the latest snapshot in the active profile.
+The catalog directory is `model-catalog` under `MUSE_DATA_DIR`, then under
+`$XDG_DATA_HOME/muse` when the Muse override is absent, otherwise under
+`~/.local/share/muse`. Supply an absolute path for either override.
+An empty override, missing or unreadable snapshot, snapshot over 4 MiB, or
+ambiguity between equally recent snapshots leaves no verified Muse review candidates.
+The current Muse sandbox uses the default profile. When the sandbox is
+available, routing excludes a different host profile and launch checks the
+profile again.
+For the default profile, Makewand copies only the selected current snapshot to
+the private sandbox home and verifies its contents again before launch.
+Proxy models must also qualify for the strong tier under the rules for their
+underlying model family.
+
 For `outcome`, positional `pass` means the delegated work was accepted. An accurate
 review finding confirmed defects is useful work even when the candidate fails:
 
@@ -86,6 +115,12 @@ providers. Other candidates may represent separate work in the request. When a
 retry is authorized, pass `--retry-approved` explicitly on the dispatch as well.
 The call ledger records its attempt ID, the supplied caller, and the caller's
 declaration of approval. Budget and concurrency admission still apply.
+
+When a suitable alternate reviewer is available or work can wait until later, use
+`route --no-capacity-wait` to carry the option to the provider command. Admission
+checks the same capacity limits once and reports a busy slot before launching a
+model. The default still waits for capacity. Inspect the reported reason before
+deciding whether to use another candidate.
 
 For quota exhaustion also use `makewand mark` with the observed reset interval.
 Do not infer quota exhaustion merely from a quick failure. Avoid repeated model

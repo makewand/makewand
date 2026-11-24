@@ -278,15 +278,26 @@ def execute_agy_task(
         else:
             cmd = ["agy", "-p", final_prompt] + base_flags
 
-        from makewand.discovery import get_provider_model_tier, resolve_agy_model, _discover_local_agy_models
-        resolved = get_provider_model_tier("agy", tier)
+        from makewand.discovery import (
+            _discover_local_agy_models, _is_native_agy_model, _split_agy_suffix,
+            get_provider_model_tier, resolve_agy_model,
+        )
+        fixed_effort_id = model and _split_agy_suffix(model)[1]
+        resolved = {} if fixed_effort_id else get_provider_model_tier("agy", tier)
         target_model = model or resolved.get("model")
         requested_effort = effort or resolved.get("effort")
+        final_effort = None
         if target_model and target_model != "default":
-            try:
-                _avail = _discover_local_agy_models().models
-            except Exception:
-                _avail = None
+            _avail = ()
+            if not fixed_effort_id:
+                try:
+                    catalog = _discover_local_agy_models()
+                    _avail = catalog.models
+                    if (model and not effort and _is_native_agy_model(model)
+                            and getattr(catalog, "metadata", {}).get(model, {}).get("cli_model_id")):
+                        requested_effort = None
+                except Exception:
+                    _avail = None
             final_model, final_effort = resolve_agy_model(target_model, requested_effort, _avail)
             cmd.extend(["--model", final_model])
             target_model = final_model
@@ -294,12 +305,12 @@ def execute_agy_task(
                 cmd.extend(["--effort", final_effort])
         else:
             from makewand.discovery import normalize_provider_effort
-            target_effort = normalize_provider_effort("agy", requested_effort)
-            if target_effort and target_effort != "none":
-                cmd.extend(["--effort", target_effort])
+            final_effort = normalize_provider_effort("agy", requested_effort)
+            if final_effort and final_effort != "none":
+                cmd.extend(["--effort", final_effort])
 
-        from makewand.model_quota import before_cli_launch
-        quota_refusal = before_cli_launch('agy', target_model, relay=relay, cwd=cwd)
+        from makewand.model_quota import before_cli_launch, review_launch_refusal
+        quota_refusal = before_cli_launch('agy', target_model, relay=relay, cwd=cwd, effort=final_effort)
         if quota_refusal is not None:
             return quota_refusal
 
@@ -318,6 +329,9 @@ def execute_agy_task(
                 log_desc = "只读解析任务 (禁止写操作)" if readonly else "架构/兜底任务 (权限自动穿透)"
                 import sys
                 print(c(f"[Makewand -> Antigravity] 派发{log_desc} (Tier: {tier})...", COLOR_GREEN), file=sys.stderr)
+                refusal = review_launch_refusal("agy", target_model, final_effort)
+                if refusal is not None:
+                    return refusal
                 note_dispatch_route("cli")
                 mark_provider_invocation()
                 code, out, err, ex = run_subprocess(

@@ -340,10 +340,15 @@ class TestAgyModelCacheRefresh(_TempHome):
              patch("subprocess.run") as run:
             found = discovery.discover_model_efforts()
         run.assert_not_called()
-        self.assertEqual(sorted(found["agy"]), ["gemini-4-argon-high", "gemini-4-argon-medium", "gpt-oss-120b-medium"])
+        self.assertEqual(set(found["agy"]), set(listed))
         from makewand.routing_catalog import build_full_catalog
-        offered = {item.model for rows in build_full_catalog(found).values() for item in rows if item.provider == "agy"}
-        self.assertEqual(offered, {"gemini-4-argon-medium", "gemini-4-argon-high", "gpt-oss-120b-medium"})
+        offered = {item.model: item for rows in build_full_catalog(found).values()
+                   for item in rows if item.provider == "agy"}
+        self.assertEqual(set(offered), set(listed))
+        for model in ("gemini-pro-orchestrator", "gemini-pro-orchestrator-argon"):
+            self.assertEqual(offered[model].args, ("--model", model))
+            self.assertIsNone(offered[model].effort)
+            self.assertEqual(offered[model].tier_class, 3)
 
 
 @unittest.skipIf(os.name == "nt", "uses a POSIX shell script as the fake agy")

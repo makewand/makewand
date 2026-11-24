@@ -87,6 +87,7 @@ def flags(window_seconds=86400, now=None):
         by_task = {}
         for attempt in attempts if isinstance(attempts, list) else ():
             if (isinstance(attempt, dict) and isinstance(attempt.get("task_id"), str) and attempt["task_id"]
+                    and attempt.get("status") not in ("reserved", "released")
                     and _number(attempt.get("started_at")) is not None):
                 by_task.setdefault(attempt["task_id"], []).append(attempt)
         for task, runs in by_task.items():
@@ -101,6 +102,7 @@ def flags(window_seconds=86400, now=None):
                     found.append({"task": task, "ledger": str(path), "kind": "retry_after_failure",
                                   "detail": f"{failed.get('engine')} {failed.get('result_status')} 后又派 {len(later)} 次"
                                             f"（{', '.join(sorted({str(a.get('engine')) for a in later}))}）"
-                                            + (f"，其中 {declared} 次由调用方标注已获批准" if declared else "")})
+                                            f"，{declared} 次带调用方批准声明，"
+                                            f"{len(later) - declared} 次无声明，需核对是否为同一子任务"})
                     break
     return found
