@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Codex 和 Claude 默认可用完订阅额度，周用量达到 100% 或供应商拒绝时停止。Codex 的低额度提醒不会按默认策略触发限流，仍可显式配置保留阈值。
 - 高风险审查按本机目录校验精确模型 ID、版本、推理档和实际家族，路由生成的只读命令在派发时复核。无跨家族候选时，同家族回退需要显式批准。
 - `route`、`review` 和直接派发支持 `--no-capacity-wait`。名额已满时只尝试一次准入，减少长时间排队。观察报告区分调用方的重试批准声明，并排除没有实际准入的后续预约。
 - AGY 官方目录中无推理后缀的原生模型按原始 ID 进入强档，使用 CLI 默认推理设置。

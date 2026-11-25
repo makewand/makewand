@@ -47,9 +47,7 @@ class TestHealth(unittest.TestCase):
 
         # Proactive weekly warning (e.g. from session zainaqi)
         output_warn = "⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown. ⚠ weekly limit: 7% left · /status"
-        limited_warn, reason_warn, resets_warn = parse_codex_quota(output_warn)
-        self.assertTrue(limited_warn)
-        self.assertIn("7%", reason_warn)
+        self.assertEqual(parse_codex_quota(output_warn), (False, "", None))
 
         # Reached usage limit with relative time
         output_reached = "You've reached your usage limit. Try again in 2 hours."

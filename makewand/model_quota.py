@@ -72,11 +72,14 @@ def merge_limits(previous, incoming):
     return sorted(rows.values(), key=_written_at)[-128:]
 
 
-def _live_refusals(info, identity):
+def _live_refusals(provider, info, identity):
     """The stored refusals of this account that have not expired."""
-    from makewand.health import is_reset_time_passed, status_age_seconds
+    from makewand.health import _is_quota_reserve_gate, is_reset_time_passed, status_age_seconds
     for row in info["quota_limits"]:
         if not isinstance(row, dict) or row.get("status") != "limited":
+            continue
+        if provider in ("codex", "claude") and _is_quota_reserve_gate(row):
+            # The official windows reapply the current reserve at admission.
             continue
         scope = row.get("quota_scope")
         if not isinstance(scope, dict) or scope.get("account_ref") != identity["account_ref"]:
@@ -96,7 +99,7 @@ def refused_models(provider, info):
         return []
     identity = selected_scope(provider)
     return [(row["quota_scope"]["model"], str(row.get("reason") or "供应商拒绝") + _hold_note(row))
-            for row in _live_refusals(info, identity) if row["quota_scope"].get("model")]
+            for row in _live_refusals(provider, info, identity) if row["quota_scope"].get("model")]
 
 
 def projected_status(provider, info, model=None, identity=None):
@@ -135,13 +138,15 @@ def projected_status(provider, info, model=None, identity=None):
     if not isinstance(info.get("quota_limits"), list):
         return info
     identity = identity or selected_scope(provider)
-    matches = [row for row in _live_refusals(info, identity)
+    matches = [row for row in _live_refusals(provider, info, identity)
                if not row["quota_scope"].get("model")
                or model_matches(row["quota_scope"]["model"], canonical_model(provider, model))]
     result = dict(info)
     if matches:
         from makewand.health import _written_at
         chosen = max(matches, key=_written_at)
+        result.pop("quota_reserve_gate", None)
+        result.pop("quota_gate_evidence", None)
         result.update({key: value for key, value in chosen.items() if key != "quota_limits"})
     elif info.get("quota_scope"):
         result.update(status="unknown", verified=False, resets_at=None,
@@ -297,7 +302,7 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
         if used is None or not 0 <= used <= 100:
             continue
         minutes = window.get("window_minutes")
-        if used >= 100 or 100 - used < reserve:
+        if used >= 100 or reserve and health._quota_remaining(used) < reserve:
             return f"当前账号/模型的{minutes or '未知'}分钟额度窗口已达保护阈值（已用 {used:g}%）"
         if minutes == 10080 and weekly is not None and used >= weekly:
             return f"周额度已用 {used:g}%，达到阈值 {weekly:g}%"

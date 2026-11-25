@@ -276,8 +276,10 @@ class TestOnlyTheCliOwnStreamCounts(unittest.TestCase):
 
     def test_codex_weekly_warning_counts_only_on_codex_lines(self):
         warning = "⚠ Heads up, you have less than 10% of your weekly limit left. Run /status for a breakdown."
-        self.assertTrue(parse_codex_quota(warning)[0])
-        self.assertTrue(parse_codex_quota("", warning + "\n")[0])
+        with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "8"}), \
+                patch.object(health, "_get_official_subscription_quota", return_value=None):
+            self.assertTrue(parse_codex_quota(warning)[0])
+            self.assertTrue(parse_codex_quota("", warning + "\n")[0])
         for output, stderr in ((warning + "\n", "ERROR: stream disconnected before completion: error sending request\n"),
                                ("The status table:\n    weekly limit: 3% left\n", None),
                                ("Quoted:\n```\nweekly limit: 3% left\n```\nDone.\n", None)):

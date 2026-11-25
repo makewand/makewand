@@ -191,7 +191,9 @@ class TestCodexTranscriptStructure(unittest.TestCase):
         self.assertFalse(parse_codex_quota("", transcript, prompt=prompt)[0])
         # codex's own lines right after the echo still count.
         warning = "\u26a0 Heads up, you have less than 5% of your weekly limit left. Run /status for a breakdown.\n"
-        self.assertTrue(parse_codex_quota("", CODEX_HDR + warning, prompt="review this")[0])
+        with patch.dict("os.environ", {"MAKEWAND_QUOTA_RESERVE_PERCENT": "8"}), \
+                patch("makewand.health._get_official_subscription_quota", return_value=None):
+            self.assertTrue(parse_codex_quota("", CODEX_HDR + warning, prompt="review this")[0])
         self.assertTrue(parse_codex_quota("", CODEX_HDR + "ERROR: 429 Too Many Requests\n", prompt="review this")[0])
 
     def test_an_indented_copy_of_an_event_is_content(self):

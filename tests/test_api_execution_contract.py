@@ -148,6 +148,14 @@ class APIExecutionTests(unittest.TestCase):
         self.assertEqual(self.attempts()[0]["result_status"], "UNKNOWN")
         self.assertFalse(self.attempts()[0]["outcome_known"])
 
+    def test_health_echo_advisory_cannot_establish_a_known_refusal(self):
+        from makewand import health
+        with patch.dict("os.environ", {health.QUOTA_RESERVE_ENV: "4"}), \
+                patch.object(health, "run_subprocess", return_value=(1, "", "weekly limit: 3% left", None)):
+            self.assertEqual(health._run_model_probe("codex", "fixture only", 1)[0], 127)
+        self.assertEqual(self.attempts()[0]["result_status"], "UNKNOWN")
+        self.assertFalse(self.attempts()[0]["outcome_known"])
+
 
     @patch("urllib.request.urlopen")
     def test_truncated_stream_cannot_apply_partial_code(self, transport):
