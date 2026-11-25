@@ -13,7 +13,7 @@ _CODEX_WEEKLY_HINT_RE = re.compile(r"weekly\s*limit", re.IGNORECASE)
 
 
 def parse_codex_quota(output: str, stderr: Optional[str] = None, *,
-                      prompt: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
+                      prompt: Optional[str] = None, allow_reserve: bool = True) -> Tuple[bool, str, Optional[str]]:
     """Limit refusals and warnings codex prints itself (health.CLI_MESSAGE_CATALOG["codex"]).
 
     `stderr` is passed when the streams were captured apart; codex exec then
@@ -21,6 +21,7 @@ def parse_codex_quota(output: str, stderr: Optional[str] = None, *,
     model's answer to stdout. Otherwise `output` is the merged text. Only
     codex's own lines of the transcript count, never the prompt it echoes
     (`prompt`, as sent), the agent's messages or the command output it relays.
+    Use `allow_reserve=False` for execution outcomes and real refusal records.
     """
     from makewand.health import find_cli_messages, extract_reset_phrase, cli_own_lines, cli_own_output
     found = find_cli_messages("codex", ("quota", "rate"), output, stderr, prompt=prompt)
@@ -37,36 +38,35 @@ def parse_codex_quota(output: str, stderr: Optional[str] = None, *,
         reset_time = extract_reset_phrase(line) or (datetime.now() + timedelta(hours=3)).isoformat()
         return True, f"请求频率受限 (429 · 重置时间: {reset_time})", reset_time
 
-    # Warnings are not hard 429/exhaustion evidence. Preserve the legacy
-    # <=10% policy unless a valid reserve was explicitly selected. Only codex's
-    # own lines count: its marked lines, and a line that is one of its warnings
+    # Positive or approximate warnings matter only with an enabled reserve.
+    # Only codex's own lines count: its marked lines and recognized warnings
     # wherever the transcript prints it ("weekly limit: 7% left" inside a
     # sentence of the answer is task content).
     own = cli_own_output("codex", output, stderr)
     lower = ("\n".join(cli_own_lines("codex", own, prompt=prompt, warnings=True)).lower()
              if _CODEX_WEEKLY_HINT_RE.search(own) else "")
-    exact = re.search(r"weekly\s*limit:\s*(\d+(?:\.\d+)?)%\s*left", lower)
-    upper = re.search(r"less\s*than\s*(\d+)%\s*of\s*(?:your\s+)?weekly\s*limit\s*left", lower)
-    if exact or upper:
-        from makewand.health import QUOTA_RESERVE_ENV, _quota_reserve_setting, _get_official_subscription_quota
-        reserve, error = _quota_reserve_setting()
-        if QUOTA_RESERVE_ENV not in os.environ or error:
-            pct_val = float((exact or upper).group(1))
-            if pct_val <= 10:
-                return True, f"每周额度濒临耗尽 (剩余 {pct_val:g}%)", (datetime.now() + timedelta(hours=3)).isoformat()
-        else:
-            if exact:
-                remaining = float(exact.group(1))
-                known = 0 <= remaining <= 100
-            else:
-                # "less than 10%" is only an upper bound. Do not turn it into
-                # assumed capacity; consult the unchanged account/TTL reader.
-                quota = _get_official_subscription_quota("codex")
-                remaining = quota.get("percentage") if quota and quota.get("source") == "official" else None
-                known = isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
-            if not known or remaining <= 0 or remaining < reserve:
-                detail = f"剩余 {remaining:g}% < {reserve:g}%" if known and remaining > 0 else "剩余额度耗尽或无法确认"
-                return True, f"配额保护阈值拦截 ({detail})", (datetime.now() + timedelta(hours=3)).isoformat()
+    exact = re.findall(r"weekly\s*limit:\s*(\d+(?:\.\d+)?)%\s*left", lower)
+    remaining = min(map(float, exact), default=None)
+    if remaining == 0:
+        return True, "每周使用额度耗尽 (剩余 0%)", (datetime.now() + timedelta(hours=3)).isoformat()
+    if not allow_reserve:
+        return False, "", None
+    upper = re.search(r"less\s*than\s*\d+(?:\.\d+)?%\s*of\s*(?:your\s+)?weekly\s*limit\s*left", lower)
+    if remaining is None and not upper:
+        return False, "", None
+    from makewand.health import _quota_reserve_setting, _get_official_subscription_quota
+    reserve, _ = _quota_reserve_setting()
+    if reserve == 0:
+        return False, "", None
+    if remaining is None:
+        # An upper bound alone gives no exact remaining percentage.
+        quota = _get_official_subscription_quota("codex")
+        remaining = quota.get("percentage") if quota and quota.get("source") == "official" else None
+        if not isinstance(remaining, (int, float)) or isinstance(remaining, bool):
+            remaining = None
+    if remaining is None or 0 <= remaining < reserve:
+        detail = f"剩余 {remaining:g}% < {reserve:g}%" if remaining else "剩余额度耗尽或无法确认"
+        return True, f"配额保护阈值拦截 ({detail})", (datetime.now() + timedelta(hours=3)).isoformat()
 
     return False, "", None
 
@@ -240,7 +240,7 @@ def execute_codex_task(
     if is_process_timeout(ex) or code < 0:
         return model_process_failure("codex", code, combined, err, ex, readonly)
 
-    is_limited, reason, resets = parse_codex_quota(out, err if apart else None, prompt=prompt)
+    is_limited, reason, resets = parse_codex_quota(out, err if apart else None, prompt=prompt, allow_reserve=False)
     if is_limited:
         if restore_quota("provider_refusal"):
             return False, None, f"Codex CLI 触发额度限制 ({reason})，额度已由赠送重置恢复；本次未完成，可重新派发"

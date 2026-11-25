@@ -679,14 +679,14 @@ class RoutingCliTests(unittest.TestCase):
 
     def test_route_quota_over_threshold(self):
         over = self.run_cli("route", "implement", "mechanical", "--simple",
-                            quota={"codex": [95, "10-20 15:04"], "claude": [10, ""]})
+                            quota={"codex": [100, "10-20 15:04"], "claude": [10, ""]})
         self.assertEqual(over.returncode, 0, over.stderr)
-        self.assertIn("跳过：codex（周额度已用 95%，达到阈值 90%（10-20 15:04））", over.stdout)
+        self.assertIn("跳过：codex（周额度已用 100%，达到阈值 100%（10-20 15:04））", over.stdout)
         under = self.run_cli("route", "implement", "mechanical", "--simple",
-                             quota={"codex": [10, ""], "claude": [84, ""]})
+                             quota={"codex": [99.9, ""], "claude": [99, ""]})
         self.assertNotIn("跳过：", under.stdout)
         payload = self.route_json("implement", "mechanical", "--simple",
-                                  quota={"claude": [91, "10-18 20:00"]})
+                                  quota={"claude": [100, "10-18 20:00"]})
         self.assertEqual([item["provider"] for item in payload["skipped"]], ["claude"])
 
     def test_route_missing_quota_file_means_no_data(self):

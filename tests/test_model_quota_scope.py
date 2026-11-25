@@ -63,6 +63,39 @@ class ModelQuotaScopeTests(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
 
+    def test_codex_legacy_advisory_does_not_hold_model_or_erase_real_refusal(self):
+        old = "每周额度濒临耗尽 (剩余 7%)"
+        for warning in (old, "每周额度濒临耗尽 (剩余 1e-05%)"):
+            for model in (None, "gpt-6-astra"):
+                with self.subTest(warning=warning, model=model):
+                    advisory = model_quota.refusal("codex", warning, self.reset, model)
+                    info = dict(advisory, quota_limits=[advisory])
+                    cache = health._sanitize_cache({"codex": info})
+                    self.assertIsNone(model_quota.quota_reason("codex", model, info=cache["codex"]))
+                    self.assertEqual(model_quota.refused_models("codex", cache["codex"]), [])
+        for reason in ("真实供应商返回 429", "每周额度濒临耗尽 (剩余 0%)", "每周使用额度耗尽 (剩余 0%)"):
+            with self.subTest(reason=reason):
+                refusal = model_quota.refusal("codex", reason, self.reset)
+                info = dict(advisory, quota_reserve_gate=True, quota_limits=[advisory, refusal])
+                cache = health._sanitize_cache({"codex": info})
+                self.assertIn(reason, model_quota.quota_reason("codex", "gpt-6-astra", info=cache["codex"]))
+
+    def test_official_windows_allow_last_fraction_for_both_subscriptions(self):
+        from datetime import timezone
+        from makewand.route_select import Policy
+        now = datetime.now(timezone.utc).isoformat()
+        quota = {key: self.identity[key] for key in ("account_ref", "pool_ref")}
+        with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "0"}):
+            for provider in ("claude", "codex"):
+                for minutes in (300, 10080):
+                    with self.subTest(provider=provider, minutes=minutes):
+                        window = {"pool_ref": self.identity["pool_ref"], "window_minutes": minutes,
+                                  "used_percent": 99.99, "observed_at": now}
+                        quota["windows"] = [window]
+                        self.assertIsNone(model_quota.quota_reason(provider, quota=quota, info={}, policy=Policy()))
+                        window["used_percent"] = 100
+                        self.assertIsNotNone(model_quota.quota_reason(provider, quota=quota, info={}, policy=Policy()))
+
     def test_a_pool_that_keeps_refusing_is_held_longer_each_time(self):
         self._usage()
         hours = 3600

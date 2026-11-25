@@ -65,10 +65,10 @@ class QuotaFreshnessTests(unittest.TestCase):
         return {"used_percent": used, "window_minutes": minutes,
                 "resets_at": reset if reset is not None else self.now + 3600}
 
-    def test_fresh_low_quota_remains_limited(self):
-        self.snapshot(WeeklyPct=96, WeeklyResetAt=iso(self.now + 3600))
+    def test_fresh_exhausted_quota_remains_limited(self):
+        self.snapshot(WeeklyPct=100, WeeklyResetAt=iso(self.now + 3600))
         quota = _get_official_subscription_quota("codex")
-        self.assertEqual(quota["percentage"], 4)
+        self.assertEqual(quota["percentage"], 0)
         self.assertEqual(quota["status"], "limited")
         self.assertEqual(quota["window_minutes"], 10080)
         with patch("makewand.health._get_official_subscription_quota", return_value=quota):
@@ -111,11 +111,11 @@ class QuotaFreshnessTests(unittest.TestCase):
         self.assertEqual(quota["selected_source"], "codex_session")
 
     def test_new_weekly_sample_does_not_erase_fresh_rolling_limit(self):
-        self.snapshot(age=30, WeeklyPct=70, FiveHourPct=97,
+        self.snapshot(age=30, WeeklyPct=70, FiveHourPct=100,
                       WeeklyResetAt=iso(self.now + 86400), FiveHourResetAt=iso(self.now + 600))
         self.session({"primary": self.window(15)})
         quota = _get_official_subscription_quota("codex")
-        self.assertEqual(quota["percentage"], 3)
+        self.assertEqual(quota["percentage"], 0)
         self.assertEqual(quota["status"], "limited")
         self.assertEqual(quota["window_minutes"], 300)
         self.assertEqual(len(quota["windows"]), 2)
@@ -152,10 +152,10 @@ class QuotaFreshnessTests(unittest.TestCase):
         self.assertIn("window_reset", quota["unverified_reasons"])
 
     def test_one_reset_window_does_not_erase_an_active_limited_window(self):
-        self.snapshot(WeeklyPct=100, FiveHourPct=94,
+        self.snapshot(WeeklyPct=100, FiveHourPct=100,
                       WeeklyResetAt=iso(self.now - 1), FiveHourResetAt=iso(self.now + 100))
         quota = _get_official_subscription_quota("codex")
-        self.assertEqual(quota["percentage"], 6)
+        self.assertEqual(quota["percentage"], 0)
         self.assertEqual(quota["window_minutes"], 300)
         self.assertEqual(quota["status"], "limited")
 
@@ -188,13 +188,14 @@ class QuotaFreshnessTests(unittest.TestCase):
         self.session({"primary": {"used_percent": 94}})
         quota = _get_official_subscription_quota("codex")
         self.assertEqual(quota["percentage"], 6)
-        self.assertEqual(quota["status"], "limited")
+        self.assertEqual(quota["status"], "warning")
         self.assertIsNone(quota["window_minutes"])
         self.assertIsNone(quota["resets_at"])
 
     def test_fractional_threshold_is_not_rounded_into_extra_capacity(self):
         self.session({"primary": self.window(92.4)})
-        quota = _get_official_subscription_quota("codex")
+        with patch.dict(os.environ, {"MAKEWAND_QUOTA_RESERVE_PERCENT": "8"}):
+            quota = _get_official_subscription_quota("codex")
         self.assertEqual(quota["percentage"], 7.6)
         self.assertEqual(quota["status"], "limited")
 

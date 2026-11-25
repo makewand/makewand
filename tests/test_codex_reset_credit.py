@@ -223,7 +223,9 @@ class RestoreQuotaTests(unittest.TestCase):
         self.assertIsNone(model_quota.quota_reason("codex", info=limited, quota={}, policy=policy))
         self.assertTrue(model_quota.quota_reason("codex", info=fresh, quota={}, policy=policy))
         self.assertTrue(model_quota.quota_reason("codex", quota=self._quota(100, time.time() + 30), **args))
-        self.assertIn("已用 94", model_quota.quota_reason("codex", quota=self._quota(94, time.time() + 30), **args))
+        self.assertIsNone(model_quota.quota_reason("codex", quota=self._quota(94, time.time() + 30), **args))
+        with patch.dict(os.environ, {"MAKEWAND_QUOTA_RESERVE_PERCENT": "8"}):
+            self.assertIn("已用 94", model_quota.quota_reason("codex", quota=self._quota(94, time.time() + 30), **args))
 
     def test_a_reset_leaves_other_windows_blocking(self):
         policy = type("P", (), {"codex_max_weekly": None})()
@@ -252,32 +254,41 @@ class RestoreQuotaTests(unittest.TestCase):
 
 
 class CodexRefusalTests(unittest.TestCase):
-    def _run(self, restored):
+    def _run(self, restored, message="ERROR: You've hit your usage limit. Try again in 3 days.\n"):
         try:
             from test_multi_model_optimization import _FakeProviderHome
         except ImportError:
             from tests.test_multi_model_optimization import _FakeProviderHome
         from makewand.providers.codex import execute_codex_task
-        refusal = (1, "", "ERROR: You've hit your usage limit. Try again in 3 days.\n", None)
+        refusal = (1, "", message, None)
         with _FakeProviderHome() as home, patch("makewand.sandbox.is_bwrap_available", return_value=True), \
                 patch("makewand.sandbox._provider_socket_preflight"), \
                 patch("makewand.providers.codex.run_subprocess", return_value=refusal), \
-                patch("makewand.providers.codex.parse_codex_quota", return_value=(True, "limit", None)), \
                 patch("makewand.codex_reset_credit.restore_quota", return_value=restored) as restore, \
                 patch("makewand.health.record_engine_limit") as record:
             result = execute_codex_task("review", cwd=str(home.workspace), readonly=True)
-        restore.assert_called_once_with("provider_refusal")
-        return result, record
+        return result, record, restore
 
     def test_a_restored_quota_does_not_record_a_limit_and_the_run_still_fails(self):
-        result, record = self._run(True)
+        result, record, restore = self._run(True)
         self.assertFalse(result[0])
         self.assertIn("赠送重置", result[2])
         record.assert_not_called()
+        restore.assert_called_once_with("provider_refusal")
 
     def test_without_a_restore_the_limit_is_recorded(self):
-        _result, record = self._run(False)
+        _result, record, restore = self._run(False)
         record.assert_called_once()
+        restore.assert_called_once_with("provider_refusal")
+
+    def test_warning_does_not_record_a_refusal_or_try_to_reset_quota(self):
+        with patch.dict(os.environ, {"MAKEWAND_QUOTA_RESERVE_PERCENT": "8"}):
+            for remaining in ("3", "0.00001"):
+                with self.subTest(remaining=remaining):
+                    result, record, restore = self._run(False, f"weekly limit: {remaining}% left\n")
+                    self.assertEqual(result.status, "UNKNOWN")
+                    record.assert_not_called()
+                    restore.assert_not_called()
 
 
 class RouteRestoreTests(unittest.TestCase):

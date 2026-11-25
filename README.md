@@ -144,9 +144,9 @@ makewand mark codex 6h --reason 429
 makewand outcome codex 2 implement pass --model gpt-6-astra --effort high
 ```
 
-`route <类型> <难度>` 的类型为 review、implement、test、research、doc，难度为 mechanical、normal、hard。它在完整的模型 × 推理深度目录中，从够用的最便宜档位（1–3）起选：跳过 `~/.config/mw-hub/policy`（或 `MW_HUB_POLICY`）里暂停中的工具、`mark` 标记期内的工具，以及官方周额度达到阈值的 codex/claude（默认 90%/85%），再按 `outcome` 记录的通过率用 Thompson 采样排序。`--self <工具>` 把与你同家的候选排在最后，`--not <工具>` 排除与它同家族的候选（审查时传实现方），`--tier N` 指定起始档，`--risk high` 从最强档起，`--simple` 只用精简三档表，`--json` 输出全部候选；验收不过时按输出末尾的提示升一档。派活命令自带的时限见下文“调用与资源预算”。
+`route <类型> <难度>` 的类型为 review、implement、test、research、doc，难度为 mechanical、normal、hard。它在完整的模型 × 推理深度目录中，从够用的最便宜档位（1–3）起选：跳过 `~/.config/mw-hub/policy`（或 `MW_HUB_POLICY`）里暂停中的工具、`mark` 标记期内的工具，以及官方周用量达到阈值的 codex/claude（两者默认 100%），再按 `outcome` 记录的通过率用 Thompson 采样排序。`--self <工具>` 把与你同家的候选排在最后，`--not <工具>` 排除与它同家族的候选（审查时传实现方），`--tier N` 指定起始档，`--risk high` 从最强档起，`--simple` 只用精简三档表，`--json` 输出全部候选；验收不过时按输出末尾的提示升一档。派活命令自带的时限见下文“调用与资源预算”。
 
-`route` 和 Python 订阅 CLI 启动还共用当前账号/模型的额度检查：真实拒绝记录与官方各时间窗口分别保留，默认剩余额度保护值仍为 8%，周阈值仍为上述 90%/85%。模型子限额只影响相应模型，AGY 的 Gemini 限流不会推断为 Opus/Sonnet 没额度；`mark` 仍是用户明确设置的整工具暂停。Codex 通过只读 `account/rateLimits/read` 查询实际窗口，不发送生成请求；未知桶不会冒充模型或共享额度。Go 原生路由的 70%/90% 档位仍用于软排序，与操作方设置的启动保护阈值含义不同。未观察到额度、身份或重置后新状态时显示未知；本地削峰与并发保护继续独立生效。
+`route` 和 Python 订阅 CLI 启动还共用当前账号/模型的额度检查：真实拒绝记录与官方各时间窗口分别保留，默认保留 0%，正余额仍可派发，0% 或供应商拒绝会停止。可用 `MAKEWAND_QUOTA_RESERVE_PERCENT` 显式保留余量，或在策略文件中为 Codex 和 Claude 分别设置周用量上限。模型子限额只影响相应模型，AGY 的 Gemini 限流不会推断为 Opus/Sonnet 没额度；`mark` 仍是用户明确设置的整工具暂停。Codex 通过只读 `account/rateLimits/read` 查询实际窗口，不发送生成请求；未知桶不会冒充模型或共享额度。Go 原生路由的 70%/90% 档位仍用于软排序，与操作方设置的启动保护阈值含义不同。未观察到额度、身份或重置后新状态时显示未知；本地削峰与并发保护继续独立生效。
 
 `mark <工具> <时长>` 的时长为 d/h/m/s 组合（如 `6h`、`93h17m`、`2d`，最长 365 天），`--reason` 可选。`outcome <工具> <档> <类型> pass|fail` 可附 `--model`、`--effort`、`--seconds`、`--calls`。标记与成绩保存在 makewand 私有状态目录的 `routing/` 下（`MAKEWAND_ROUTING_DIR` 可改）。三个命令都不调用模型；在 provider worker（`MAKEWAND_PROVIDER_WORKER=1`）内被拒绝。
 

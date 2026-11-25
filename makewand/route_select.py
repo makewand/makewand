@@ -58,8 +58,8 @@ __all__ = [
     "select",
 ]
 
-DEFAULT_CODEX_MAX_WEEKLY = 90
-DEFAULT_CLAUDE_MAX_WEEKLY = 85
+DEFAULT_CODEX_MAX_WEEKLY = 100
+DEFAULT_CLAUDE_MAX_WEEKLY = 100
 DEFAULT_REQUEST_BUDGET = 3
 HALF_LIFE_DAYS = 14
 # Sample weight runs from 1.0 for the cheapest catalog position down to 1 - spread for the last.
