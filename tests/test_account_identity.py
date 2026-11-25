@@ -117,7 +117,7 @@ class AccountQuotaTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.login(self.first, "A")
                 entry = self.snapshot()
-                entry["WeeklyPct"] = 99
+                entry["WeeklyPct"] = 100
                 self.snapshot(entries=[entry])
                 cache = {"codex": {"status": "unknown"}}
                 _sanitize_cache(cache)
