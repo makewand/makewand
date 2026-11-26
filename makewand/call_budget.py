@@ -290,12 +290,12 @@ def _reserve_wait(engine, tier, model, readonly, *, capacity_policy, ticket_id, 
             raise
         except ConcurrencyBusyError as error:
             busy_error = error
-            if capacity_policy and time.monotonic() >= next_report:
-                shared_capacity.report_busy(error)
-                next_report = time.monotonic() + shared_capacity.WAIT_REPORT_SECONDS
             remaining = wait_until - time.monotonic()
             if remaining <= 0:
                 raise
+            if capacity_policy and time.monotonic() >= next_report:
+                shared_capacity.report_busy(error)
+                next_report = time.monotonic() + shared_capacity.WAIT_REPORT_SECONDS
             # _reserve_once has exited _ledger: never sleep holding the lock.
             if scope is None:
                 time.sleep(min(delay, remaining))

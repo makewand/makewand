@@ -116,6 +116,16 @@ class ExecutionRuntimeTests(unittest.TestCase):
         self.assertIs(annotated["retry_approved_by_caller"], True)
         self.assertNotIn("caller", ordinary)
         self.assertNotIn("retry_approved_by_caller", ordinary)
+
+    def test_nested_stage_cannot_reenable_capacity_wait(self):
+        from makewand.call_budget import ConcurrencyBusyError
+        with execution_context(wait_for_capacity=False), execution_context(wait_for_capacity=True), \
+                patch("makewand.call_budget.reserve", side_effect=ConcurrencyBusyError("fixture busy")) as reserve:
+            result = execute(self.request(), lambda _: self.fail("provider reached"))
+        self.assertEqual(result.error_kind, "concurrency_busy")
+        self.assertIs(result.outcome_known, True)
+        self.assertIs(reserve.call_args.kwargs["wait_for_capacity"], False)
+        self.assertFalse(self.budget.exists())
     def test_unknown_exception_records_attempt_without_replay_or_secrets(self):
         called = []
         def provider(timeout):

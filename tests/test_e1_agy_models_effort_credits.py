@@ -86,6 +86,23 @@ class TestParseAgyModelsOutput(unittest.TestCase):
 
 
 class TestAgyCacheAndFallback(_HomeCase):
+    def test_strict_model_catalog_preserves_exact_cli_spelling(self):
+        old = "gemini-4-argon-high"
+        exact = "Gemini-4-Argon-High"
+        cache = self.write_cache([(old, "Legacy cache")])
+        self.assertEqual(discovery._agy_effort_map(), {old: ["high"]})
+        self.assertEqual(discovery._agy_effort_map(exact_ids_only=True), {})
+        result = _sync_agy_models_cache(cache_file=cache, output_text=f"{exact}\tArgon\n", force=True)
+        self.assertEqual(result, cache)
+        self.assertEqual(discovery._agy_effort_map(exact_ids_only=True), {exact: ["high"]})
+        from makewand.review_policy import ReviewPolicy, validate_review_dispatch
+        policy = ReviewPolicy.from_options("codex", (), False)
+        discovered = {"agy": discovery._agy_effort_map(exact_ids_only=True)}
+        self.assertEqual(validate_review_dispatch(policy, "agy", exact, None, discovered), "high")
+        with self.assertRaisesRegex(ValueError, "未通过高风险审查校验"):
+            validate_review_dispatch(policy, "agy", old, None, discovered)
+        self.assertEqual(resolve_agy_model(exact, None), (exact, None))
+
     def test_injected_output_is_cached_and_discoverable(self):
         cache = self.home / ".cache" / "makewand" / "agy_models_cache.json"
         result = _sync_agy_models_cache(cache_file=cache, max_age=86400, output_text=AGY_FIXTURE_TEXT)
@@ -283,11 +300,12 @@ class TestAgyNoSandboxCredits(_HomeCase):
         else:
             path.write_text(json.dumps({"useG1Credits": value}), encoding="utf-8")
 
-    def _execute(self):
+    def _execute(self, model="gemini-4-argon-low", discovered=None):
         from makewand.providers import agy as agy_provider
         workspace = Path(self._tmp.name) / "ws"
         workspace.mkdir(exist_ok=True)
-        discovered = DiscoveredAgyModels(AVAILABLE, None, None)
+        if discovered is None:
+            discovered = DiscoveredAgyModels(AVAILABLE, None, None)
         with patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=False), \
              patch("makewand.sandbox.is_bwrap_available", return_value=False), \
@@ -296,7 +314,7 @@ class TestAgyNoSandboxCredits(_HomeCase):
              patch.object(discovery, "_discover_local_agy_models", return_value=discovered), \
              patch.object(agy_provider, "run_subprocess", return_value=(0, "ok", "", None)) as run:
             result = agy_provider.execute_agy_task(
-                "hello", cwd=str(workspace), model="gemini-4-argon-low", readonly=True)
+                "hello", cwd=str(workspace), model=model, readonly=True)
         return result, run
 
     def test_host_true_blocks_and_never_runs_agy(self):
@@ -347,6 +365,42 @@ class TestAgyNoSandboxCredits(_HomeCase):
         self.assertTrue(ok, err)
         self.assertEqual(out, "ok")
         run.assert_called_once()
+
+    def test_cli_listed_bare_model_is_launched_without_an_inherited_effort(self):
+        self._write("settings.json", False)
+        self._write("antigravity-cli/settings.json", False)
+        model = "gemini-pro-orchestrator"
+        self.write_cache([(model, model)])
+        catalog = _discover_local_agy_models(sync=False)
+        (ok, _, err), run = self._execute(model, catalog)
+        self.assertTrue(ok, err)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--model") + 1], model)
+        self.assertNotIn("--effort", argv)
+
+    def test_explicit_suffixed_model_preserves_spelling_without_tier_resolution(self):
+        self._write("settings.json", False)
+        self._write("antigravity-cli/settings.json", False)
+        model = "Gemini-4-Argon-High"
+        with patch.object(discovery, "get_provider_model_tier") as tier:
+            (ok, _, err), run = self._execute(model)
+        tier.assert_not_called()
+        self.assertTrue(ok, err)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--model") + 1], model)
+        self.assertNotIn("--effort", argv)
+
+    def test_listed_bare_proxy_keeps_inherited_effort_variant(self):
+        self._write("settings.json", False)
+        self._write("antigravity-cli/settings.json", False)
+        model = "claude-opus-5-5"
+        variant = model + "-high"
+        self.write_cache([(model, model), (variant, variant)])
+        catalog = _discover_local_agy_models(sync=False)
+        (ok, _, err), run = self._execute(model, catalog)
+        self.assertTrue(ok, err)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[argv.index("--model") + 1], variant)
 
     def test_other_providers_are_not_blocked_by_agy_settings(self):
         from makewand.sandbox import provider_sandbox_launch

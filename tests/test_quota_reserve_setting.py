@@ -67,14 +67,15 @@ class QuotaReserveSettingTests(unittest.TestCase):
             info["reason"] = "保护阈值拦截 (剩余 6.0% < 8%): 官方报告每周窗口剩余额度: 6%"
         return {"codex": info}
 
-    def test_unset_default_keeps_original_boundaries_and_description(self):
-        for remaining, status in ((0, "limited"), (7.99, "limited"),
+    def test_unset_default_blocks_only_exhaustion(self):
+        for remaining, status in ((0, "limited"), (0.001, "warning"), (7.99, "warning"),
                                   (8, "warning"), (24.99, "warning"), (25, "healthy")):
             with self.subTest(remaining=remaining):
                 self.snapshot(remaining)
                 quota = health._get_official_subscription_quota("codex")
+                self.assertEqual(quota["percentage"], remaining)
                 self.assertEqual(quota["status"], status)
-                self.assertEqual(quota["reserve_percent"], 8)
+                self.assertEqual(quota["reserve_percent"], 0)
                 self.assertIsNone(quota["reserve_error"])
                 self.assertNotIn("配额保留阈值", quota["desc"])
 
@@ -122,27 +123,27 @@ class QuotaReserveSettingTests(unittest.TestCase):
                     self.assertEqual(health._quota_reserve_setting(), (expected, None))
                 self.assertEqual(observed, [])
 
-    def test_invalid_setting_warns_without_echo_and_uses_eight(self):
+    def test_invalid_setting_warns_without_echo_and_uses_default(self):
         self.snapshot(6)
         for value in ("", "NaN", "inf", "-1", "100.1", "secret-not-a-number"):
             with self.subTest(value=value), patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: value}):
                 with warnings.catch_warnings(record=True) as observed:
                     warnings.simplefilter("always")
                     quota = health._get_official_subscription_quota("codex")
-                self.assertEqual(quota["status"], "limited")
-                self.assertEqual(quota["reserve_percent"], 8)
+                self.assertEqual(quota["status"], "warning")
+                self.assertEqual(quota["reserve_percent"], 0)
                 self.assertEqual(quota["reserve_error"], health.QUOTA_RESERVE_ERROR)
                 self.assertEqual(len(observed), 1)
                 self.assertEqual(str(observed[0].message), health.QUOTA_RESERVE_ERROR)
                 self.assertNotIn("secret-not-a-number", quota["desc"])
-                self.assertIn("using the default 8% reserve", quota["desc"])
+                self.assertIn("using the default 0% reserve", quota["desc"])
 
     def test_invalid_setting_is_visible_without_official_evidence(self):
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "NaN"}):
             with warnings.catch_warnings(record=True) as observed:
                 warnings.simplefilter("always")
                 quota = health.calculate_provider_quota("codex", {"status": "unknown"})
-            self.assertEqual(quota["reserve_percent"], 8)
+            self.assertEqual(quota["reserve_percent"], 0)
             self.assertEqual(quota["reserve_error"], health.QUOTA_RESERVE_ERROR)
             self.assertIsNone(quota["percentage"])
             self.assertIn(health.QUOTA_RESERVE_ERROR, quota["desc"])
@@ -151,7 +152,8 @@ class QuotaReserveSettingTests(unittest.TestCase):
     def test_fresh_official_evidence_rechecks_only_our_buffer_limit(self):
         from makewand.engine_selection import _engine_usable
         self.snapshot(6)
-        old = health._sanitize_cache({"codex": {"status": "unknown"}})
+        with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "8"}):
+            old = health._sanitize_cache({"codex": {"status": "unknown"}})
         self.assertEqual(old["codex"]["status"], "limited")
         self.assertIn("< 8%", old["codex"]["reason"])
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "4"}):
@@ -170,7 +172,7 @@ class QuotaReserveSettingTests(unittest.TestCase):
             self.assertEqual(health._sanitize_cache(real_limit)["codex"]["status"], "limited")
             self.assertEqual(real_limit["codex"]["reason"], original["codex"]["reason"])
             self.assertNotIn("quota_reserve_gate", real_limit["codex"])
-        self.assertEqual(health._sanitize_cache(cache)["codex"]["status"], "limited")
+        self.assertEqual(health._sanitize_cache(cache)["codex"]["status"], "unknown")
 
     def test_exact_legacy_buffer_verdict_can_be_rechecked(self):
         self.snapshot(6)
@@ -206,16 +208,21 @@ class QuotaReserveSettingTests(unittest.TestCase):
 
     def test_codex_exact_warning_respects_explicit_reserve_only(self):
         from makewand.providers.codex import parse_codex_quota
-        self.assertTrue(parse_codex_quota("weekly limit: 6% left")[0])
+        self.assertFalse(parse_codex_quota("weekly limit: 6% left")[0])
+        self.assertFalse(parse_codex_quota("less than 10% of your weekly limit left")[0])
+        self.assertTrue(parse_codex_quota("weekly limit: 0% left")[0])
+        self.assertTrue(parse_codex_quota("weekly limit: 7% left\nweekly limit: 0% left",
+                                          allow_reserve=False)[0])
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "4"}):
             self.assertFalse(parse_codex_quota("weekly limit: 6% left")[0])
             self.assertFalse(parse_codex_quota("weekly limit: 4% left")[0])
+            self.assertFalse(parse_codex_quota("weekly limit: 3% left", allow_reserve=False)[0])
             for value in ("3", "0"):
                 self.assertTrue(parse_codex_quota(f"weekly limit: {value}% left")[0])
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "NaN"}):
             with warnings.catch_warnings(record=True) as observed:
                 warnings.simplefilter("always")
-                self.assertTrue(parse_codex_quota("weekly limit: 6% left")[0])
+                self.assertFalse(parse_codex_quota("weekly limit: 6% left")[0])
             self.assertTrue(observed)
 
     def test_explicit_codex_buffer_warning_requires_current_account_evidence(self):
@@ -236,6 +243,8 @@ class QuotaReserveSettingTests(unittest.TestCase):
         text = "less than 10% of your weekly limit left"
         with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "4"}):
             self.assertTrue(parse_codex_quota(text)[0])
+            self.assertTrue(parse_codex_quota(
+                "Heads up, you have less than 3.5% of your weekly limit left. Run /status for a breakdown.")[0])
             self.snapshot(6)
             self.assertFalse(parse_codex_quota(text)[0])
             self.snapshot(3)

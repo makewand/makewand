@@ -119,13 +119,13 @@ class PolicyTests(unittest.TestCase):
         quoted = load_policy(single)
         self.assertEqual(quoted.claude_max_weekly, 66)
         # 数字解析失败时保留默认阈值，不让整份策略失效。
-        self.assertEqual(quoted.codex_max_weekly, 90)
+        self.assertEqual(quoted.codex_max_weekly, 100)
 
     def test_missing_file_uses_defaults(self):
         missing = self.base / "no-such-policy"
         policy = load_policy(missing)
-        self.assertEqual(policy.codex_max_weekly, 90)
-        self.assertEqual(policy.claude_max_weekly, 85)
+        self.assertEqual(policy.codex_max_weekly, 100)
+        self.assertEqual(policy.claude_max_weekly, 100)
         self.assertEqual(policy.paused, ())
 
         home = Path.home()
@@ -149,8 +149,8 @@ class PolicyTests(unittest.TestCase):
             os.environ.pop("MW_HUB_POLICY", None)
             self.assertEqual(default_policy_path(), default)
             loaded = load_policy()
-        self.assertEqual(loaded.codex_max_weekly, 90)
-        self.assertEqual(loaded.claude_max_weekly, 85)
+        self.assertEqual(loaded.codex_max_weekly, 100)
+        self.assertEqual(loaded.claude_max_weekly, 100)
         self.assertEqual(loaded.paused, ())
 
     def test_mw_hub_policy_overrides_the_default_path(self):
@@ -182,8 +182,8 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(explicit.codex_max_weekly, 11)
         self.assertEqual(explicit.claude_max_weekly, 12)
         with patch.dict(os.environ, {"MW_HUB_POLICY": str(missing)}):
-            self.assertEqual(load_policy().codex_max_weekly, 90)
-            self.assertEqual(load_policy().claude_max_weekly, 85)
+            self.assertEqual(load_policy().codex_max_weekly, 100)
+            self.assertEqual(load_policy().claude_max_weekly, 100)
 
 
 class QuotaTextTests(unittest.TestCase):
@@ -345,22 +345,22 @@ class SelectTests(unittest.TestCase):
     def test_weekly_threshold_skips_codex_and_claude_only(self):
         def reader():
             return {
-                "codex": (90, "resets 10-20 15:04"),
-                "claude": (85, "resets 10-21 08:00"),
+                "codex": (100, "resets 10-20 15:04"),
+                "claude": (100, "resets 10-21 08:00"),
                 "agy": (100, "resets soon"),
                 "grok": (100, ""),
             }
 
         result = self._select(quota_reader=reader)
         skipped = dict(result.skipped)
-        self.assertEqual(skipped["codex"], "周额度已用 90%，达到阈值 90%（resets 10-20 15:04）")
-        self.assertEqual(skipped["claude"], "周额度已用 85%，达到阈值 85%（resets 10-21 08:00）")
+        self.assertEqual(skipped["codex"], "周额度已用 100%，达到阈值 100%（resets 10-20 15:04）")
+        self.assertEqual(skipped["claude"], "周额度已用 100%，达到阈值 100%（resets 10-21 08:00）")
         self.assertTrue(_chinese(skipped["codex"]))
         self.assertNotIn("agy", skipped)
         self.assertNotIn("grok", skipped)
         self.assertEqual([item.provider for item in result.candidates], ["agy", "grok"])
 
-        under = self._select(quota_reader=lambda: {"codex": (89.9, ""), "claude": (84, "resets 10-21 08:00")})
+        under = self._select(quota_reader=lambda: {"codex": (99.9, ""), "claude": (99, "resets 10-21 08:00")})
         self.assertEqual(under.skipped, [])
         self.assertEqual([item.provider for item in under.candidates], ["agy", "codex", "grok", "claude"])
 
@@ -373,7 +373,7 @@ class SelectTests(unittest.TestCase):
         self.assertIn("claude", [item.provider for item in mixed.candidates])
 
     def test_unknown_quota_does_not_exclude(self):
-        partial = self._select(quota_reader=lambda: {"codex": (99, "resets tomorrow")})
+        partial = self._select(quota_reader=lambda: {"codex": (100, "resets tomorrow")})
         self.assertIn("codex", dict(partial.skipped))
         self.assertIn("claude", [item.provider for item in partial.candidates])
 
@@ -382,7 +382,7 @@ class SelectTests(unittest.TestCase):
         garbage = self._select(quota_reader=lambda: {"codex": "unknown", "claude": (None, "")})
         self.assertEqual(garbage.skipped, [])
 
-        stdout = f"{_BAR} codex\n   weekly      95% used  (resets 10-20 15:04)\n{_BAR} claude\n   weekly      10% used\n"
+        stdout = f"{_BAR} codex\n   weekly      100% used  (resets 10-20 15:04)\n{_BAR} claude\n   weekly      10% used\n"
         completed = subprocess.CompletedProcess(FAKE_QUOTA_ARGV, 0, stdout=stdout, stderr="")
         with patch("makewand.route_select.quota_argv", return_value=FAKE_QUOTA_ARGV), \
                 patch("makewand.route_select.subprocess.run", return_value=completed) as run:
@@ -390,7 +390,7 @@ class SelectTests(unittest.TestCase):
         self.assertTrue(run.called)
         self.assertEqual(
             dict(wired.skipped)["codex"],
-            "周额度已用 95%，达到阈值 90%（resets 10-20 15:04）",
+            "周额度已用 100%，达到阈值 100%（resets 10-20 15:04）",
         )
         self.assertNotIn("claude", dict(wired.skipped))
 

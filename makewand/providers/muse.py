@@ -257,7 +257,7 @@ def execute_muse_task(
     if cwd:
         cmd.extend(["--workspace", str(cwd)])
     from makewand.discovery import get_provider_model_tier, normalize_provider_effort
-    resolved = get_provider_model_tier("muse", tier)
+    resolved = get_provider_model_tier("muse", tier) if not (model and effort) else {}
     target_model = model or resolved.get("model")
     if target_model and target_model != "default":
         cmd.extend(["--model", target_model])
@@ -278,8 +278,8 @@ def execute_muse_task(
         else:
             cmd.append(prompt)
 
-        from makewand.model_quota import before_cli_launch
-        quota_refusal = before_cli_launch('muse', target_model, relay=relay, cwd=cwd)
+        from makewand.model_quota import before_cli_launch, review_launch_refusal
+        quota_refusal = before_cli_launch('muse', target_model, relay=relay, cwd=cwd, effort=target_effort)
         if quota_refusal is not None:
             return quota_refusal
 
@@ -312,9 +312,20 @@ def execute_muse_task(
                 apply_limits=not use_muse_slice,
                 command_prefix=launch_prefix,
             ) as launch:
+                from makewand.execution_runtime import current_context
+                if current_context().get("review_dispatch") is not None and launch.sandboxed:
+                    from makewand.discovery import muse_review_uses_sandbox_profile
+                    from makewand.model_quota import refuse_before_launch
+                    if not muse_review_uses_sandbox_profile():
+                        return refuse_before_launch("Muse 沙箱使用默认数据目录，无法验证当前自定义目录对应的高风险审查型号")
+                    if launch.home is None or not launch.home.muse_review_snapshot_is_current():
+                        return refuse_before_launch("Muse 沙箱的高风险审查快照与当前目录不一致，请重新核对目录")
                 exec_cmd = launch.cmd
                 import sys
                 print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)
+                refusal = review_launch_refusal("muse", target_model, target_effort)
+                if refusal is not None:
+                    return refusal
                 note_dispatch_route("cli")
                 mark_provider_invocation()
                 code, out, err, ex = run_subprocess(

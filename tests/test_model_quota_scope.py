@@ -63,6 +63,39 @@ class ModelQuotaScopeTests(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
 
+    def test_codex_legacy_advisory_does_not_hold_model_or_erase_real_refusal(self):
+        old = "每周额度濒临耗尽 (剩余 7%)"
+        for warning in (old, "每周额度濒临耗尽 (剩余 1e-05%)"):
+            for model in (None, "gpt-6-astra"):
+                with self.subTest(warning=warning, model=model):
+                    advisory = model_quota.refusal("codex", warning, self.reset, model)
+                    info = dict(advisory, quota_limits=[advisory])
+                    cache = health._sanitize_cache({"codex": info})
+                    self.assertIsNone(model_quota.quota_reason("codex", model, info=cache["codex"]))
+                    self.assertEqual(model_quota.refused_models("codex", cache["codex"]), [])
+        for reason in ("真实供应商返回 429", "每周额度濒临耗尽 (剩余 0%)", "每周使用额度耗尽 (剩余 0%)"):
+            with self.subTest(reason=reason):
+                refusal = model_quota.refusal("codex", reason, self.reset)
+                info = dict(advisory, quota_reserve_gate=True, quota_limits=[advisory, refusal])
+                cache = health._sanitize_cache({"codex": info})
+                self.assertIn(reason, model_quota.quota_reason("codex", "gpt-6-astra", info=cache["codex"]))
+
+    def test_official_windows_allow_last_fraction_for_both_subscriptions(self):
+        from datetime import timezone
+        from makewand.route_select import Policy
+        now = datetime.now(timezone.utc).isoformat()
+        quota = {key: self.identity[key] for key in ("account_ref", "pool_ref")}
+        with patch.dict(os.environ, {health.QUOTA_RESERVE_ENV: "0"}):
+            for provider in ("claude", "codex"):
+                for minutes in (300, 10080):
+                    with self.subTest(provider=provider, minutes=minutes):
+                        window = {"pool_ref": self.identity["pool_ref"], "window_minutes": minutes,
+                                  "used_percent": 99.99, "observed_at": now}
+                        quota["windows"] = [window]
+                        self.assertIsNone(model_quota.quota_reason(provider, quota=quota, info={}, policy=Policy()))
+                        window["used_percent"] = 100
+                        self.assertIsNotNone(model_quota.quota_reason(provider, quota=quota, info={}, policy=Policy()))
+
     def test_a_pool_that_keeps_refusing_is_held_longer_each_time(self):
         self._usage()
         hours = 3600
@@ -405,6 +438,120 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertEqual(result.status, "PASSED")
         self.assertEqual(result.output, "fixture API answer")
         self.assertEqual(attempt["status"], "completed")
+
+    def test_guarded_review_refuses_changed_effort_before_transport(self):
+        from makewand.execution_runtime import execution_context
+        with execution_context(review_dispatch=("agy", "gemini-4-argon-high", None)), \
+                patch.object(model_quota, "quota_reason") as quota:
+            result, attempt = self.execute_fixture(
+                lambda _: model_quota.before_cli_launch("agy", "gemini-4-argon-high", effort="low"))
+        self.assertFalse(result.success)
+        self.assertEqual(attempt["status"], "released")
+        quota.assert_not_called()
+
+    def test_high_risk_review_pins_makewand_relay_policy(self):
+        from makewand.cli import _execute_direct_task
+        from makewand.execution_contract import ExecutionResult
+        from makewand.execution_runtime import execution_context
+        from makewand.providers.base import ProviderAPIRelay
+
+        with execution_context(review_dispatch=("codex", "gpt-6.2-astra", "high")), \
+                patch("makewand.config.get_api_policy", return_value="allow_paid"), \
+                patch("makewand.config.api_relay_available", return_value=True) as may_relay, \
+                patch("makewand.execution_runtime.execute", return_value=ExecutionResult(status="UNVERIFIED")) as execute:
+            _execute_direct_task("codex", None, "fixture", readonly=True, timeout=1)
+            self.assertFalse(ProviderAPIRelay("codex", color="").available)
+        self.assertEqual(execute.call_args.args[0].api_policy, "subscription_only")
+        may_relay.assert_not_called()
+
+    def test_guarded_review_refuses_model_removed_after_catalog_refresh(self):
+        from makewand.execution_runtime import execution_context
+        with execution_context(review_dispatch=("agy", "gemini-4-argon-high", None)), \
+                patch("makewand.discovery.discover_model_efforts",
+                      return_value={"agy": {"gemini-5-argon-high": ["high"]}}) as refreshed, \
+                patch.object(model_quota, "quota_reason") as quota:
+            result, attempt = self.execute_fixture(
+                lambda _: model_quota.before_cli_launch("agy", "gemini-4-argon-high"))
+        self.assertFalse(result.success)
+        self.assertEqual(attempt["status"], "released")
+        refreshed.assert_called_once_with(strict_catalogs=True)
+        quota.assert_not_called()
+
+    def test_guarded_review_rechecks_catalog_after_sandbox_setup(self):
+        from makewand.execution_runtime import execution_context
+        from makewand.providers.codex import execute_codex_task
+
+        model = "gpt-6.2-astra"
+        catalog = {"codex": {model: ["high"]}}
+        @contextmanager
+        def prepare_sandbox(*args, **kwargs):
+            catalog["codex"].clear()
+            yield SimpleNamespace()
+
+        with execution_context(review_dispatch=("codex", model, "high")), \
+                patch("makewand.config.has_subscription_configured", return_value=True), \
+                patch("makewand.discovery.discover_model_efforts", return_value=catalog), \
+                patch("makewand.discovery._codex_model_efforts", return_value=["high"]), \
+                patch("makewand.sandbox.provider_sandbox_launch", side_effect=prepare_sandbox), \
+                patch("makewand.execution_runtime.mark_provider_invocation") as launched, \
+                patch("makewand.providers.codex.run_subprocess") as transport:
+            ok, _, error = execute_codex_task("fixture", cwd=str(self.root), model=model, effort="high", readonly=True)
+        self.assertFalse(ok)
+        self.assertIn("请重新核对目录", error)
+        launched.assert_not_called()
+        transport.assert_not_called()
+
+    def test_guarded_muse_refuses_profile_mismatch_at_sandbox_boundary(self):
+        from makewand.execution_runtime import execution_context
+        from makewand.providers.muse import execute_muse_task
+
+        model = "muse-wonder-1.0"
+
+        @contextmanager
+        def prepare_sandbox(*args, **kwargs):
+            yield SimpleNamespace(sandboxed=True)
+
+        with execution_context(review_dispatch=("muse", model, "high")), \
+                patch.dict(os.environ, MUSE_DATA_DIR=str(self.root / "custom")), \
+                patch("makewand.config.has_subscription_configured", return_value=True), \
+                patch("makewand.discovery.discover_model_efforts", return_value={"muse": {model: ["high"]}}), \
+                patch("makewand.discovery.get_provider_model_tier") as default_tier, \
+                patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
+                patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+                patch("makewand.sandbox.provider_sandbox_launch", side_effect=prepare_sandbox), \
+                patch("makewand.execution_runtime.mark_provider_invocation") as launched, \
+                patch("makewand.providers.muse.run_subprocess") as transport:
+            ok, _, error = execute_muse_task("fixture", cwd=str(self.root), model=model, effort="high", readonly=True)
+        self.assertFalse(ok)
+        self.assertIn("默认数据目录", error)
+        default_tier.assert_not_called()
+        launched.assert_not_called()
+        transport.assert_not_called()
+
+    def test_guarded_muse_private_home_holds_only_the_current_catalog(self):
+        from makewand.execution_runtime import execution_context
+        from makewand.sandbox import ProviderHome
+
+        model = "muse-wonder-1.0"
+        directory = self.root / ".local" / "share" / "muse" / "model-catalog"
+        directory.mkdir(parents=True)
+        old = directory / "old.json"
+        old.write_text('{"rows":[]}')
+        os.utime(old, (1_000_000, 1_000_000))
+        current = directory / "current.json"
+        current.write_text(json.dumps({"rows": [{"model_id": model, "reasoning_effort_variants": ["high"]}]}))
+        home = ProviderHome("muse", str(self.root))
+        self.addCleanup(home.finalize, write_back=False)
+        with patch.dict(os.environ), execution_context(review_dispatch=("muse", model, "high")):
+            os.environ.pop("MUSE_DATA_DIR", None)
+            os.environ.pop("XDG_DATA_HOME", None)
+            home.materialize()
+            copied = Path(home._private_roots[".local/share/muse"]) / "model-catalog"
+            self.assertEqual(list(copied.iterdir()), [copied / current.name])
+            self.assertEqual((copied / current.name).read_bytes(), current.read_bytes())
+            self.assertTrue(home.muse_review_snapshot_is_current())
+            current.write_text("")
+            self.assertFalse(home.muse_review_snapshot_is_current())
 
     def quota(self, model, used, minutes=300):
         return dict(self.identity, windows=[{"model": model, "used_percent": used,

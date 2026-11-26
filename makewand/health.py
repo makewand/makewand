@@ -12,7 +12,8 @@ from makewand import filelock as fcntl
 import uuid
 import tempfile
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
+from decimal import Decimal
+from functools import lru_cache, partial
 from typing import Dict, Any, Optional, Iterator, Tuple
 from pathlib import Path
 from makewand.config import (
@@ -63,15 +64,15 @@ FAILURE_TTL_MAX_SECONDS = 24 * 3600
 
 
 QUOTA_RESERVE_ENV = "MAKEWAND_QUOTA_RESERVE_PERCENT"
-DEFAULT_QUOTA_RESERVE_PERCENT = 8.0
+DEFAULT_QUOTA_RESERVE_PERCENT = 0.0
 QUOTA_RESERVE_ERROR = (
     "MAKEWAND_QUOTA_RESERVE_PERCENT must be a finite number between 0 and 100; "
-    "using the default 8% reserve"
+    "using the default 0% reserve"
 )
 
 
 def _quota_reserve_setting():
-    """An explicit per-process buffer; invalid input cannot lower the default."""
+    """An optional per-process buffer; invalid input uses the default."""
     raw = os.environ.get(QUOTA_RESERVE_ENV)
     if raw is None:
         return DEFAULT_QUOTA_RESERVE_PERCENT, None
@@ -94,6 +95,12 @@ def _quota_status(remaining, reserve, *, healthy_at=25, inclusive=True):
     return "healthy" if healthy else "warning"
 
 
+def _quota_remaining(used):
+    # Keep the observed precision when subtracting from 100. This avoids
+    # treating positive fractions as exhausted or tripping a decimal buffer early.
+    return float(Decimal(100) - Decimal(str(used)))
+
+
 def _quota_reserve_metadata(reserve, error):
     return {"reserve_percent": reserve, "reserve_error": error}
 
@@ -111,9 +118,15 @@ def _is_quota_reserve_gate(info):
     # Migrate only our exact legacy buffer verdict, never a provider 429/auth
     # verdict. Subsequent real dispatch/probe updates replace the whole entry.
     reason = str(info.get("reason") or "")
+    # Older Codex versions stored advisory warnings as quota refusals.
+    # The same legacy message could also report exactly zero remaining.
+    percent = r"\d+(?:\.\d+)?(?:e[+-]?\d+)?"
+    api_note = r"(?: \(已就绪备用 API 兜底接力\))?"
+    legacy_warning = re.fullmatch(rf"每周额度濒临耗尽 \(剩余 ({percent})%\)" + api_note, reason)
     return info.get("quota_reserve_gate") is True or bool(
-        re.match(r"^保护阈值拦截 \(剩余 \d+(?:\.\d+)?% < 8%\):", reason)
-        or re.fullmatch(r"配额保护阈值拦截 \((?:剩余 \d+(?:\.\d+)?% < \d+(?:\.\d+)?%|剩余额度耗尽或无法确认)\)", reason)
+        (legacy_warning and float(legacy_warning[1]) > 0)
+        or re.match(rf"^保护阈值拦截 \(剩余 {percent}% < 8%\):", reason)
+        or re.fullmatch(rf"配额保护阈值拦截 \((?:剩余 {percent}% < {percent}%|剩余额度耗尽或无法确认)\)" + api_note, reason)
     )
 
 REAUTH_HINTS = {
@@ -1336,7 +1349,7 @@ def _run_model_probe(engine: str, command: str, timeout: int, *, repo_trust="tru
         captured.append(raw)
         if raw[0] == 0:
             return True, raw[1], None
-        parser = {"claude": parse_claude_quota, "codex": parse_codex_quota,
+        parser = {"claude": parse_claude_quota, "codex": partial(parse_codex_quota, allow_reserve=False),
                   "muse": parse_muse_quota, "grok": parse_grok_quota,
                   "agy": parse_agy_quota}.get(engine)
         if raw[0] > 0 and not is_process_timeout(raw[3]) and parser is not None:
@@ -1538,7 +1551,7 @@ def probe_model(
         t = _resolve_probe_timeout(model_name, timeout or 45, tier=tier, effort=effort)
         code, out, err, ex = _run_model_probe(model_name, cmd, timeout=t, repo_trust=repo_trust, cwd=cwd)
         combined = f"{out}\n{err}"
-        is_limited, reason, resets = parse_codex_quota(combined)
+        is_limited, reason, resets = parse_codex_quota(combined, allow_reserve=False)
         if is_limited:
             reason_str = f"{reason} (已就绪备用 API 兜底接力)" if api_ready else reason
             return {"status": "limited", "reason": reason_str, "resets_at": resets, "updated_at": now, "mode": mode, "api_fallback": api_ready}
@@ -2090,7 +2103,7 @@ def _get_official_subscription_quota(provider: str, resets_at: Optional[str] = N
                 "desc": "当前账号/模型没有可关联的额度窗口；余量未知", "is_unlimited": False,
                 "resets_at": None, "windows": list(windows.values()), **identity}
     worst = max(shared, key=lambda entry: entry["used_percent"])
-    remaining = round(100 - worst["used_percent"], 2)
+    remaining = _quota_remaining(worst["used_percent"])
     scoped_message = ""
     if model is None and any((entry["model"] and entry["used_percent"] >= 100) or
                             entry.get("scoped_percent") == 100 for entry in windows.values()):

@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Codex 和 Claude 默认可用完订阅额度，周用量达到 100% 或供应商拒绝时停止。Codex 的低额度提醒不会按默认策略触发限流，仍可显式配置保留阈值。
+- 高风险审查按本机目录校验精确模型 ID、版本、推理档和实际家族，路由生成的只读命令在派发时复核。无跨家族候选时，同家族回退需要显式批准。
+- `route`、`review` 和直接派发支持 `--no-capacity-wait`。名额已满时只尝试一次准入，减少长时间排队。观察报告区分调用方的重试批准声明，并排除没有实际准入的后续预约。
+- AGY 官方目录中无推理后缀的原生模型按原始 ID 进入强档，使用 CLI 默认推理设置。
 - `route` 在派发命令、升档提示和额度查询中继承不可信仓库设置。调用账本保存发起方及显式重试声明，路由读取 UNKNOWN/超时回执并提示核对授权。
 - `review` 的最终裁决同时决定退出码和 JSON 状态。候选在审查期间变化或有效裁决缺失时，结果为未验证，省去只凭原答复补写裁决的第二次调用。
 - `route` 不再推荐 agy 没有的模型名。agy 列出的 `gemini-pro-orchestrator` 和 `gemini-pro-orchestrator-argon` 不带推理深度后缀，路由目录却照常拼上 -low/-medium/-high，一共 6 个名字；照着派发时 agy 约 7 秒报错，这次调用仍计入请求的次数（11-15 出现 1 次）。现在只推荐 agy 列表里带后缀的模型；这两个模型仍可按名字直接派发。

@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import json
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -313,12 +314,11 @@ def parse_agy_models_output(text: str) -> List[Tuple[str, str]]:
             parts = line.split(None, 1)
             slug = parts[0].strip()
             desc = parts[1].strip() if len(parts) > 1 else ""
-        slug = slug.lower()
         if not _valid_model_id(slug):
             continue
         # English/error lines ("No models available ...", "Please sign in ...")
         # start with a bare word; real model ids are hyphenated/dotted/digit-bearing.
-        if slug != "gemini" and not any(c in slug for c in "-.") and not any(c.isdigit() for c in slug):
+        if slug.lower() != "gemini" and not any(c in slug for c in "-.") and not any(c.isdigit() for c in slug):
             continue
         if slug.endswith(":"):
             continue
@@ -617,17 +617,22 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
                 if isinstance(m, dict):
                     slug = m.get("id") or m.get("slug")
                     desc = m.get("description") or m.get("name") or ""
-                    norm_slug = _agy_full_model_id(slug or "")
-                    if norm_slug and (norm_slug, desc) not in seen:
-                        seen.add((norm_slug, desc))
-                        discovered_agy.append((norm_slug, desc))
-                        metadata[norm_slug] = _catalog_origin(agy_cache_file)
                 elif isinstance(m, str):
-                    norm_slug = _agy_full_model_id(m)
-                    if norm_slug and (norm_slug, "") not in seen:
-                        seen.add((norm_slug, ""))
-                        discovered_agy.append((norm_slug, ""))
-                        metadata[norm_slug] = _catalog_origin(agy_cache_file)
+                    slug, desc = m, ""
+                else:
+                    continue
+                verbatim = cdata.get("verbatim_ids") is True and _valid_model_id(slug) and slug == slug.strip()
+                model_id = slug if verbatim else _agy_full_model_id(slug)
+                if not model_id:
+                    continue
+                if (model_id, desc) not in seen:
+                    seen.add((model_id, desc))
+                    discovered_agy.append((model_id, desc))
+                    metadata.setdefault(model_id, {}).update(_catalog_origin(agy_cache_file))
+                if slug == model_id:
+                    metadata.setdefault(model_id, {})["cli_model_id"] = True
+                if verbatim:
+                    metadata[model_id]["verbatim_cli_model_id"] = True
         except Exception:
             pass
 
@@ -645,6 +650,7 @@ def _discover_local_agy_models(sync: bool = True) -> DiscoveredAgyModels:
 
 def _is_native_agy_model(slug: str) -> bool:
     """Antigravity's own Gemini models, as opposed to the claude-*/gpt-* models it proxies."""
+    slug = slug.lower()
     return slug.startswith(("gemini-", "google-")) or slug == "gemini"
 
 
@@ -816,7 +822,7 @@ def _sync_agy_models_cache(cache_file: Optional[Path] = None, timeout: float = A
             # replace the cache with each other's partial output.
             fd, tmp_name = tempfile.mkstemp(prefix=cache_file.name + ".", suffix=".tmp", dir=str(cache_file.parent))
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump({"updated_at": time.time(), "models": models_data}, handle, indent=2)
+                json.dump({"updated_at": time.time(), "verbatim_ids": True, "models": models_data}, handle, indent=2)
             os.replace(tmp_name, str(cache_file))
             tmp_name = None
             _AGY_FAILED_REFRESHES.pop(str(cache_file), None)
@@ -899,7 +905,71 @@ class DiscoveredMuseModels(tuple):
         return default
 
 
-def _discover_local_muse_models() -> DiscoveredMuseModels:
+def _muse_review_data_dir(user_home=None):
+    if "MUSE_DATA_DIR" in os.environ:
+        root = os.environ["MUSE_DATA_DIR"]
+        data_dir = Path(root)
+    elif "XDG_DATA_HOME" in os.environ:
+        root = os.environ["XDG_DATA_HOME"]
+        data_dir = Path(root) / "muse"
+    else:
+        root = str(user_home if user_home is not None else Path.home())
+        data_dir = Path(root) / ".local" / "share" / "muse"
+    if not root.strip() or not data_dir.is_absolute():
+        return None
+    return data_dir
+
+
+def muse_review_uses_sandbox_profile(user_home=None):
+    """The Muse sandbox clears profile overrides and uses the default data root."""
+    home = Path(user_home) if user_home is not None else Path.home()
+    return _muse_review_data_dir(home) == home / ".local" / "share" / "muse"
+
+
+def _muse_current_catalog(user_home=None):
+    """Select one profile and its latest snapshot before reading model data."""
+    try:
+        data_dir = _muse_review_data_dir(user_home)
+        if data_dir is None:
+            return None
+        files = []
+        for path in (data_dir / "model-catalog").glob("*.json"):
+            metadata = path.lstat()
+            if stat.S_ISREG(metadata.st_mode):
+                files.append((metadata.st_mtime_ns, path))
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not files:
+        return None
+    latest = max(stamp for stamp, _ in files)
+    current = [path for stamp, path in files if stamp == latest]
+    return current[0] if len(current) == 1 else None
+
+
+def _muse_catalog_groups(strict_catalog):
+    if strict_catalog:
+        catalog = _muse_current_catalog()
+        if catalog is not None:
+            yield (catalog,)
+        return
+    directories = []
+    if os.environ.get("MUSE_DATA_DIR"):
+        directories.append(Path(os.environ["MUSE_DATA_DIR"]).expanduser() / "model-catalog")
+    if os.environ.get("XDG_DATA_HOME"):
+        directories.append(Path(os.environ["XDG_DATA_HOME"]).expanduser() / "muse" / "model-catalog")
+    directories.extend([
+        Path.home() / ".local" / "share" / "muse" / "model-catalog",
+        Path.home() / ".config" / "muse" / "model-catalog",
+        Path.home() / ".muse" / "model-catalog",
+    ])
+    for directory in directories:
+        try:
+            yield sorted(directory.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+
+
+def _discover_local_muse_models(*, strict_catalog=False) -> DiscoveredMuseModels:
     """
     Scans local Muse model-catalog and config directories.
     Returns DiscoveredMuseModels(models, configured_default, configured_effort).
@@ -912,46 +982,46 @@ def _discover_local_muse_models() -> DiscoveredMuseModels:
     catalog_default = None
 
     # 1. Check official model catalog cache
-    muse_cat_bases = []
-    if os.environ.get("MUSE_DATA_DIR"):
-        muse_cat_bases.append(Path(os.environ["MUSE_DATA_DIR"]).expanduser() / "model-catalog")
-    if os.environ.get("XDG_DATA_HOME"):
-        muse_cat_bases.append(Path(os.environ["XDG_DATA_HOME"]).expanduser() / "muse" / "model-catalog")
-    muse_cat_bases.extend([
-        Path.home() / ".local" / "share" / "muse" / "model-catalog",
-        Path.home() / ".config" / "muse" / "model-catalog",
-        Path.home() / ".muse" / "model-catalog",
-    ])
+    for files in _muse_catalog_groups(strict_catalog):
+        for json_file in files:
+            try:
+                if strict_catalog:
+                    from makewand.sandbox import _read_host_state
+                    snapshot = _read_host_state(str(json_file))
+                    if snapshot is None:
+                        continue
+                    catalog_text = snapshot[0].decode("utf-8")
+                else:
+                    catalog_text = json_file.read_text(encoding="utf-8")
+                cdata = json.loads(catalog_text)
+            except (OSError, ValueError):
+                continue
+            rows = cdata.get("rows") if isinstance(cdata, dict) else None
+            if not isinstance(rows, list):
+                continue
+            hidden = {r.get("model_id") or r.get("id") or r.get("slug") for r in rows
+                      if strict_catalog and isinstance(r, dict) and r.get("visibility") == "hidden"
+                      and _valid_model_id(r.get("model_id") or r.get("id") or r.get("slug"))}
+            for r in rows:
+                if not isinstance(r, dict) or r.get("visibility") == "hidden":
+                    continue
+                mid = r.get("model_id") or r.get("id") or r.get("slug")
+                if not _valid_model_id(mid) or mid in hidden:
+                    continue
+                levels = r.get("reasoning_effort_variants")
+                if mid not in model_efforts and isinstance(levels, list):
+                    model_efforts[mid] = _effort_names(levels)
+                desc = r.get("description") or r.get("display_label") or ""
+                if not isinstance(desc, str):
+                    desc = ""
+                if (mid, desc) not in seen:
+                    seen.add((mid, desc))
+                    discovered_muse.append((mid, desc))
+                if (r.get("is_default") or r.get("is_current")) and not catalog_default:
+                    catalog_default = mid
 
-    for cat_dir in muse_cat_bases:
-        if not cat_dir.exists():
-            continue
-        try:
-            for json_file in sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
-                try:
-                    cdata = json.loads(json_file.read_text(encoding="utf-8"))
-                    rows = cdata.get("rows", [])
-                    if isinstance(rows, list):
-                        for r in rows:
-                            if not isinstance(r, dict):
-                                continue
-                            if r.get("visibility") == "hidden":
-                                continue
-                            mid = r.get("model_id") or r.get("id") or r.get("slug")
-                            if not _valid_model_id(mid):
-                                continue
-                            if mid not in model_efforts and isinstance(r.get("reasoning_effort_variants"), list):
-                                model_efforts[mid] = _effort_names(r["reasoning_effort_variants"])
-                            desc = r.get("description") or r.get("display_label") or ""
-                            if (mid, desc) not in seen:
-                                seen.add((mid, desc))
-                                discovered_muse.append((mid, desc))
-                            if (r.get("is_default") or r.get("is_current")) and not catalog_default:
-                                catalog_default = mid
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    if strict_catalog:
+        return DiscoveredMuseModels(discovered_muse, catalog_default, None, model_efforts)
 
     # 2. Check settings.json for user-configured model and effort
     for s_path in [
@@ -1227,10 +1297,14 @@ def _grok_effort_map() -> Dict[str, List[str]]:
     return found
 
 
-def _muse_effort_map() -> Dict[str, List[str]]:
+def _muse_effort_map(*, strict_catalog=False) -> Dict[str, List[str]]:
     found: Dict[str, List[str]] = {}
     try:
-        discovered = _discover_local_muse_models()
+        if strict_catalog and not muse_review_uses_sandbox_profile():
+            from makewand.sandbox import is_bwrap_available
+            if is_bwrap_available():
+                return found
+        discovered = _discover_local_muse_models(strict_catalog=True) if strict_catalog else _discover_local_muse_models()
     except Exception:
         return found
     for mid, _desc in discovered.models:
@@ -1239,7 +1313,7 @@ def _muse_effort_map() -> Dict[str, List[str]]:
     return found
 
 
-def _agy_effort_map() -> Dict[str, List[str]]:
+def _agy_effort_map(*, exact_ids_only=False) -> Dict[str, List[str]]:
     found: Dict[str, List[str]] = {}
     try:
         discovered = _discover_local_agy_models(sync=False)
@@ -1248,16 +1322,18 @@ def _agy_effort_map() -> Dict[str, List[str]]:
     for slug, _desc in discovered.models:
         if not _valid_model_id(slug):
             continue
+        if exact_ids_only and not discovered.metadata.get(slug, {}).get("verbatim_cli_model_id"):
+            continue
         _base, suffix = _split_agy_suffix(slug)
-        # agy lists a model without a suffix when it has no reasoning-depth
-        # variants (gemini-pro-orchestrator). The catalog would append one and
-        # route would offer a name agy rejects, so only suffixed ids are listed.
         if suffix:
             found[str(slug)] = [suffix]
+        elif _is_native_agy_model(slug) and discovered.metadata.get(slug, {}).get("cli_model_id"):
+            # Only the CLI listing proves this exact bare ID is dispatchable.
+            found[str(slug)] = ["none"]
     return found
 
 
-def discover_model_efforts() -> Dict[str, Dict[str, List[str]]]:
+def discover_model_efforts(*, strict_catalogs=False) -> Dict[str, Dict[str, List[str]]]:
     """Local model → reasoning efforts for agy, claude, codex, muse and grok.
 
     Reads the same on-disk catalogs ``discover_available_models`` already uses.
@@ -1270,8 +1346,8 @@ def discover_model_efforts() -> Dict[str, Dict[str, List[str]]]:
         ("codex", _codex_effort_map),
         ("claude", _claude_effort_map),
         ("grok", _grok_effort_map),
-        ("muse", _muse_effort_map),
-        ("agy", _agy_effort_map),
+        ("muse", lambda: _muse_effort_map(strict_catalog=strict_catalogs)),
+        ("agy", lambda: _agy_effort_map(exact_ids_only=strict_catalogs)),
     ):
         try:
             models = reader()

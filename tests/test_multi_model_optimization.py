@@ -515,11 +515,13 @@ class TestCliOptimizationsAndCircuitBreaker(unittest.TestCase):
                     "SourceAt": now.isoformat(), "WeeklyResetAt": (now + timedelta(hours=1)).isoformat()}]}))
                 return _get_official_subscription_quota(provider)
 
-    def test_low_quota_circuit_breaker_threshold(self):
+    def test_low_quota_trips_only_an_explicit_circuit_breaker(self):
         q = self.fake_bound_quota("codex", 94)
         self.assertIsNotNone(q)
         self.assertEqual(q["percentage"], 6)
-        self.assertEqual(q["status"], "limited")
+        self.assertEqual(q["status"], "warning")
+        with patch.dict(os.environ, {"MAKEWAND_QUOTA_RESERVE_PERCENT": "8"}):
+            self.assertEqual(self.fake_bound_quota("codex", 94)["status"], "limited")
 
     def test_safe_quota_above_circuit_breaker(self):
         q = self.fake_bound_quota("claude", 85)
