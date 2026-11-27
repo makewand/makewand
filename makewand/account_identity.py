@@ -160,10 +160,24 @@ def credential_binding(provider):
     variable = "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"
     root = Path(os.environ.get(variable) or Path.home() / ("." + provider)).expanduser().resolve()
     paths = [root / ("auth.json" if provider == "codex" else ".credentials.json")]
+    token = None
     if provider == "claude":
+        # A sandboxed run on the long-lived token never reads the interactive
+        # login: bind the token file instead, so a host session refreshing its
+        # login while this call waits for a slot does not refuse the launch.
+        from makewand.sandbox import _claude_setup_token_path, is_bwrap_available
+        token = _claude_setup_token_path(str(Path.home())) if is_bwrap_available() else None
+        if token is not None:
+            paths = [Path(token)]
         paths.append(Path.home() / ".claude.json" if root == (Path.home() / ".claude").resolve() else root / ".claude.json")
     files = {}
     for path in paths:
+        if provider == "claude" and token is not None and path == Path(token):
+            # Never followed through a symlink; an unusable file refuses the launch later.
+            from makewand.sandbox import _read_host_state
+            state = _read_host_state(token)
+            files[os.path.realpath(token)] = hashlib.sha256(state[0]).hexdigest() if state else "unusable"
+            continue
         found = _read_host_regular(str(path))
         files[os.path.realpath(path)] = (_claude_identity_fingerprint(found[0] if found else None)
                                     if path.name == ".claude.json" else

@@ -1071,13 +1071,16 @@ CREDENTIAL_MAX_BYTES = 4 * 1024 * 1024
 # resolves outside HOME and the masked host roots (_credential_backup_path).
 CREDENTIAL_BACKUP_DIR = ".config/makewand/credential-backups"
 # A long-lived Claude token (`claude setup-token`) kept by the user below
-# CREDENTIAL_BACKUP_DIR. While it exists, sandboxed Claude runs get it as
-# CLAUDE_CODE_OAUTH_TOKEN and no copy of the interactive login
-# (~/.claude/.credentials.json): a copy refreshed inside the sandbox spends the
-# refresh token the host sessions still hold, and logs one side out.
+# CREDENTIAL_BACKUP_DIR. While it exists, a sandboxed Claude run gets a private
+# .credentials.json made from it (access token only, nothing to refresh) and no
+# copy of the interactive login (~/.claude/.credentials.json): a copy refreshed
+# inside the sandbox spends the refresh token the host sessions still hold, and
+# logs one side out. The token never enters a command line or the environment.
 CLAUDE_SETUP_TOKEN_REL = "claude/setup-token"
-CLAUDE_SETUP_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 _CLAUDE_SETUP_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=-]{19,4095}")
+# Claude refreshes a stored login close to its expiry; the private one has no
+# refresh token, so it is dated well past any run.
+_CLAUDE_SETUP_TOKEN_LIFETIME_MS = 365 * 24 * 3600 * 1000
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -1359,20 +1362,38 @@ def _credential_backup_path(user_home: str, backup_rel: str) -> Optional[str]:
     return path
 
 
-def _claude_setup_token(user_home: str) -> Optional[str]:
+def _claude_setup_token_path(user_home: str) -> Optional[str]:
     """
-    The user's long-lived Claude token (CLAUDE_SETUP_TOKEN_REL), or None when
-    none is kept or the run selects another login (CLAUDE_CONFIG_DIR, an API
-    key). A file that exists but cannot be used refuses the launch instead of
-    falling back to a copy of the interactive login.
+    Where the user's long-lived Claude token (CLAUDE_SETUP_TOKEN_REL) is kept,
+    or None when sandboxed runs do not use one: no such file, or the run
+    selects another login (CLAUDE_CONFIG_DIR, an API key). Only a missing file
+    or directory means "no token"; an entry that cannot be examined still
+    selects the token, so the launch is refused instead of quietly copying the
+    interactive login.
     """
     if any(os.environ.get(name) for name in ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY")):
         return None
-    if not os.path.lexists(os.path.join(user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL)):
+    path = os.path.join(user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        pass
+    return path
+
+
+def _claude_setup_token(user_home: str) -> Optional[Tuple[str, str]]:
+    """
+    (token, sha256 of the file) of the user's long-lived Claude token, or None
+    when none is used (_claude_setup_token_path). A file that is there but
+    cannot be used refuses the launch; the message never shows its content.
+    """
+    selected = _claude_setup_token_path(user_home)
+    if selected is None:
         return None
     path = _credential_backup_path(user_home, CLAUDE_SETUP_TOKEN_REL)
     state = _read_host_state(path) if path else None
-    problem = None
     if state is None:
         problem = "不是可读取的普通文件，或所在目录沙箱可能看得到"
     elif state[1] & 0o077:
@@ -1383,11 +1404,19 @@ def _claude_setup_token(user_home: str) -> Optional[str]:
         except UnicodeDecodeError:
             token = ""
         if _CLAUDE_SETUP_TOKEN.fullmatch(token):
-            return token
+            return token, _digest(state[0])
         problem = "内容不是单行令牌"
     raise SandboxConfigError(
         f"Claude 专用令牌文件 ~/{CREDENTIAL_BACKUP_DIR}/{CLAUDE_SETUP_TOKEN_REL} {problem}，拒绝启动 (fail closed)；"
         "请用 claude setup-token 重新生成并以 600 权限保存，或删除该文件以改回使用交互登录")
+
+
+def _claude_setup_token_login(token: str) -> bytes:
+    """The private .credentials.json of a run on the long-lived token: nothing in it can be refreshed."""
+    return (json.dumps({"claudeAiOauth": {
+        "accessToken": token, "refreshToken": None,
+        "expiresAt": int(time.time() * 1000) + _CLAUDE_SETUP_TOKEN_LIFETIME_MS,
+        "scopes": ["user:inference"]}}) + "\n").encode("ascii")
 
 
 def _mirror_credential_backup(host_p: str, backup: str) -> None:
@@ -1875,7 +1904,7 @@ class _CredentialCopy:
     mode: int = 0o600
     minted: Tuple[str, ...] = ()  # minted keys of this file (_credential_writeback_merge)
     backup: bool = False  # host_path is makewand's backup copy: never followed through a symlink
-    detached: bool = False  # the run uses CLAUDE_SETUP_TOKEN_ENV: nothing copied in, nothing written back
+    detached: bool = False  # made from the long-lived Claude token: never written back
 
 
 ACCOUNT_DIR_VARS = {"codex": "CODEX_HOME", "claude": "CLAUDE_CONFIG_DIR"}
@@ -2102,7 +2131,7 @@ class ProviderHome:
         self.scan_roots: List[str] = []
         self.credentials: List[_CredentialCopy] = []
         self.identity_file: Optional[Tuple[str, str]] = None
-        self.env_token: Optional[str] = None  # _claude_setup_token, passed as CLAUDE_SETUP_TOKEN_ENV
+        self.setup_token: Optional[str] = None  # _claude_setup_token: replaces the copy of the login
         self._materialized = False
         self._lock = threading.Lock()
         self._private_roots: Dict[str, str] = {}
@@ -2142,14 +2171,18 @@ class ProviderHome:
                 self._materialized = True
                 return []
             if self.provider == "claude":
-                self.env_token = _claude_setup_token(self.user_home)
+                found = _claude_setup_token(self.user_home)
+                if binding is not None:
+                    # The token read here is the one admission fingerprinted.
+                    key = os.path.realpath(os.path.join(self.user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL))
+                    if binding["files"].get(key) != (found[1] if found else None):
+                        refuse_credential_launch("selected login changed after admission; refusing account switch")
+                self.setup_token = found[0] if found else None
             try:
                 self._build(profile, paths, absent_root_ok)
             except BaseException:
                 self._remove_private_dir()
                 raise
-            if self.env_token:
-                self.bwrap_args = self.bwrap_args + ["--setenv", CLAUDE_SETUP_TOKEN_ENV, self.env_token]
             self._materialized = True
             return list(self.bwrap_args)
 
@@ -2172,17 +2205,27 @@ class ProviderHome:
             self.identity_file = (priv_root, rel)
         if found is None:
             return None
+        self._write_private(priv_root, rel, found[0])
+        return found
+
+    @staticmethod
+    def _write_private(priv_root: str, rel: str, data: bytes) -> None:
         dst = os.path.join(priv_root, rel)
         try:
             os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
             fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_CLOEXEC, 0o600)
             try:
-                os.write(fd, found[0])
+                os.write(fd, data)
             finally:
                 os.close(fd)
         except OSError as exc:
             raise SandboxConfigError(f"无法复制 provider 凭据到私有目录 ({exc})，拒绝启动 (fail closed)") from exc
-        return found
+
+    def _setup_token_login(self, priv_root: str, rel: str, host_path: str) -> None:
+        """Puts the login made from the long-lived token where the copy of the host login would go."""
+        self._write_private(priv_root, rel, _claude_setup_token_login(self.setup_token))
+        self.credentials.append(_CredentialCopy(private_root=priv_root, rel=rel, host_path=host_path,
+                                                initial_digest=None, detached=True))
 
     def _credential_source(self, host_p: str, found: Optional[Tuple[bytes, int]], priv_root: str, rel: str,
                            backup_rel: Optional[str]) -> Tuple[str, Optional[Tuple[bytes, int]], bool]:
@@ -2250,6 +2293,9 @@ class ProviderHome:
         minted = profile.get("minted_keys", {})
         backups = profile.get("credential_backups", {})
         for rel in rels:
+            if self.setup_token:
+                self._setup_token_login(priv, rel, os.path.join(root_path, rel))
+                continue
             # makewand's backup of a credential (credential_backups) stands in
             # for the missing host file here too.
             host_p, found, is_backup = self._credential_source(
@@ -2257,8 +2303,7 @@ class ProviderHome:
             self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=host_p,
                                                     initial_digest=_digest(found[0]) if found else None,
                                                     mode=found[1] if found else 0o600,
-                                                    minted=tuple(minted.get((root_rel, rel), ())), backup=is_backup,
-                                                    detached=self.env_token is not None))
+                                                    minted=tuple(minted.get((root_rel, rel), ())), backup=is_backup))
 
     def _build(self, profile: dict, project_paths: Sequence[str],
                absent_root_ok: Optional[Callable[[str], bool]] = None) -> None:
@@ -2281,7 +2326,7 @@ class ProviderHome:
                 from makewand.account_identity import verify_credential_copy
                 for kind in ("credentials", "seed"):
                     for e_root, rel in profile.get(kind, []):
-                        if e_root == root_rel:
+                        if e_root == root_rel and not (kind == "credentials" and self.setup_token):
                             verify_credential_copy(os.path.join(root_path, rel), None)
                 # Never create or expose a missing provider root on the host.
                 if absent_root_ok is None or absent_root_ok(root_path):
@@ -2302,11 +2347,9 @@ class ProviderHome:
                     if e_root != root_rel:
                         continue
                     host_p = os.path.join(real, rel)
-                    if kind == "credentials" and self.env_token:
-                        # The private root stays known to execution evidence;
-                        # the interactive login itself never enters the sandbox.
-                        self.credentials.append(_CredentialCopy(
-                            private_root=priv, rel=rel, host_path=host_p, initial_digest=None, detached=True))
+                    if kind == "credentials" and self.setup_token:
+                        # The interactive login itself never enters the sandbox.
+                        self._setup_token_login(priv, rel, host_p)
                         continue
                     found = self._copy_in(host_p, priv, rel)
                     if kind == "credentials":
