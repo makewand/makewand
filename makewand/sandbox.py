@@ -2161,9 +2161,9 @@ class ProviderHome:
             if self._materialized:
                 return list(self.bwrap_args)
             from makewand.execution_runtime import current_context
-            from makewand.account_identity import credential_binding, refuse_credential_launch
+            from makewand.account_identity import binding_view, credential_binding, refuse_credential_launch
             binding = current_context().get("_credential_binding")
-            if binding is not None and binding != credential_binding(self.provider):
+            if binding is not None and binding_view(binding, True) != binding_view(credential_binding(self.provider), True):
                 refuse_credential_launch("selected login changed after admission; refusing account switch")
             paths = list(self.project_paths) + [p for p in project_paths if p]
             profile = _resolve_provider_profile(self.provider, self.user_home, paths)
@@ -3794,10 +3794,11 @@ def provider_sandbox_launch(
         if provider in ("claude", "codex"):
             # Keep the user's configuration, instructions and hooks (and
             # Claude's Keychain namespace). Check account attribution on exit.
-            from makewand.account_identity import credential_binding, account_identity, refuse_credential_launch
+            from makewand.account_identity import (account_identity, binding_view, credential_binding,
+                                                   refuse_credential_launch)
             from makewand.execution_runtime import current_context
-            binding = current_context().get("_credential_binding")
-            selected_binding = credential_binding(provider)
+            binding = binding_view(current_context().get("_credential_binding"), False)
+            selected_binding = binding_view(credential_binding(provider), False)
             if binding is not None and binding != selected_binding:
                 refuse_credential_launch("selected login changed after admission; refusing account switch")
             selected_account = account_identity(provider)
@@ -3823,7 +3824,7 @@ def provider_sandbox_launch(
                 try:
                     changed = selected_account != account_identity(provider)
                     if not selected_account["identity_known"]:
-                        changed = changed or selected_binding != credential_binding(provider)
+                        changed = changed or selected_binding != binding_view(credential_binding(provider), False)
                 except (OSError, ValueError, RuntimeError):
                     changed = True
                 if changed:

@@ -141,16 +141,6 @@ class TestClaudeSetupToken(unittest.TestCase):
             self.assert_token_run(ws)
             self.assertFalse((home / ".claude").exists())
 
-    def test_private_root_stays_known_to_execution_evidence(self):
-        with clean_env(), fake_home() as home, temp_workspace() as ws:
-            make_claude(home)
-            with sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
-                provider_home.materialize([str(ws)])
-                copies = [c for c in provider_home.credentials if c.rel == ".credentials.json"]
-                self.assertEqual([c.detached for c in copies], [True])
-                self.assertTrue(os.path.isdir(copies[0].private_root))
-                self.assertEqual(provider_home.identity_file[1], ".claude.json")
-
     def test_without_a_token_the_login_is_copied_and_refreshes_written_back(self):
         with clean_env(), fake_home() as home, temp_workspace() as ws:
             root = make_claude(home, token=None)
@@ -204,6 +194,20 @@ class TestClaudeSetupToken(unittest.TestCase):
                 self.assertNotIn(TOKEN, result.stdout)
                 self.assertFalse(any(TOKEN in argument for argument in cmd))
 
+
+class TestClaudeSetupTokenAdmission(unittest.TestCase):
+    """Building the private home needs no working bubblewrap."""
+
+    def test_private_root_stays_known_to_execution_evidence(self):
+        with clean_env(), fake_home() as home, temp_workspace() as ws:
+            make_claude(home)
+            with sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
+                provider_home.materialize([str(ws)])
+                copies = [c for c in provider_home.credentials if c.rel == ".credentials.json"]
+                self.assertEqual([c.detached for c in copies], [True])
+                self.assertTrue(os.path.isdir(copies[0].private_root))
+                self.assertEqual(provider_home.identity_file[1], ".claude.json")
+
     def refused_at_launch(self, binding, ws):
         with admitted(binding), sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
             with self.assertRaises(SandboxConfigError):
@@ -244,6 +248,43 @@ class TestClaudeSetupToken(unittest.TestCase):
             binding = account_identity.credential_binding("claude")
             (root / ".credentials.json").write_text(HOST_LOGIN.replace("OLD", "REFRESHED"))
             self.refused_at_launch(binding, ws)
+
+    def test_admitted_token_run_works_without_a_host_claude_directory(self):
+        with clean_env(), fake_home() as home, temp_workspace() as ws:
+            make_claude(home, root=False)
+            binding = account_identity.credential_binding("claude")
+            with admitted(binding), sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
+                provider_home.materialize([str(ws)])
+                copy = next(c for c in provider_home.credentials if c.rel == ".credentials.json")
+                login = json.loads((Path(copy.private_root) / copy.rel).read_text())["claudeAiOauth"]
+                self.assertEqual(login["accessToken"], TOKEN)
+
+    def test_host_run_ignores_the_token_file_and_keeps_binding_the_login(self):
+        with clean_env(), fake_home() as home:
+            root = make_claude(home)
+            view = account_identity.binding_view
+            before = account_identity.credential_binding("claude")
+            token_path(home).write_text(OTHER_TOKEN + "\n")
+            self.assertEqual(view(before, False), view(account_identity.credential_binding("claude"), False))
+            self.assertNotEqual(view(before, True), view(account_identity.credential_binding("claude"), True))
+            (root / ".credentials.json").write_text(HOST_LOGIN.replace("OLD", "REFRESHED"))
+            self.assertNotEqual(view(before, False), view(account_identity.credential_binding("claude"), False))
+
+    def test_binding_fingerprints_token_and_login_without_starting_a_process(self):
+        with clean_env(), fake_home() as home, \
+                patch.object(sandbox, "run_subprocess", side_effect=AssertionError("helper process")):
+            root = make_claude(home)
+            binding = account_identity.credential_binding("claude")
+            token, login = os.path.realpath(token_path(home)), os.path.realpath(root / ".credentials.json")
+            self.assertEqual((binding["setup_token"], binding["login"]), (token, login))
+            self.assertNotIn(TOKEN, json.dumps(binding))
+            self.assertNotIn(login, account_identity.binding_view(binding, True)["files"])
+            self.assertNotIn(token, account_identity.binding_view(binding, False)["files"])
+            token_path(home).unlink()
+            binding = account_identity.credential_binding("claude")
+            self.assertNotIn("setup_token", binding)
+            self.assertIs(account_identity.binding_view(binding, True), binding)
+            self.assertEqual(list(binding["files"]), [login, os.path.realpath(home / ".claude.json")])
 
 
 class TestClaudeSetupTokenFile(unittest.TestCase):
@@ -289,7 +330,7 @@ class TestClaudeSetupTokenFile(unittest.TestCase):
             with self.subTest(label), clean_env(), fake_home() as home:
                 make_claude(home, **arguments)
                 message = self.refused(home, problem)
-                self.assertNotIn(TOKEN, message)
+                self.assertNotIn(arguments.get("token") or TOKEN, message)
 
     def test_symlinked_file_or_store_refuses_the_launch(self):
         for label in ("file", "store"):
@@ -314,26 +355,6 @@ class TestClaudeSetupTokenFile(unittest.TestCase):
             store.mkdir(parents=True)
             (store / "claude").write_text("a file where the directory belongs\n")  # ENOTDIR
             self.refused(home, "普通文件")
-
-    def test_binding_names_the_token_instead_of_the_interactive_login(self):
-        with clean_env(), fake_home() as home, patch.object(sandbox, "is_bwrap_available", return_value=True):
-            root = make_claude(home)
-            files = account_identity.credential_binding("claude")["files"]
-            self.assertIn(os.path.realpath(token_path(home)), files)
-            self.assertNotIn(os.path.realpath(root / ".credentials.json"), files)
-            self.assertNotIn(TOKEN, json.dumps(files))
-
-    def test_binding_keeps_the_interactive_login_for_host_runs_and_without_a_token(self):
-        with clean_env(), fake_home() as home:
-            root = make_claude(home)
-            with patch.object(sandbox, "is_bwrap_available", return_value=False):
-                files = account_identity.credential_binding("claude")["files"]
-            self.assertIn(os.path.realpath(root / ".credentials.json"), files)
-            self.assertNotIn(os.path.realpath(token_path(home)), files)
-            token_path(home).unlink()
-            with patch.object(sandbox, "is_bwrap_available", return_value=True):
-                files = account_identity.credential_binding("claude")["files"]
-            self.assertIn(os.path.realpath(root / ".credentials.json"), files)
 
 
 if __name__ == "__main__":
