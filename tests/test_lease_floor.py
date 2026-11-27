@@ -103,3 +103,51 @@ def test_lease_with_stored_limits_still_validates():
     data = ledger()
     admit(data, 8)
     account_leases.validate(data)
+
+
+# The host-wide gate (shared_capacity) reads each lease's limits from the ledger.
+
+def _row(identifier, limits, project):
+    return {"id": identifier, "kind": "model", "project": project, "task_id": identifier,
+            "lease": {"keys": list(KEYS)}, "limits": list(limits)}
+
+
+def test_host_gate_rows_carry_each_leases_own_limits(tmp_path):
+    from makewand import shared_capacity
+
+    def lease(with_limits):
+        value = {"keys": list(KEYS), "owner": account_leases.process_ref(os.getpid()), "workers": [],
+                 "expires_at": 4102444800, "heartbeat_at": 0, "launch_pending": False}
+        if with_limits:
+            value["limits"] = [8, 8, 8]
+        return value
+
+    ledger_file = tmp_path / "call-budget.json"
+    ledger_file.write_text(__import__("json").dumps({
+        "schema": 1, "maximum": 3,
+        "attempts": [{"id": "old", "status": "started", "task_id": "t-old", "started_at": 1},
+                     {"id": "new", "status": "started", "task_id": "t-new", "started_at": 2}],
+        "leases": {"old": lease(False), "new": lease(True)},
+        # The stored floor stands in only for the lease written before limits were kept.
+        "lease_limits": dict.fromkeys(KEYS, 2),
+    }))
+    rows, _attempts, _now = shared_capacity._source_rows(str(ledger_file))
+    assert rows["old"]["limits"] == [2, 2, 2]
+    assert rows["new"]["limits"] == [8, 8, 8]
+
+
+def test_host_gate_admits_up_to_the_raised_limit_once_older_leases_end():
+    from makewand import shared_capacity
+    current = {"global_max": 8, "project_max": 1, "tool_max": 2, "providers": {"claude": 8}}
+
+    def fits(active, number):
+        ticket = dict(_row(f"ticket-{number}", [8, 8, 8], f"project-{number}"), task_id=f"ticket-{number}")
+        return shared_capacity.fits(ticket, active, current)
+
+    old = [_row("old-1", [2, 2, 2], "a"), _row("old-2", [2, 2, 2], "b")]
+    assert not fits(old, 3)                       # both were admitted with 2
+    mixed = [old[1], _row("new-1", [8, 8, 8], "c")]
+    assert not fits(mixed, 4)                     # one lease admitted with 2 is still running
+    new = [_row(f"new-{i}", [8, 8, 8], f"p{i}") for i in range(7)]
+    assert fits(new, 8)                           # seven running, limit eight
+    assert not fits(new + [_row("new-7", [8, 8, 8], "p7")], 9)

@@ -692,3 +692,53 @@ class ModelQuotaScopeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReminderScopeTests(unittest.TestCase):
+    """Checks added after the first review of the reminder change."""
+
+    def setUp(self):
+        ModelQuotaScopeTests.setUp(self)
+
+    def test_route_reminds_only_about_candidates_it_offers(self):
+        from makewand.outcome_ledger import OutcomeLedger
+        from makewand.review_policy import ReviewPolicy
+        from makewand.route_select import Policy, select
+        discovered = {"agy": {"gemini-4-argon-high": ["high"], "claude-opus-5-5-high": ["high"]}}
+        health.record_engine_limit("agy", "fixture opus refusal", self.reset, model="claude-opus-5-5-high")
+        verified = {("agy", "gemini-4-argon-high", "high"), ("agy", "claude-opus-5-5-high", "high")}
+
+        def route(author):
+            with patch("makewand.review_policy.review_models", return_value=verified), \
+                    patch("makewand.config.has_subscription_configured", return_value=True), \
+                    patch("makewand.config.is_provider_enabled", return_value=True):
+                return select("review", "hard", risk="high", self_tool=author, full=True, policy=Policy(),
+                              quota_reader=lambda: {}, status_reader=health.load_status_cache,
+                              ledger=OutcomeLedger(self.root / "outcomes.jsonl"), discovered=discovered,
+                              review_policy=ReviewPolicy.from_options(author, (), True))
+
+        # For a Claude author the same-family Opus is dropped while Gemini is available: no reminder about it.
+        result = route("claude")
+        offered = {(row.provider, row.model) for row in result.candidates}
+        self.assertIn(("agy", "gemini-4-argon-high"), offered)
+        self.assertNotIn(("agy", "claude-opus-5-5-high"), offered)
+        self.assertEqual(result.reminders, [])
+        # For a Codex author Opus is offered, after Gemini, with its reminder.
+        result = route("codex")
+        models = [row.model for row in result.candidates if row.provider == "agy"]
+        self.assertEqual(models, ["gemini-4-argon-high", "claude-opus-5-5-high"])
+        self.assertEqual(result.reminders,
+                         [("agy", "部分模型（claude-opus-5-5-high）：当前账号/模型额度受限：fixture opus refusal")])
+
+    def test_protected_review_needs_an_explicit_effort(self):
+        from makewand.review_policy import ReviewPolicy, validate_review_dispatch
+        policy = ReviewPolicy.from_options("agy", (), False)
+        for provider, model, effort in (("claude", "claude-fable-5-2", None), ("claude", "claude-fable-5-2", ""),
+                                        ("codex", "gpt-6.2-astra", None)):
+            with self.subTest(provider=provider, effort=effort), self.assertRaisesRegex(ValueError, "需要明确的推理档"):
+                validate_review_dispatch(policy, provider, model, effort, {})
+        with self.assertRaisesRegex(ValueError, "需要明确的推理档"):
+            validate_review_dispatch(ReviewPolicy.from_options("codex", (), False), "agy", "gemini-4-argon", None, {})
+        self.assertEqual(validate_review_dispatch(policy, "claude", "claude-fable-5-2", "high", {}), "high")
+        self.assertEqual(validate_review_dispatch(ReviewPolicy.from_options("codex", (), False), "agy",
+                                                  "gemini-4-argon-high", None, {}), "high")

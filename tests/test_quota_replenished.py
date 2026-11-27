@@ -1,9 +1,8 @@
-"""A refusal or mark that names a reset time ends when the provider replenishes that pool early.
+"""A stored refusal that names a reset time ends when the provider replenishes that pool early.
 
 Seen 2026-11-27: Claude's weekly quota was restored hours after a refusal that
 named Nov 29 as its reset. The official windows showed 1% used, yet the stored
-refusal and a quota mark kept Claude out of every route until someone cleared
-them by hand.
+refusal kept being reported until someone cleared it by hand.
 """
 try:
     import _isolation  # noqa: F401
@@ -135,16 +134,3 @@ def test_official_reader_reentering_the_gate_does_not_recurse(monkeypatch):
     monkeypatch.setattr(health, "_get_official_subscription_quota", reader)
     assert model_quota.refused_models("claude", status(refusal(resets_at=RESET.isoformat()))) == []
     assert calls == ["claude"]
-
-
-def test_mark_ends_with_the_pool_it_names(monkeypatch):
-    monkeypatch.setattr(health, "_get_official_subscription_quota",
-                        lambda provider, *a, **k: official(window(1), window(100, model="Fable")))
-    until = RESET.timestamp() + 300  # callers round the reset up a little
-    assert model_quota.mark_replenished("claude", until)
-    assert model_quota.mark_replenished("Claude:claude-opus-5-5", until)
-    assert not model_quota.mark_replenished("claude:claude-fable-5-2", until)
-    assert not model_quota.mark_replenished("claude", (NOW + timedelta(hours=6)).timestamp())  # an operator's own hold
-    assert not model_quota.mark_replenished("muse", until)
-    assert not model_quota.mark_replenished("claude", None)
-    assert not model_quota.mark_replenished(None, until)

@@ -1131,8 +1131,8 @@ def _main():
     p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前排在后面并提醒（不拦截）", parents=[sub_common_parser])
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
     p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
-    p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
-    p_mark.add_argument("--model", dest="mark_model", default=None, help="只标记这一个模型，同一工具的其他模型照常参选")
+    p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由提醒时会显示）")
+    p_mark.add_argument("--model", dest="mark_model", default=None, help="只标记这一个模型（提醒并排在后面），同一工具的其他模型不受影响")
 
     p_outcome = subparsers.add_parser("outcome", allow_abbrev=False, help="记录一次派活的验收成绩", parents=[sub_common_parser])
     p_outcome.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")

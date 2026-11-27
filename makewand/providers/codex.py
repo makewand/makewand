@@ -96,7 +96,6 @@ def execute_codex_task(
     )
     from makewand.git_helper import find_git_root
     from makewand.codex_reset_credit import restore_quota
-    from makewand.model_quota import limit_cleared_by_reset
     # Untrusted repo enforcement
     if repo_trust == "untrusted":
         allow_network = False
@@ -126,13 +125,9 @@ def execute_codex_task(
     if cache.get("codex", {}).get("status") == "needs_auth" and relay.available:
         return relay("[Makewand -> Codex] 订阅登录失效，自动降级为 OpenAI API 模式接力执行...", cwd=cwd)
 
-    if (cache.get("codex", {}).get("status") == "limited" and not limit_cleared_by_reset("codex", cache["codex"])
-            and not restore_quota("cached_limit")):
-        if relay.available:
-            return relay("[Makewand -> Codex] 订阅配额已耗尽，无缝自动降级为 OpenAI API 模式接力执行...", cwd=cwd)
-        from makewand.model_quota import refuse_before_launch
-        return refuse_before_launch(relay.unavailable(f"Codex CLI 当前额度受限: {cache['codex'].get('reason')}",
-                                     "可配置 OPENAI_API_KEY 作为备用 API 自动接力"))
+    # A stored "limited" status is a reminder (model_quota.before_cli_launch prints
+    # it): only the provider's own answer or a current official reading stops or
+    # relays a launch.
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:

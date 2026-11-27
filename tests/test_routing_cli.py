@@ -830,6 +830,12 @@ class RoutingCliTests(unittest.TestCase):
         verified = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
                                 "--model", "gpt-6.2-astra", "--effort", "high", "fixture")
         self.assertNotIn("提醒（不拦截）", verified.stderr)
+        # A protected review still needs an explicit effort: the adapter's default would differ from the validated one.
+        missing_effort = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
+                                      "--model", "gpt-6.2-astra", "fixture")
+        self.assertEqual(missing_effort.returncode, 2, missing_effort.stderr)
+        self.assertIn("需要明确的推理档", missing_effort.stderr)
+        self.assertNotIn("提醒（不拦截）", missing_effort.stderr)
         # The family rule is not a local record and still refuses.
         same_family = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "codex",
                                    "--model", "gpt-6.2-astra", "--effort", "high", "fixture")

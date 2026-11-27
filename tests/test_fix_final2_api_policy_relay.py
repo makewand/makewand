@@ -134,15 +134,24 @@ class AdapterTests(unittest.TestCase):
                     calls, _ = self.dispatch(engine, "needs_auth", key=False, policy=policy)
                     self.assertEqual(calls, [("cli", engine)])
 
-    def test_limited_or_missing_cli_with_a_forbidden_key_says_the_policy_blocks_the_relay(self):
+    def test_missing_cli_with_a_forbidden_key_says_the_policy_blocks_the_relay(self):
         for engine in ADAPTERS:
-            for status, subscribed in (("limited", True), ("healthy", False)):
-                with self.subTest(engine=engine, status=status, subscribed=subscribed):
-                    calls, result = self.dispatch(engine, status, key=True, policy=None, subscribed=subscribed)
-                    self.assertEqual(calls, [])
-                    self.assertFalse(result[0])
-                    self.assertIn("subscription_only", result[2])
-                    self.assertIn("MAKEWAND_API_POLICY=allow_paid", result[2])
+            with self.subTest(engine=engine):
+                calls, result = self.dispatch(engine, "healthy", key=True, policy=None, subscribed=False)
+                self.assertEqual(calls, [])
+                self.assertFalse(result[0])
+                self.assertIn("subscription_only", result[2])
+                self.assertIn("MAKEWAND_API_POLICY=allow_paid", result[2])
+
+    def test_a_stored_limit_runs_the_subscription_cli_under_either_policy(self):
+        """A stored "limited" status may be stale: it neither refuses the launch nor sends work to the paid API."""
+        for engine in ADAPTERS:
+            for policy in (None, "allow_paid"):
+                with self.subTest(engine=engine, policy=policy):
+                    calls, result = self.dispatch(engine, "limited", key=True, policy=policy)
+                    self.assertEqual(calls, [("cli", engine)])
+                    self.assertEqual(result[:2], (True, "cli answer"))
+                    self.assertEqual(self.routes, ["cli"])
 
     def test_a_quota_refusal_is_relayed_only_under_an_allowing_policy(self):
         limit = {"code": 1, "out": "", "err": "Claude AI usage limit reached|1999999999\n"}

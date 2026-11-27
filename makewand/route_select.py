@@ -324,10 +324,8 @@ def select(
         verified_models = review_models(discovered or {})
 
     marks = {}
-    from makewand.model_quota import mark_replenished
     for name, mark in ledger.active_marks(moment).items():
-        # A mark held until the reset of a pool the provider has replenished is over.
-        if isinstance(name, str) and name.strip() and not mark_replenished(name, _as_epoch(mark.until)):
+        if isinstance(name, str) and name.strip():
             marks[name.strip().lower()] = mark
 
     blocks = ledger.request_blocks(request_id, now=moment) if request_id and not retry_approved else {}
@@ -410,20 +408,19 @@ def select(
             if model and model not in family_models.setdefault(row.provider, []):
                 family_models[row.provider].append(model)
             continue
-        if note:
-            reminded.setdefault(row.provider, {}).setdefault(note, set()).add(_row_model(row))
-        else:
-            clean_models.setdefault(row.provider, set()).add(_row_model(row))
-        available.append((index, row, bool(note)))
+        available.append((index, row, note))
     if review_policy is not None:
         cross_family = [item for item in available
                         if review_model_family(item[1].provider, item[1].model) != review_policy.author_family]
         available = cross_family or available
-    offered = {row.provider for _index, row, _noted in available}
+    # Only candidates that are offered are reminded about.
+    for _index, row, note in available:
+        if note:
+            reminded.setdefault(row.provider, {}).setdefault(note, set()).add(_row_model(row))
+        else:
+            clean_models.setdefault(row.provider, set()).add(_row_model(row))
     reminders = []
     for provider, notes in reminded.items():
-        if provider not in offered:
-            continue
         for text, models in notes.items():
             # A reminder on every offered model of the provider needs no model list.
             named = sorted(model for model in models if model)
@@ -444,7 +441,7 @@ def select(
     batch_requests = [
         (row.provider, tier, task_type,
          getattr(row, "model", None), getattr(row, "effort", None))
-        for _index, row, _noted in available
+        for _index, row, _note in available
     ]
     stats_many = getattr(ledger, "stats_many", None)
     if callable(stats_many):
@@ -460,7 +457,7 @@ def select(
         ]
 
     scored = []
-    for (index, row, noted), stats in zip(available, batch_stats):
+    for (index, row, note), stats in zip(available, batch_stats):
         alpha = _positive_param(stats.alpha)
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))
@@ -471,7 +468,7 @@ def select(
         # passing still overtakes them.
         weight = 1.0 - COST_WEIGHT_SPREAD * (index / (len(rows) - 1)) if len(rows) > 1 else 1.0
         # Candidates with a reminder come after every candidate without one.
-        scored.append((1 if is_self else 0, 1 if noted else 0, -(score * weight), index, row, score, is_self))
+        scored.append((1 if is_self else 0, 1 if note else 0, -(score * weight), index, row, score, is_self))
     scored.sort()
 
     chosen = [

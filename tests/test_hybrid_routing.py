@@ -82,7 +82,10 @@ class TestHybridRouting(unittest.TestCase):
     @patch("makewand.config.has_subscription_configured")
     @patch("makewand.config.has_api_configured")
     @patch("makewand.providers.api_client.call_api_chat")
-    def test_codex_limited_triggers_api_fallback(self, mock_call_api, mock_has_api, mock_has_sub, mock_cache):
+    def test_codex_live_refusal_triggers_api_fallback_and_a_stored_limit_does_not(self, mock_call_api, mock_has_api, mock_has_sub, mock_cache):
+        import contextlib
+        import io
+        from types import SimpleNamespace
         from makewand.providers.codex import execute_codex_task
 
         mock_cache.return_value = {"codex": {"status": "limited", "reason": "Monthly quota hit"}}
@@ -90,10 +93,31 @@ class TestHybridRouting(unittest.TestCase):
         mock_has_api.return_value = True
         mock_call_api.return_value = (True, "Generated code via OpenAI API fallback", None)
 
-        ok, out, err = execute_codex_task("Fix bug in auth.py")
+        @contextlib.contextmanager
+        def launch(name, cmd, cwd, **kwargs):
+            yield SimpleNamespace(cmd=cmd, pass_fds=(), env={})
+
+        # A stored limit is a reminder: the subscription CLI runs and nothing goes to the paid API.
+        with patch("makewand.sandbox.provider_sandbox_launch", side_effect=launch), \
+                patch("makewand.providers.codex.run_subprocess", return_value=(0, "cli answer", "", None)) as cli, \
+                contextlib.redirect_stderr(io.StringIO()):
+            ok, out, err = execute_codex_task("Fix bug in auth.py")
+        self.assertTrue(ok)
+        self.assertEqual(out, "cli answer")
+        cli.assert_called_once()
+        mock_call_api.assert_not_called()
+
+        # The provider's own refusal starts the relay the policy allows.
+        refusal = (1, "", "ERROR: You've hit your usage limit. Try again in 3 hours.\n", None)
+        with patch("makewand.sandbox.provider_sandbox_launch", side_effect=launch), \
+                patch("makewand.providers.codex.run_subprocess", return_value=refusal) as cli, \
+                patch("makewand.codex_reset_credit.restore_quota", return_value=False), \
+                patch("makewand.health.record_engine_limit"), contextlib.redirect_stderr(io.StringIO()):
+            ok, out, err = execute_codex_task("Fix bug in auth.py")
         self.assertTrue(ok)
         self.assertEqual(out, "Generated code via OpenAI API fallback")
         self.assertIsNone(err)
+        cli.assert_called_once()
         mock_call_api.assert_called_once()
 
     @patch("makewand.health.load_status_cache")

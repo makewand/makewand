@@ -265,7 +265,7 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
 
     def test_selection_and_adapters_agree_on_what_is_relayed(self):
         for engine in self.ADAPTERS:
-            for status in ("limited", "needs_auth", "error"):
+            for status in ("needs_auth", "error"):
                 for policy in ("allow_paid", "subscription_only"):
                     with self.subTest(engine=engine, status=status, policy=policy):
                         with routing(pool=(engine,), api=(engine,)), \
@@ -273,6 +273,16 @@ class TestAdaptersRelayWhatSelectionCountsAsRelayed(unittest.TestCase):
                             relayable = _usable_or_api_relay(engine, {engine: live(status)})
                         calls, _ = self.dispatch(engine, status, policy=policy)
                         self.assertEqual(bool(calls), relayable)
+
+    def test_a_stored_limit_is_not_relayed_by_the_adapter(self):
+        """Automatic selection still counts a stored limit as relayed; a named engine runs its CLI
+        and only a live refusal or a current official reading starts the relay."""
+        for engine in self.ADAPTERS:
+            for policy in ("allow_paid", "subscription_only"):
+                with self.subTest(engine=engine, policy=policy):
+                    calls, result = self.dispatch(engine, "limited", policy=policy)
+                    self.assertEqual(calls, [])
+                    self.assertEqual(result[2], "cli path")
 
 
 if __name__ == "__main__":

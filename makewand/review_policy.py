@@ -144,6 +144,9 @@ def validate_review_dispatch(policy, provider, model, effort, discovered):
     reason = policy.check_family(provider, model)
     if reason:
         raise ValueError(reason)
+    if not effort:
+        # Without it the adapter picks a default and the launch check would refuse a "changed" effort.
+        raise ValueError("高风险审查需要明确的推理档：用 --effort 指定（AGY 用带推理档后缀的模型 ID，如 gemini-4-argon-high）")
     return effort
 
 
@@ -159,7 +162,7 @@ def review_currency_reminder(provider, model, effort, discovered):
             return None
     except Exception:  # noqa: BLE001 - an unreadable catalog proves nothing about the model
         pass
-    return (f"本机目录未把 {model or '默认模型'} 列为最新强档，或缺少该推理档的证据；照常派发。"
+    return (f"本机目录未把 {model or '默认模型'} 列为最新强档，或缺少该推理档的证据；这一条只提醒，不因此拦截。"
             "可运行 route review hard --risk high 核对当前推荐")
 
 

@@ -308,22 +308,6 @@ class SelectTests(unittest.TestCase):
         self.assertNotIn("codex", dict(after.skipped))
         self.assertIn("codex", [item.provider for item in after.candidates])
 
-    def test_mark_ends_when_the_provider_replenished_the_pool(self):
-        self.ledger.mark("claude", self.now + 3600, "官方周额度用完")
-        self.ledger.mark("codex", self.now + 3600, "官方周额度用完")
-        seen = []
-
-        def replenished(name, until):
-            seen.append((name, until))
-            return name == "claude"
-        with patch("makewand.model_quota.mark_replenished", replenished):
-            result = self._select()
-        self.assertEqual(result.reminders, [("codex", "额度标记未过期：官方周额度用完")])
-        names = [item.provider for item in result.candidates]
-        self.assertIn("claude", names)
-        self.assertEqual(names[-1], "codex")
-        self.assertEqual(sorted(seen), [("claude", self.now + 3600), ("codex", self.now + 3600)])
-
     def test_active_mark_reminds_and_lists_last_and_expired_mark_does_not(self):
         unmarked = [item.provider for item in self._select().candidates]
         self.ledger.mark("claude", self.now + 3600, "官方周额度用完")

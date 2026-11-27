@@ -10,9 +10,11 @@ import re
 import threading
 from pathlib import Path
 
-# Official usage at or below this in the pool that refused means the provider
-# replenished it (a window reset early, extra quota granted): the refusal and
-# any mark that still names the old reset time no longer describe the account.
+# Official usage at or below this in the pool that refused, read after the
+# refusal, means the provider replenished it (a window reset early, extra quota
+# granted): the stored refusal no longer describes the account. A mark carries
+# no creation time, so no reading can be placed after it; marks end at their
+# stated time or when overwritten (`makewand mark <tool> 1s`).
 REPLENISHED_USED_PERCENT = 95
 # A refusal names the reset of the pool that refused; the official window with
 # the same reset moment is that pool.
@@ -151,14 +153,6 @@ def _refusal_replenished(provider, row):
         return replenished(provider, row["quota_scope"].get("model"), reset.timestamp(), observed.timestamp())
     except (TypeError, ValueError, OverflowError, OSError):
         return False
-
-
-def mark_replenished(name, until):
-    """A quota mark ("provider" or "provider:model") held until the reset of a pool that has quota again."""
-    if not isinstance(name, str):
-        return False
-    provider, _, model = name.strip().lower().partition(":")
-    return replenished(provider, model or None, _number(until))
 
 
 def _live_refusals(provider, info, identity):
@@ -305,7 +299,7 @@ def _hold_note(info):
     observed = health._written_at(info)
     if hold == health.UNKNOWN_RESET_HOLDS[0] or observed is None or not _names_no_reset(info):
         return ""
-    return f"（连续被拒，约 {(observed + timedelta(seconds=hold)).strftime('%m-%d %H:%M')} 前不再派发）"
+    return f"（连续被拒，这条记录保留到约 {(observed + timedelta(seconds=hold)).strftime('%m-%d %H:%M')}）"
 
 
 def _number(value):
@@ -469,7 +463,7 @@ def before_cli_launch(provider, model, *, relay=None, cwd=None, effort=None):
     # A stored refusal reminds; only a current official reading refuses or relays.
     note = stored_refusal_reason(provider, model)
     if note:
-        remind(provider, note + "；照常派发，以供应商当场的答复为准")
+        remind(provider, note + "；不因这条记录拦截，以供应商当场的答复为准")
     reason = official_quota_reason(provider, model)
     if reason and provider == "codex":
         from makewand.codex_reset_credit import restore_quota
