@@ -153,13 +153,18 @@ def refuse_credential_launch(message):
 
 
 def credential_binding(provider):
-    """Ephemeral fingerprints for admission-to-copy consistency; never persisted."""
+    """Ephemeral fingerprints for admission-to-copy consistency; never persisted.
+
+    Reads files only: it runs inside a request, before and after the provider,
+    where a helper process would be recorded as the provider's own.
+    """
     if provider not in ("codex", "claude"):
         return None
     from makewand.sandbox import _read_host_regular
     variable = "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"
     root = Path(os.environ.get(variable) or Path.home() / ("." + provider)).expanduser().resolve()
-    paths = [root / ("auth.json" if provider == "codex" else ".credentials.json")]
+    login = root / ("auth.json" if provider == "codex" else ".credentials.json")
+    paths = [login]
     if provider == "claude":
         paths.append(Path.home() / ".claude.json" if root == (Path.home() / ".claude").resolve() else root / ".claude.json")
     files = {}
@@ -168,7 +173,37 @@ def credential_binding(provider):
         files[os.path.realpath(path)] = (_claude_identity_fingerprint(found[0] if found else None)
                                     if path.name == ".claude.json" else
                                     hashlib.sha256(found[0]).hexdigest() if found else None)
-    return {"root": str(root), "files": files}
+    binding = {"root": str(root), "files": files}
+    if provider == "claude":
+        # A sandboxed run on the long-lived token never reads the interactive
+        # login, and a host run never reads the token: both are fingerprinted
+        # here and each launch path compares its own view (binding_view). The
+        # token is kept apart from "files", whose keys are resolved paths: a
+        # token file symlinked to a login file must not replace its entry.
+        from makewand.sandbox import _claude_setup_token_path, _read_host_state
+        token = _claude_setup_token_path(str(Path.home()))
+        if token is not None:
+            # Never followed through a symlink; an unusable file refuses the launch later.
+            state = _read_host_state(token)
+            binding["setup_token"] = hashlib.sha256(state[0]).hexdigest() if state else "unusable"
+            binding["login"] = os.path.realpath(login)
+    return binding
+
+
+def binding_view(binding, sandboxed):
+    """The part of a credential_binding that a launch path depends on.
+
+    A sandboxed Claude run on the long-lived token ignores the interactive
+    login, so a host session refreshing it while the call waits for a slot does
+    not refuse the launch. A host run ignores the token file altogether: its
+    view is the same whether or not one is kept.
+    """
+    if not binding or "setup_token" not in binding:
+        return binding
+    if not sandboxed:
+        return {"root": binding["root"], "files": binding["files"]}
+    return {"root": binding["root"], "setup_token": binding["setup_token"],
+            "files": {path: value for path, value in binding["files"].items() if path != binding["login"]}}
 
 
 def verify_credential_copy(path, data):
