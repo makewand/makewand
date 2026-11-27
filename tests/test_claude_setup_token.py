@@ -18,11 +18,12 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from makewand import account_identity, sandbox
+from makewand import account_identity, execution_evidence, sandbox
 from makewand.execution_runtime import _context
 from makewand.sandbox import SandboxConfigError, is_bwrap_available, wrap_bwrap
 
@@ -120,7 +121,7 @@ class TestClaudeSetupToken(unittest.TestCase):
         login = sandbox_login(result.stdout)
         self.assertEqual(login["accessToken"], TOKEN)
         self.assertIsNone(login["refreshToken"])
-        self.assertGreater(login["expiresAt"], 1795000000000 + 300 * 86400000)
+        self.assertGreater(login["expiresAt"], int(time.time() * 1000) + 300 * 86400000)
         self.assertNotIn("HOSTREFRESH", result.stdout)
         # Neither a command line nor the environment carries the token.
         self.assertFalse(any(TOKEN in argument for argument in cmd))
@@ -206,7 +207,11 @@ class TestClaudeSetupTokenAdmission(unittest.TestCase):
                 copies = [c for c in provider_home.credentials if c.rel == ".credentials.json"]
                 self.assertEqual([c.detached for c in copies], [True])
                 self.assertTrue(os.path.isdir(copies[0].private_root))
-                self.assertEqual(provider_home.identity_file[1], ".claude.json")
+                evidence = {"engine": "claude", "account_ref": "", "windows": [], "source": "selected_login"}
+                execution_evidence.private_home(evidence, provider_home)
+                self.assertEqual(evidence["account_ref"], account_identity.account_ref("claude", "u-1"))
+                self.assertTrue(evidence["identity_known"])
+                self.assertEqual(evidence["source"], "private_home")
 
     def refused_at_launch(self, binding, ws):
         with admitted(binding), sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
@@ -260,31 +265,74 @@ class TestClaudeSetupTokenAdmission(unittest.TestCase):
                 self.assertEqual(login["accessToken"], TOKEN)
 
     def test_host_run_ignores_the_token_file_and_keeps_binding_the_login(self):
-        with clean_env(), fake_home() as home:
-            root = make_claude(home)
-            view = account_identity.binding_view
-            before = account_identity.credential_binding("claude")
-            token_path(home).write_text(OTHER_TOKEN + "\n")
-            self.assertEqual(view(before, False), view(account_identity.credential_binding("claude"), False))
-            self.assertNotEqual(view(before, True), view(account_identity.credential_binding("claude"), True))
-            (root / ".credentials.json").write_text(HOST_LOGIN.replace("OLD", "REFRESHED"))
-            self.assertNotEqual(view(before, False), view(account_identity.credential_binding("claude"), False))
+        view = account_identity.binding_view
+        current = lambda sandboxed: view(account_identity.credential_binding("claude"), sandboxed)  # noqa: E731
+        for before, after in ((TOKEN, OTHER_TOKEN), (None, TOKEN), (TOKEN, None)):
+            with self.subTest(before=bool(before), after=bool(after)), clean_env(), fake_home() as home:
+                root = make_claude(home, token=before)
+                admitted_host, admitted_sandbox = current(False), current(True)
+                if after is None:
+                    token_path(home).unlink()
+                else:
+                    token_path(home).parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                    token_path(home).write_text(after + "\n")
+                    token_path(home).chmod(0o600)
+                self.assertEqual(admitted_host, current(False))
+                self.assertNotEqual(admitted_sandbox, current(True))
+                (root / ".credentials.json").write_text(HOST_LOGIN.replace("OLD", "REFRESHED"))
+                self.assertNotEqual(admitted_host, current(False))
 
     def test_binding_fingerprints_token_and_login_without_starting_a_process(self):
         with clean_env(), fake_home() as home, \
                 patch.object(sandbox, "run_subprocess", side_effect=AssertionError("helper process")):
             root = make_claude(home)
             binding = account_identity.credential_binding("claude")
-            token, login = os.path.realpath(token_path(home)), os.path.realpath(root / ".credentials.json")
-            self.assertEqual((binding["setup_token"], binding["login"]), (token, login))
+            login, identity = os.path.realpath(root / ".credentials.json"), os.path.realpath(home / ".claude.json")
+            self.assertEqual(binding["login"], login)
+            self.assertEqual(list(binding["files"]), [login, identity])
             self.assertNotIn(TOKEN, json.dumps(binding))
-            self.assertNotIn(login, account_identity.binding_view(binding, True)["files"])
-            self.assertNotIn(token, account_identity.binding_view(binding, False)["files"])
+            self.assertEqual(list(account_identity.binding_view(binding, True)["files"]), [identity])
+            self.assertEqual(account_identity.binding_view(binding, False), {"root": binding["root"], "files": binding["files"]})
             token_path(home).unlink()
             binding = account_identity.credential_binding("claude")
-            self.assertNotIn("setup_token", binding)
+            self.assertEqual(sorted(binding), ["files", "root"])
             self.assertIs(account_identity.binding_view(binding, True), binding)
-            self.assertEqual(list(binding["files"]), [login, os.path.realpath(home / ".claude.json")])
+
+    def test_token_symlinked_to_a_login_file_keeps_that_file_bound(self):
+        for name in (".claude.json", ".claude/.credentials.json"):
+            with self.subTest(name), clean_env(), fake_home() as home:
+                make_claude(home)
+                token_path(home).unlink()
+                token_path(home).symlink_to(home / name)
+                binding = account_identity.credential_binding("claude")
+                self.assertEqual(binding["setup_token"], "unusable")
+                for sandboxed in (False, True):
+                    files = account_identity.binding_view(binding, sandboxed)["files"]
+                    self.assertIn(os.path.realpath(home / ".claude.json"), files)
+                    self.assertNotEqual(files[os.path.realpath(home / ".claude.json")], "unusable")
+                before = account_identity.binding_view(binding, False)
+                (home / ".claude.json").write_text('{"oauthAccount": {"accountUuid": "u-2"}}\n')
+                (home / ".claude" / ".credentials.json").write_text(HOST_LOGIN.replace("OLD", "B"))
+                self.assertNotEqual(before, account_identity.binding_view(
+                    account_identity.credential_binding("claude"), False))
+                with admitted(binding), temp_workspace() as ws, contextlib.redirect_stderr(io.StringIO()):
+                    self.refused_at_launch(binding, ws)
+
+    def test_admitted_run_on_another_selected_login_ignores_the_token(self):
+        for name in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"):
+            for symlinked in (False, True):
+                with self.subTest(name, symlinked=symlinked), clean_env(), fake_home() as home, \
+                        temp_workspace() as ws, patch.dict(os.environ, {name: "k"}):
+                    root = make_claude(home)
+                    if symlinked:
+                        token_path(home).unlink()
+                        token_path(home).symlink_to(root / ".credentials.json")
+                    binding = account_identity.credential_binding("claude")
+                    self.assertNotIn("setup_token", binding)
+                    with admitted(binding), sandbox.provider_home_session("claude", [str(ws)]) as provider_home:
+                        provider_home.materialize([str(ws)])
+                        self.assertIsNone(provider_home.setup_token)
+                        self.assertEqual([c.detached for c in provider_home.credentials], [False])
 
 
 class TestClaudeSetupTokenFile(unittest.TestCase):
@@ -341,6 +389,29 @@ class TestClaudeSetupTokenFile(unittest.TestCase):
                 target.rename(moved)
                 target.symlink_to(moved)
                 self.refused(home, "普通文件")
+
+    def test_dangling_symlink_on_the_store_path_refuses_the_launch(self):
+        for depth in (1, 2):
+            with self.subTest(depth=depth), clean_env(), fake_home() as home:
+                make_claude(home, token=None)
+                store = home / sandbox.CREDENTIAL_BACKUP_DIR
+                link = store if depth == 1 else store / "claude"
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(home / "volume-that-is-not-mounted")
+                self.assertIsNotNone(sandbox._claude_setup_token_path(str(home)))
+                self.refused(home, "普通文件")
+
+    def test_resolving_symlinked_config_directory_is_followed(self):
+        with clean_env(), fake_home() as home:
+            make_claude(home, token=None)
+            (home / "dotfiles").mkdir()
+            (home / ".config").symlink_to(home / "dotfiles")
+            self.assertIsNone(self.token(home))  # no token kept: nothing to refuse
+            path = token_path(home)
+            path.parent.mkdir(parents=True, mode=0o700)
+            path.write_text(TOKEN + "\n")
+            path.chmod(0o600)
+            self.refused(home, "普通文件")  # kept outside the masked store: a sandbox could see it
 
     def test_entry_that_cannot_be_examined_refuses_the_launch(self):
         if os.geteuid() == 0:

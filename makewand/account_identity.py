@@ -177,15 +177,15 @@ def credential_binding(provider):
     if provider == "claude":
         # A sandboxed run on the long-lived token never reads the interactive
         # login, and a host run never reads the token: both are fingerprinted
-        # here and each launch path compares its own view (binding_view).
+        # here and each launch path compares its own view (binding_view). The
+        # token is kept apart from "files", whose keys are resolved paths: a
+        # token file symlinked to a login file must not replace its entry.
         from makewand.sandbox import _claude_setup_token_path, _read_host_state
         token = _claude_setup_token_path(str(Path.home()))
         if token is not None:
             # Never followed through a symlink; an unusable file refuses the launch later.
             state = _read_host_state(token)
-            key = os.path.realpath(token)
-            files[key] = hashlib.sha256(state[0]).hexdigest() if state else "unusable"
-            binding["setup_token"] = key
+            binding["setup_token"] = hashlib.sha256(state[0]).hexdigest() if state else "unusable"
             binding["login"] = os.path.realpath(login)
     return binding
 
@@ -195,13 +195,15 @@ def binding_view(binding, sandboxed):
 
     A sandboxed Claude run on the long-lived token ignores the interactive
     login, so a host session refreshing it while the call waits for a slot does
-    not refuse the launch. A host run ignores the token file.
+    not refuse the launch. A host run ignores the token file altogether: its
+    view is the same whether or not one is kept.
     """
     if not binding or "setup_token" not in binding:
         return binding
-    ignored = binding["login"] if sandboxed else binding["setup_token"]
-    return {"root": binding["root"], "token_run": sandboxed,
-            "files": {path: value for path, value in binding["files"].items() if path != ignored}}
+    if not sandboxed:
+        return {"root": binding["root"], "files": binding["files"]}
+    return {"root": binding["root"], "setup_token": binding["setup_token"],
+            "files": {path: value for path, value in binding["files"].items() if path != binding["login"]}}
 
 
 def verify_credential_copy(path, data):

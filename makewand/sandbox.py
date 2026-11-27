@@ -1369,17 +1369,25 @@ def _claude_setup_token_path(user_home: str) -> Optional[str]:
     selects another login (CLAUDE_CONFIG_DIR, an API key). Only a missing file
     or directory means "no token"; an entry that cannot be examined still
     selects the token, so the launch is refused instead of quietly copying the
-    interactive login.
+    interactive login. That includes a token file that is a symlink and a
+    dangling symlink on the way to it (a store on a volume that is not
+    mounted); a symlinked directory that resolves (~/.config kept elsewhere) is
+    followed, and the file below it is refused later if a sandbox could see it.
     """
     if any(os.environ.get(name) for name in ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY")):
         return None
     path = os.path.join(user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL)
-    try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return None
-    except OSError:
-        pass
+    parts = os.path.join(CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL).split("/")
+    current = user_home
+    for index, part in enumerate(parts):
+        current = os.path.join(current, part)
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode) and (index == len(parts) - 1 or not os.path.exists(current)):
+                break
+        except FileNotFoundError:
+            return None
+        except OSError:
+            break
     return path
 
 
@@ -2174,8 +2182,7 @@ class ProviderHome:
                 found = _claude_setup_token(self.user_home)
                 if binding is not None:
                     # The token read here is the one admission fingerprinted.
-                    key = os.path.realpath(os.path.join(self.user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL))
-                    if binding["files"].get(key) != (found[1] if found else None):
+                    if binding.get("setup_token") != (found[1] if found else None):
                         refuse_credential_launch("selected login changed after admission; refusing account switch")
                 self.setup_token = found[0] if found else None
             try:
