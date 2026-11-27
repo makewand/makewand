@@ -4,7 +4,7 @@
   已经落盘的缓存，额度读取可以刷新快照。可信模式也可按策略兑现 Codex 赠送的额度重置。
   ``--simple`` 退回精简三档表；``--legacy`` 把旧版本模型纳入完整目录的排序。
   文本最多列这一档的前 5 个候选。
-- ``mark`` 把一家工具标记为额度受限，到期前路由跳过它；
+- ``mark`` 把一家工具标记为额度受限，到期前路由把它排在后面并提醒（不拦截）；
 - ``outcome`` 追加一条验收成绩，供之后的 Thompson 采样使用。
   ``--model`` / ``--effort`` 可选，写进账本后按候选统计。
 
@@ -246,7 +246,8 @@ def _restore_codex_reset(policy, result, not_tool) -> bool:
     """
     from makewand.codex_reset_credit import restore_quota
     from makewand.model_quota import quota_reason
-    reason = dict(result.skipped).get("codex")
+    # A mark is a reminder now; the official gate is still a skip. Either may hide a redeemable reset.
+    reason = dict(result.skipped).get("codex") or dict(getattr(result, "reminders", ())).get("codex")
     now = time.time()
     if (not reason or os.environ.get(_QUOTA_FILE_ENV, "").strip()
             or _family_reason("codex", not_tool) or _pause_reason(policy, "codex", now)):
@@ -255,7 +256,8 @@ def _restore_codex_reset(policy, result, not_tool) -> bool:
         ledger = OutcomeLedger()
         mark = ledger.active_marks().get("codex")
         gate = quota_reason("codex", policy=policy)
-        if not (_mark_reason(mark, now) == reason or (gate and gate in reason)) or not restore_quota("route"):
+        mark_text = _mark_reason(mark, now)
+        if not ((mark_text and mark_text in reason) or (gate and gate in reason)) or not restore_quota("route"):
             return False
         # The reset restored the whole weekly pool, so marks on single models go too.
         for name, held in ledger.active_marks().items():
@@ -367,6 +369,11 @@ def cmd_route(args) -> None:
                 {"provider": provider, "reason": reason}
                 for provider, reason in result.skipped
             ],
+            # Still offered, listed after the others: local records remind, they do not gate.
+            "reminders": [
+                {"provider": provider, "reason": reason}
+                for provider, reason in result.reminders
+            ],
             "escalate_tier": None if retry_required else result.escalate_tier,
             "budget": budget,
         }
@@ -403,6 +410,9 @@ def cmd_route(args) -> None:
     if result.skipped:
         skipped = "；".join(f"{provider}（{reason}）" for provider, reason in result.skipped)
         lines.append(f"  跳过：{skipped}")
+    if result.reminders:
+        reminders = "；".join(f"{provider}（{reason}）" for provider, reason in result.reminders)
+        lines.append(f"  提醒（不拦截，已排到后面，以供应商当场的答复为准）：{reminders}")
     lines.extend(f"  注意：{note}" for note in weekly_forecasts(policy).values())
     if review_policy is not None and any(_is_same_review_family(row, execution_options) for row in shown):
         lines.append("  本次候选使用了明确批准的同家族回退。")
@@ -668,7 +678,7 @@ def cmd_mark(args) -> None:
     except OSError as error:
         _fail(f"错误：写入额度标记失败：{error}")
     subject = f"{provider} 的 {model.strip()}" if model else provider
-    print(f"已记录：{subject} 约 {when} 前不再派活")
+    print(f"已记录：{subject} 约 {when} 前排在后面（只提醒，不拦截）")
 
 
 def cmd_outcome(args) -> None:

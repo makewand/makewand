@@ -99,8 +99,11 @@ class TestAgyCacheAndFallback(_HomeCase):
         policy = ReviewPolicy.from_options("codex", (), False)
         discovered = {"agy": discovery._agy_effort_map(exact_ids_only=True)}
         self.assertEqual(validate_review_dispatch(policy, "agy", exact, None, discovered), "high")
-        with self.assertRaisesRegex(ValueError, "未通过高风险审查校验"):
-            validate_review_dispatch(policy, "agy", old, None, discovered)
+        # The catalog's old spelling is a reminder at dispatch, not a refusal.
+        from makewand.review_policy import review_currency_reminder
+        self.assertEqual(validate_review_dispatch(policy, "agy", old, None, discovered), "high")
+        self.assertIsNone(review_currency_reminder("agy", exact, "high", discovered))
+        self.assertIn(f"未把 {old} 列为最新强档", review_currency_reminder("agy", old, "high", discovered))
         self.assertEqual(resolve_agy_model(exact, None), (exact, None))
 
     def test_injected_output_is_cached_and_discoverable(self):

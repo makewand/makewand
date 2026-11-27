@@ -228,7 +228,10 @@ def _source_rows(value):
                             "project": project_id, "label": entry.get("capacity_label") or "existing task",
                             "task_id": entry.get("task_id"), "started_at": started,
                             "lease": copy.deepcopy(lease),
-                            "limits": [data.get("lease_limits", {}).get(k, 2**63 - 1) for k in lease["keys"]]}
+                            # A lease answers for the limits it was admitted with; the stored
+                            # floor only stands in for a lease written before those were kept.
+                            "limits": account_leases.own_limits(lease) or
+                                      [data.get("lease_limits", {}).get(k, 2**63 - 1) for k in lease["keys"]]}
     return rows, attempts, now
 
 

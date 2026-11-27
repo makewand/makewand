@@ -7,7 +7,17 @@ import hashlib
 import math
 import os
 import re
+import threading
 from pathlib import Path
+
+# Official usage at or below this in the pool that refused means the provider
+# replenished it (a window reset early, extra quota granted): the refusal and
+# any mark that still names the old reset time no longer describe the account.
+REPLENISHED_USED_PERCENT = 95
+# A refusal names the reset of the pool that refused; the official window with
+# the same reset moment is that pool.
+_SAME_RESET_SECONDS = 30 * 60
+_reading_official = threading.local()
 
 
 def selected_scope(provider):
@@ -72,8 +82,87 @@ def merge_limits(previous, incoming):
     return sorted(rows.values(), key=_written_at)[-128:]
 
 
+def replenished(provider, model, reset_at, since=None, quota=None):
+    """Whether current official evidence shows quota again in the pool that was exhausted until reset_at.
+
+    Only Codex and Claude report official windows. The pool is the window of
+    the selected account whose reset moment is reset_at (epoch seconds); a
+    model's own sublimit counts only for that model. Every such window must
+    have been observed within the last 15 minutes, after `since` when given,
+    and show at most REPLENISHED_USED_PERCENT used. A refusal by a pool the
+    official windows do not report (another reset moment) is never cleared.
+    """
+    from datetime import datetime, timezone
+    if provider not in ("codex", "claude") or _number(reset_at) is None:
+        return False
+    if quota is None:
+        if getattr(_reading_official, "active", False):
+            return False
+        _reading_official.active = True
+        try:
+            from makewand import health
+            quota = health._get_official_subscription_quota(provider)
+        except Exception:  # noqa: BLE001 - unreadable evidence clears nothing
+            return False
+        finally:
+            _reading_official.active = False
+    if not isinstance(quota, dict):
+        return False
+    identity = selected_scope(provider)
+    if (not identity["identity_known"] or quota.get("account_ref") != identity["account_ref"]
+            or quota.get("pool_ref") != identity["pool_ref"]):
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    found = False
+    for window in quota.get("windows") or []:
+        if (not isinstance(window, dict) or window.get("scope") == "unknown"
+                or window.get("pool_ref") != identity["pool_ref"]):
+            continue
+        scope = window.get("model")
+        if scope and not (model and model_matches(scope, canonical_model(provider, model))):
+            continue
+        try:
+            at = datetime.fromisoformat(window["observed_at"].replace("Z", "+00:00")).timestamp()
+            reset = datetime.fromisoformat(window["resets_at"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError, OSError):
+            continue
+        if (not math.isfinite(at) or not -60 <= now - at <= 900 or since is not None and at <= since
+                or not math.isfinite(reset) or abs(reset - reset_at) > _SAME_RESET_SECONDS):
+            continue
+        used = _number(window.get("used_percent"))
+        if used is None or not 0 <= used <= REPLENISHED_USED_PERCENT:
+            return False
+        found = True
+    return found
+
+
+def _refusal_replenished(provider, row):
+    """A stored refusal whose pool the provider has replenished since (replenished)."""
+    if provider not in ("codex", "claude"):
+        return False
+    from makewand import health
+    observed = health._written_at(row)
+    if observed is None:
+        return False
+    try:
+        reset = health.parse_reset_datetime(row.get("resets_at"), observed_at=row.get("updated_at") or None)
+        if reset is None:
+            return False
+        return replenished(provider, row["quota_scope"].get("model"), reset.timestamp(), observed.timestamp())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+
+
+def mark_replenished(name, until):
+    """A quota mark ("provider" or "provider:model") held until the reset of a pool that has quota again."""
+    if not isinstance(name, str):
+        return False
+    provider, _, model = name.strip().lower().partition(":")
+    return replenished(provider, model or None, _number(until))
+
+
 def _live_refusals(provider, info, identity):
-    """The stored refusals of this account that have not expired."""
+    """The stored refusals of this account that have not expired or been replenished."""
     from makewand.health import _is_quota_reserve_gate, is_reset_time_passed, status_age_seconds
     for row in info["quota_limits"]:
         if not isinstance(row, dict) or row.get("status") != "limited":
@@ -89,6 +178,8 @@ def _live_refusals(provider, info, identity):
             continue
         if status_age_seconds(row) is None or is_reset_time_passed(
                 row.get("resets_at"), row.get("updated_at", ""), row.get("hold_seconds")):
+            continue
+        if _refusal_replenished(provider, row):
             continue
         yield row
 
@@ -246,8 +337,39 @@ def limit_cleared_by_reset(provider, info):
         return False
 
 
+def stored_refusal_reason(provider, model=None, *, info=None):
+    """An unexpired refusal this account's provider gave earlier: a reminder, never a gate.
+
+    A stored record describes the moment it was written. Providers restore
+    quota early and correct their own errors, so a record that blocked until
+    its stated reset kept a usable model out of work (2026-11-27). Route lists
+    such a model after the others and a launch proceeds with a warning; the
+    provider's own answer decides.
+    """
+    from makewand import health
+    if info is None:
+        info = health.load_status_cache().get(provider, {})
+    info = projected_status(provider, info, model)
+    if isinstance(info, dict) and info.get("status") == "limited" and not limit_cleared_by_reset(provider, info):
+        return "当前账号/模型额度受限：" + str(info.get("reason") or "供应商拒绝") + _hold_note(info)
+    return None
+
+
 def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
-    """The same deterministic quota gate for a route row and a CLI launch.
+    """Why this model looks out of quota: a stored refusal first, else the official windows.
+
+    Route rows and CLI launches read the two parts separately: only
+    official_quota_reason gates, stored_refusal_reason is a reminder.
+    """
+    return (stored_refusal_reason(provider, model, info=info)
+            or official_quota_reason(provider, model, quota=quota, policy=policy))
+
+
+def official_quota_reason(provider, model=None, *, quota=None, policy=None):
+    """The deterministic quota gate for a route row and a CLI launch.
+
+    Only a current official usage reading gates: a window observed within the
+    last 15 minutes that is used up or past the configured threshold.
 
     Legacy numeric entries mean operator-supplied weekly usage, as before.
     Structured windows require current account binding and observation checks
@@ -255,12 +377,7 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     """
     from datetime import datetime, timezone
     from makewand import health
-    if info is None:
-        info = health.load_status_cache().get(provider, {})
-    info = projected_status(provider, info, model)
     reset_at = _reset_credit_redeemed_at(provider)
-    if isinstance(info, dict) and info.get("status") == "limited" and not limit_cleared_by_reset(provider, info):
-        return "当前账号/模型额度受限：" + str(info.get("reason") or "供应商拒绝") + _hold_note(info)
     if policy is None:
         from makewand.route_select import load_policy
         policy = load_policy()
@@ -309,16 +426,26 @@ def quota_reason(provider, model=None, *, quota=None, info=None, policy=None):
     return None
 
 
+def remind(provider, text):
+    """One stderr line for a reminder that does not stop the dispatch."""
+    import sys
+    try:
+        print(f"[Makewand -> {provider}] 提醒（不拦截）：{text}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 - a closed stderr never stops a dispatch
+        pass
+
+
 def review_launch_refusal(provider, model, effort):
-    """Keep the selected high-risk model check at every launch boundary."""
+    """Keep the selected high-risk model at every launch boundary.
+
+    A launch of another model or effort than the one validated is refused.
+    Whether the local catalog still names that model as the newest strong tier
+    was a reminder at validation (review_policy.review_currency_reminder) and
+    is not asked again here: catalogs are cache files that go stale.
+    """
     from makewand.execution_runtime import current_context
     expected = current_context().get("review_dispatch")
-    if expected is None:
-        return None
-    from makewand.discovery import discover_model_efforts
-    from makewand.review_policy import review_model_is_current
-    if expected != (provider, model, effort) or not review_model_is_current(
-            provider, model, effort, discover_model_efforts(strict_catalogs=True)):
+    if expected is not None and expected != (provider, model, effort):
         return refuse_before_launch("高风险审查的型号或推理档已变化，请重新核对目录")
     return None
 
@@ -339,11 +466,15 @@ def before_cli_launch(provider, model, *, relay=None, cwd=None, effort=None):
             from makewand import call_budget
             call_budget.note_resolved_model(attempt, model, budget_file=context.get("_budget_file"),
                                             max_model_calls=context.get("_max_model_calls"))
-    reason = quota_reason(provider, model)
+    # A stored refusal reminds; only a current official reading refuses or relays.
+    note = stored_refusal_reason(provider, model)
+    if note:
+        remind(provider, note + "；照常派发，以供应商当场的答复为准")
+    reason = official_quota_reason(provider, model)
     if reason and provider == "codex":
         from makewand.codex_reset_credit import restore_quota
         if restore_quota("before_launch"):
-            reason = quota_reason(provider, model)
+            reason = official_quota_reason(provider, model)
     if reason:
         if relay is not None and relay.available:
             return relay(f"[Makewand -> {provider}] {reason}；按已允许的 API 接力策略执行", cwd=cwd)

@@ -782,10 +782,15 @@ class RoutingCliTests(unittest.TestCase):
         marks = json.loads((self.routing_dir / "marks.json").read_text(encoding="utf-8"))
         self.assertEqual(list(marks), [f"agy:{models[0]}"])
         payload = self.route_json("review", "hard", quota={})
-        left = {item["model"] for item in payload["candidates"] if item["provider"] == "agy"}
-        self.assertEqual(left, set(models[1:]))
-        reasons = {item["provider"]: item["reason"] for item in payload["skipped"]}
-        self.assertIn(f"部分模型受限（{models[0]}）", reasons["agy"])
+        # A mark reminds: every model is still offered, the marked one after all the others.
+        self.assertEqual({item["model"] for item in payload["candidates"] if item["provider"] == "agy"}, set(models))
+        marked = [index for index, item in enumerate(payload["candidates"])
+                  if item["provider"] == "agy" and item["model"] == models[0]]
+        others = [index for index, item in enumerate(payload["candidates"]) if index not in marked]
+        self.assertTrue(marked and others)
+        self.assertGreater(min(marked), max(others))
+        reasons = {item["provider"]: item["reason"] for item in payload["reminders"]}
+        self.assertIn(f"部分模型（{models[0]}）：额度标记未过期：周额度", reasons["agy"])
 
     def test_a_codex_review_gets_a_shorter_time_limit(self):
         payload = self.route_json("review", "hard", quota={})
@@ -816,11 +821,20 @@ class RoutingCliTests(unittest.TestCase):
         self.assertIn("--risk high --review-author agy", command)
         self.assertIn("--exclude-review-family claude", command)
         self.assertFalse(payload["same_family_fallback"])
-        invalid = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
-                               "--model", "gpt-6.1-terra", "--effort", "high", "fixture")
-        self.assertEqual(invalid.returncode, 2, invalid.stderr)
-        self.assertIn("未通过高风险审查校验", invalid.stderr)
-        self.assertFalse(self.stub_lines())
+        # The local catalog reminds; it does not refuse a model the caller names.
+        unverified = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
+                                  "--model", "gpt-6.1-terra", "--effort", "high", "fixture")
+        self.assertNotEqual(unverified.returncode, 2, unverified.stderr)
+        self.assertIn("提醒（不拦截）：本机目录未把 gpt-6.1-terra 列为最新强档", unverified.stderr)
+        self.assertNotIn("未通过高风险审查校验", unverified.stderr)
+        verified = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "agy",
+                                "--model", "gpt-6.2-astra", "--effort", "high", "fixture")
+        self.assertNotIn("提醒（不拦截）", verified.stderr)
+        # The family rule is not a local record and still refuses.
+        same_family = self.run_cli("codex", "--readonly", "--risk", "high", "--review-author", "codex",
+                                   "--model", "gpt-6.2-astra", "--effort", "high", "fixture")
+        self.assertEqual(same_family.returncode, 2, same_family.stderr)
+        self.assertIn("同模型家族", same_family.stderr)
 
         same = ("review", "hard", "--risk", "high", "--not", "codex", "--exclude-review-family", "agy",
                 "--exclude-review-family", "claude", "--exclude-review-family", "muse")
@@ -851,9 +865,9 @@ class RoutingCliTests(unittest.TestCase):
         self.assertFalse(self.route_json(*options, quota={})["candidates"])
         result = self.run_cli("agy", "--readonly", "--risk", "high", "--review-author", "codex",
                               "--model", "gemini-4-argon-high", "fixture")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("未通过高风险审查校验", result.stderr)
-        self.assertFalse(self.stub_lines())
+        self.assertNotEqual(result.returncode, 2, result.stderr)
+        self.assertIn("提醒（不拦截）：本机目录未把 gemini-4-argon-high 列为最新强档", result.stderr)
+        self.assertNotIn("未通过高风险审查校验", result.stderr)
 
     def test_high_risk_review_compares_model_versions_across_proxies(self):
         from makewand.review_policy import review_models
@@ -881,7 +895,8 @@ class RoutingCliTests(unittest.TestCase):
         })
 
     def test_high_risk_review_compares_namespaced_and_bare_model_lineages(self):
-        from makewand.review_policy import ReviewPolicy, review_models, validate_review_dispatch
+        from makewand.review_policy import (ReviewPolicy, review_currency_reminder, review_models,
+                                            validate_review_dispatch)
 
         discovered = {
             "muse": {"google/gemini-3.1-pro": ["high"], "opus-4-6": ["high"],
@@ -896,10 +911,15 @@ class RoutingCliTests(unittest.TestCase):
             ("claude", "claude-opus-5-5", "high"),
             ("muse", "anthropic/claude-opus-5-5", "high"),
         })
+        policy = ReviewPolicy.from_options("muse", (), False)
         for model in ("claude-3-opus-20240229", "openai/gpt5.6-astra", "google/gemini3.1-pro"):
-            with self.subTest(model=model), self.assertRaisesRegex(ValueError, "未通过高风险审查校验"):
-                validate_review_dispatch(ReviewPolicy.from_options("muse", (), False), "muse",
-                                         model, "high", {"muse": {model: ["high"]}})
+            with self.subTest(model=model):
+                listed = {"muse": {model: ["high"]}}
+                # An old lineage is a reminder at dispatch, never a refusal.
+                self.assertEqual(validate_review_dispatch(policy, "muse", model, "high", listed), "high")
+                self.assertIn(f"未把 {model} 列为最新强档", review_currency_reminder("muse", model, "high", listed))
+        self.assertIsNone(review_currency_reminder("muse", "anthropic/claude-opus-5-5", "high", discovered))
+        self.assertIn("未把", review_currency_reminder("muse", "anthropic/claude-opus-5-5", "high", None))
 
     def test_high_risk_gemma_namespace_uses_same_family_in_route_and_dispatch(self):
         model = "google/gemma-3-27b-it"
@@ -1032,9 +1052,8 @@ class RoutingCliTests(unittest.TestCase):
         latest.write_text("")
         direct = self.run_cli("muse", "--readonly", "--risk", "high", "--review-author", "codex",
                               "--model", "muse-wonder-1.0", "--effort", "high", "fixture", extra_env=env)
-        self.assertEqual(direct.returncode, 2, direct.stderr)
-        self.assertIn("未通过高风险审查校验", direct.stderr)
-        self.assertFalse(self.stub_lines())
+        self.assertIn("提醒（不拦截）：本机目录未把 muse-wonder-1.0 列为最新强档", direct.stderr)
+        self.assertNotIn("未通过高风险审查校验", direct.stderr)
 
     def test_mark_rejects_a_blank_or_ambiguous_model(self):
         for model in ("", " ", "a:b"):
@@ -1042,15 +1061,27 @@ class RoutingCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, model)
         self.assertFalse((self.routing_dir / "marks.json").exists())
 
-    def test_mark_writes_and_route_skips(self):
+    def test_mark_writes_and_route_lists_it_last_with_a_reminder(self):
+        before = self.route_json("implement", "mechanical", quota={})
+        self.assertEqual(before["reminders"], [])
         result = self.run_cli("mark", "codex", "6h", "--reason", "额度用完", quota={})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout.strip(),
-                         r"^已记录：codex 约 \d{2}-\d{2} \d{2}:\d{2} 前不再派活$")
+                         r"^已记录：codex 约 \d{2}-\d{2} \d{2}:\d{2} 前排在后面（只提醒，不拦截）$")
         marks = json.loads((self.routing_dir / "marks.json").read_text(encoding="utf-8"))
         self.assertIn("codex", marks)
         routed = self.run_cli("route", "implement", "mechanical", quota={})
-        self.assertIn("跳过：codex（额度标记未过期：额度用完）", routed.stdout)
+        self.assertIn("提醒（不拦截，已排到后面，以供应商当场的答复为准）：codex（额度标记未过期：额度用完）", routed.stdout)
+        self.assertNotIn("跳过：codex", routed.stdout)
+
+        after = self.route_json("implement", "mechanical", quota={})
+        tools = [item["provider"] for item in after["candidates"]]
+        self.assertEqual(sorted(tools), sorted(item["provider"] for item in before["candidates"]))
+        marked = [index for index, tool in enumerate(tools) if tool == "codex"]
+        self.assertTrue(marked)
+        self.assertGreater(min(marked), max(index for index, tool in enumerate(tools) if tool != "codex"))
+        self.assertEqual(after["reminders"], [{"provider": "codex", "reason": "额度标记未过期：额度用完"}])
+        self.assertNotIn("codex", {item["provider"] for item in after["skipped"]})
 
     def test_mark_duration_formats(self):
         for provider, duration in (("agy", "93h17m"), ("grok", "2d"),

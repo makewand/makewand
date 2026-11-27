@@ -144,9 +144,23 @@ def validate_review_dispatch(policy, provider, model, effort, discovered):
     reason = policy.check_family(provider, model)
     if reason:
         raise ValueError(reason)
-    if not review_model_is_current(provider, model, effort, discovered):
-        raise ValueError("型号或推理档未通过高风险审查校验。请核对本机目录并重新运行 route review hard --risk high")
     return effort
+
+
+def review_currency_reminder(provider, model, effort, discovered):
+    """Text for a model the local catalog does not name as the newest strong tier, else None.
+
+    A reminder, not a refusal: the catalog is a cache of the provider's own
+    files, and a stale or reshaped one kept every Claude model out of
+    high-risk review (2026-11-27).
+    """
+    try:
+        if review_model_is_current(provider, model, effort, discovered):
+            return None
+    except Exception:  # noqa: BLE001 - an unreadable catalog proves nothing about the model
+        pass
+    return (f"本机目录未把 {model or '默认模型'} 列为最新强档，或缺少该推理档的证据；照常派发。"
+            "可运行 route review hard --risk high 核对当前推荐")
 
 
 def review_model_is_current(provider, model, effort, discovered):

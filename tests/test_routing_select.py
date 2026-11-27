@@ -308,21 +308,41 @@ class SelectTests(unittest.TestCase):
         self.assertNotIn("codex", dict(after.skipped))
         self.assertIn("codex", [item.provider for item in after.candidates])
 
-    def test_active_mark_skips_and_expired_mark_does_not(self):
+    def test_mark_ends_when_the_provider_replenished_the_pool(self):
+        self.ledger.mark("claude", self.now + 3600, "官方周额度用完")
+        self.ledger.mark("codex", self.now + 3600, "官方周额度用完")
+        seen = []
+
+        def replenished(name, until):
+            seen.append((name, until))
+            return name == "claude"
+        with patch("makewand.model_quota.mark_replenished", replenished):
+            result = self._select()
+        self.assertEqual(result.reminders, [("codex", "额度标记未过期：官方周额度用完")])
+        names = [item.provider for item in result.candidates]
+        self.assertIn("claude", names)
+        self.assertEqual(names[-1], "codex")
+        self.assertEqual(sorted(seen), [("claude", self.now + 3600), ("codex", self.now + 3600)])
+
+    def test_active_mark_reminds_and_lists_last_and_expired_mark_does_not(self):
+        unmarked = [item.provider for item in self._select().candidates]
         self.ledger.mark("claude", self.now + 3600, "官方周额度用完")
         self.ledger.mark("codex", self.now + 1, "")
         self.ledger.mark("grok", self.now, "到点")
         self.ledger.mark("agy", self.now - 10, "已过期")
         result = self._select()
-        skipped = dict(result.skipped)
-        self.assertEqual(skipped["claude"], "额度标记未过期：官方周额度用完")
-        self.assertEqual(skipped["codex"], "额度标记未过期")
-        self.assertTrue(_chinese(skipped["claude"]))
-        self.assertTrue(_chinese(skipped["codex"]))
-        self.assertNotIn("grok", skipped)
-        self.assertNotIn("agy", skipped)
+        reminders = dict(result.reminders)
+        self.assertEqual(reminders["claude"], "额度标记未过期：官方周额度用完")
+        self.assertEqual(reminders["codex"], "额度标记未过期")
+        self.assertTrue(_chinese(reminders["claude"]))
+        self.assertTrue(_chinese(reminders["codex"]))
+        self.assertEqual(sorted(reminders), ["claude", "codex"])
+        # A mark never removes a candidate: the marked tools stay, after the others.
+        self.assertEqual(result.skipped, [])
         names = [item.provider for item in result.candidates]
-        self.assertEqual(names, ["agy", "grok"])
+        self.assertEqual(sorted(names), sorted(unmarked))
+        self.assertEqual(names[:2], ["agy", "grok"])
+        self.assertEqual(sorted(names[2:]), ["claude", "codex"])
         self.assertFalse(self.ledger.outcomes_path.exists())
 
     def test_a_mark_on_one_model_matches_only_that_model(self):
@@ -569,18 +589,18 @@ class SelectTests(unittest.TestCase):
             return {"agy": (100, "")}
 
         result = self._select(policy=policy, now=self.now, not_tool="grok", quota_reader=reader)
-        # codex 已暂停、claude 已有标记，没有还要看周额度的候选。
-        self.assertEqual(calls, [])
+        # codex 已暂停；claude 的标记只是提醒，它还在候选里，所以仍要读它的周额度。
+        self.assertEqual(calls, ["read"])
         self.assertEqual(
             result.skipped,
             [
                 ("codex", f"暂停到 {text}"),
                 ("grok", "与 grok 同属 xai 家族"),
-                ("claude", "额度标记未过期：熔断"),
             ],
         )
-        self.assertTrue(all(_chinese(reason) for _provider, reason in result.skipped))
-        self.assertEqual([item.provider for item in result.candidates], ["agy"])
+        self.assertEqual(result.reminders, [("claude", "额度标记未过期：熔断")])
+        self.assertTrue(all(_chinese(reason) for _provider, reason in result.skipped + result.reminders))
+        self.assertEqual([item.provider for item in result.candidates], ["agy", "claude"])
 
         both = Policy(paused=(Pause("codex", until, text), Pause("claude", until, text)))
 

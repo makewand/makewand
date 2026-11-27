@@ -1128,7 +1128,7 @@ def _main():
     p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
 
-    p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前不再派活", parents=[sub_common_parser])
+    p_mark = subparsers.add_parser("mark", allow_abbrev=False, help="记录一家工具额度受限，到期前排在后面并提醒（不拦截）", parents=[sub_common_parser])
     p_mark.add_argument("provider", metavar="PROVIDER", help="工具名：codex, claude, agy, grok, muse")
     p_mark.add_argument("duration", metavar="DURATION", help="受限时长，d/h/m/s 组合，如 6h、93h17m、2d、45m")
     p_mark.add_argument("--reason", default=None, help="受限原因（可选，路由跳过时会显示）")
@@ -1332,13 +1332,17 @@ def _main():
         if protected_review:
             from makewand.config import get_api_policy
             from makewand.discovery import discover_model_efforts
-            from makewand.review_policy import ReviewPolicy, validate_review_dispatch
+            from makewand.review_policy import ReviewPolicy, review_currency_reminder, validate_review_dispatch
             try:
                 policy = ReviewPolicy.from_options(args.review_author, args.exclude_review_family,
                                                    args.allow_same_family_review)
                 if get_api_policy() != "subscription_only":
                     raise ValueError("高风险审查需要 subscription_only，关闭 Makewand 的 API 接力")
-                effort = validate_review_dispatch(policy, args.subcommand, args.model, args.effort, discover_model_efforts(strict_catalogs=True))
+                discovered = discover_model_efforts(strict_catalogs=True)
+                effort = validate_review_dispatch(policy, args.subcommand, args.model, args.effort, discovered)
+                reminder = review_currency_reminder(args.subcommand, args.model, effort, discovered)
+                if reminder:
+                    print(f"[Makewand] 提醒（不拦截）：{reminder}", file=sys.stderr)
                 review_dispatch = (args.subcommand, args.model, None if args.subcommand == "agy" else effort)
             except ValueError as error:
                 parser.error(str(error))

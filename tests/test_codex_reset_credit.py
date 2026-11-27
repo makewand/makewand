@@ -236,14 +236,14 @@ class RestoreQuotaTests(unittest.TestCase):
 
     def test_a_launch_is_checked_again_after_a_restore(self):
         reasons = ["weekly", "short window"]
-        with patch.object(model_quota, "quota_reason", side_effect=reasons), \
+        with patch.object(model_quota, "official_quota_reason", side_effect=reasons), \
                 patch("makewand.codex_reset_credit.restore_quota", return_value=True):
             self.assertEqual(model_quota.before_cli_launch("codex", "m")[2], "short window")
 
     def test_launch_proceeds_only_after_a_restore(self):
-        with patch.object(model_quota, "quota_reason", return_value="limit"):
+        with patch.object(model_quota, "official_quota_reason", return_value="limit"):
             with patch("makewand.codex_reset_credit.restore_quota", return_value=True) as restore, \
-                    patch.object(model_quota, "quota_reason", side_effect=["limit", None]):
+                    patch.object(model_quota, "official_quota_reason", side_effect=["limit", None]):
                 self.assertIsNone(model_quota.before_cli_launch("codex", "m"))
             restore.assert_called_once_with("before_launch")
             with patch("makewand.codex_reset_credit.restore_quota", return_value=False):
@@ -317,6 +317,19 @@ class RouteRestoreTests(unittest.TestCase):
     def test_a_route_that_skipped_codex_for_its_mark_redeems_and_clears_it(self):
         answer, restore = self._restore("mark")
         self.assertTrue(answer)
+        restore.assert_called_once_with("route")
+        self.assertNotIn("codex", self.ledger.active_marks())
+
+    def test_a_route_that_only_reminded_about_codex_for_its_mark_redeems_too(self):
+        """A mark is a reminder now, not a skip; a used-up week behind it is still restored."""
+        from makewand import route_cli
+        from makewand.route_select import _mark_reason
+        self.ledger.mark("codex", self.mark.until, self.mark.reason)
+        result = type("R", (), {"skipped": [], "reminders": [("codex", _mark_reason(self.mark, time.time()))]})()
+        with patch.object(route_cli, "OutcomeLedger", return_value=self.ledger), \
+                patch("makewand.model_quota.quota_reason", return_value=None), \
+                patch("makewand.codex_reset_credit.restore_quota", return_value=True) as restore:
+            self.assertTrue(route_cli._restore_codex_reset(self.policy, result, None))
         restore.assert_called_once_with("route")
         self.assertNotIn("codex", self.ledger.active_marks())
 

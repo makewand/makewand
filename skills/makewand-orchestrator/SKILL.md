@@ -36,7 +36,7 @@ makewand route review normal --self <你> --not <实现方> --request-id <ID> --
 
 改用独立子代理时也先核对该入口当前可用的型号和推理档。高风险选当前强档并使用独立只读上下文。同家族的不同代际仍属同一家族；获准回退时也选择当前强档。交付时记录派发型号、推理档和回退依据，并核对完整候选哈希与 nonce。实际执行型号以可取得的运行证据为准。
 
-类型可为 review/implement/test/research/doc，难度为 mechanical/normal/hard。先选够用的最便宜档，验收失败再升档；高风险直接强档，审查尽量跨模型家族。route 不调用模型，会避开暂停、额度过线、429 标记及本请求已记录的操作失败；审查不派 Grok（`makewand review` 也不再默认用它）；agy credits 保持禁用。
+类型可为 review/implement/test/research/doc，难度为 mechanical/normal/hard。先选够用的最便宜档，验收失败再升档；高风险直接强档，审查尽量跨模型家族。route 不调用模型，会避开暂停、官方当前读数显示已用完的额度及本请求已记录的操作失败；额度标记和以前的拒绝记录只是提醒（2026-11-27）：对应的工具或模型排在后面并注明原因，照样可以派，直接派发时也只打印一行提醒，能不能用以供应商当场的答复为准；审查不派 Grok（`makewand review` 也不再默认用它）；agy credits 保持禁用。
 
 用户指定最新型号时，先用 `makewand models --json` 核对当前账号的可见模型，再看 `route --json` 中符合档位、额度和家族约束的候选。路由顺序考虑档位、额度和历史验收。显式的 `--model` 会固定型号，复用旧命令前先核对这一项。AGY 型号用 CLI 列出的完整 ID；必要时用 `makewand models --refresh` 更新 AGY 列表。
 

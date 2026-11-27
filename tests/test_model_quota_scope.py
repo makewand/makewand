@@ -5,8 +5,9 @@ except ImportError:
     from tests import _isolation  # noqa: F401
 
 from datetime import datetime, timedelta
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
+import io
 import json
 import os
 from pathlib import Path
@@ -232,9 +233,14 @@ class ModelQuotaScopeTests(unittest.TestCase):
                 self.assertTrue(result[0], result)
                 self.assertIn(model, run.call_args.args[0])
             run.reset_mock()
-            result = execute_agy_task("fixture", cwd=str(self.root), model=models[2], readonly=True)
-            self.assertFalse(result[0])
-            run.assert_not_called()
+            warnings = io.StringIO()
+            with redirect_stderr(warnings):
+                result = execute_agy_task("fixture", cwd=str(self.root), model=models[2], readonly=True)
+            # The stored Gemini refusal reminds; the provider's own answer decides.
+            self.assertTrue(result[0], result)
+            run.assert_called_once()
+            self.assertIn("提醒（不拦截）", warnings.getvalue())
+            self.assertIn("Google AI 配额暂时耗尽", warnings.getvalue())
 
     def test_new_opus_refusal_preserves_legacy_gemini_guard(self):
         self.root.joinpath("status.json").write_text(json.dumps({"agy": {
@@ -329,11 +335,15 @@ class ModelQuotaScopeTests(unittest.TestCase):
                         full=True, policy=Policy(), quota_reader=lambda: {},
                         status_reader=health.load_status_cache, ledger=OutcomeLedger(self.root / "outcomes.jsonl"),
                         discovered={"agy": {"gemini-4-argon-high": ["high"], "claude-opus-5-5-high": ["high"]}})
-        self.assertTrue(any(row.provider == "agy" and "claude-opus" in row.model for row in result.candidates))
-        self.assertFalse(any(row.provider == "agy" and "gemini-4-argon" in row.model for row in result.candidates))
-        self.assertTrue(any(provider == "agy" and "部分模型受限" in reason for provider, reason in result.skipped))
+        opus = [index for index, row in enumerate(result.candidates) if row.provider == "agy" and "claude-opus" in row.model]
+        argon = [index for index, row in enumerate(result.candidates) if row.provider == "agy" and "gemini-4-argon" in row.model]
+        # The refused Gemini model stays available, after every candidate without a reminder.
+        self.assertTrue(opus and argon)
+        self.assertEqual(argon, list(range(len(result.candidates) - len(argon), len(result.candidates))))
+        self.assertEqual(result.reminders, [("agy", "部分模型（gemini-4-argon-high）：当前账号/模型额度受限：fixture native refusal")])
+        self.assertFalse(any(provider == "agy" and "额度" in reason for provider, reason in result.skipped))
 
-    def test_route_calls_agy_partly_limited_when_its_other_models_are_only_filtered_out(self):
+    def test_route_reminds_about_agy_when_its_other_models_are_only_filtered_out(self):
         from makewand.route_select import Policy, select
         from makewand.outcome_ledger import OutcomeLedger
         health.record_engine_limit("agy", "fixture native refusal", self.reset, model="gemini-4-argon-high")
@@ -341,8 +351,10 @@ class ModelQuotaScopeTests(unittest.TestCase):
                         full=True, policy=Policy(), quota_reader=lambda: {},
                         status_reader=health.load_status_cache, ledger=OutcomeLedger(self.root / "outcomes.jsonl"),
                         discovered={"agy": {"gemini-4-argon-high": ["high"], "claude-opus-5-5-high": ["high"]}})
-        self.assertFalse(any(row.provider == "agy" for row in result.candidates))
-        self.assertTrue(any(provider == "agy" and "部分模型受限" in reason for provider, reason in result.skipped))
+        # Opus is left out for its family; Gemini is all agy can offer, with the reminder.
+        self.assertEqual({row.model for row in result.candidates if row.provider == "agy"}, {"gemini-4-argon-high"})
+        self.assertEqual(result.reminders, [("agy", "当前账号/模型额度受限：fixture native refusal")])
+        self.assertTrue(any(provider == "agy" and "家族" in reason for provider, reason in result.skipped))
 
     def test_concurrent_model_refusals_preserve_each_observation(self):
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -391,39 +403,55 @@ class ModelQuotaScopeTests(unittest.TestCase):
                 self.assertIsNone(quota["percentage"])
                 self.assertNotEqual(calculate_dynamic_pacing(provider, info)["pacing_state"], PACING_LIMITED)
 
-    def test_cached_model_limit_keeps_explicitly_allowed_api_relay(self):
-        from makewand.providers import agy, claude, codex, grok, muse
-        cases = [(agy, "agy", "gemini-4-argon-high"), (claude, "claude", "claude-opus-5-5"),
-                 (codex, "codex", "gpt-6.1-sol"), (grok, "grok", "grok-4.7"),
-                 (muse, "muse", "muse-spark-1.2")]
-        for module, provider, model in cases:
+    def test_cached_model_limit_alone_starts_no_paid_relay(self):
+        """A stored refusal may be stale; only a current official reading sends work to the paid API."""
+        cases = [("agy", "gemini-4-argon-high"), ("claude", "claude-opus-5-5"), ("codex", "gpt-6.1-sol"),
+                 ("grok", "grok-4.7"), ("muse", "muse-spark-1.2")]
+
+        class Relay:
+            available = True
+
+            def __init__(self):
+                self.notices = []
+
+            def __call__(self, notice, *, cwd):
+                self.notices.append(notice)
+                return True, "fixture API answer", None
+
+        for provider, model in cases:
             with self.subTest(provider=provider):
                 health.record_engine_limit(provider, "fixture cached model refusal", self.reset, model=model)
-                with patch.dict(os.environ, MAKEWAND_API_POLICY="allow_paid"), \
-                     patch("makewand.config.has_subscription_configured", return_value=True), \
-                     patch("makewand.config.has_api_configured", return_value=True), \
-                     patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
-                     patch("makewand.providers.api_client.call_api_chat", return_value=(True, "fixture API answer", None)) as api, \
-                     patch.object(module, "run_subprocess") as cli:
-                    result = getattr(module, "execute_" + provider + "_task")(
-                        "fixture", cwd=str(self.root), model=model, readonly=True)
-                self.assertTrue(result[0], result)
-                self.assertEqual(result[1], "fixture API answer")
-                api.assert_called_once()
-                cli.assert_not_called()
+                relay = Relay()
+                warnings = io.StringIO()
+                with redirect_stderr(warnings):
+                    self.assertIsNone(model_quota.before_cli_launch(provider, model, relay=relay, cwd=str(self.root)))
+                self.assertEqual(relay.notices, [])
+                self.assertIn("提醒（不拦截）", warnings.getvalue())
+                self.assertIn("fixture cached model refusal", warnings.getvalue())
+                with patch.object(model_quota, "official_quota_reason", return_value="fixture official window"), \
+                        patch("makewand.codex_reset_credit.restore_quota", return_value=False), \
+                        redirect_stderr(io.StringIO()):
+                    answer = model_quota.before_cli_launch(provider, model, relay=relay, cwd=str(self.root))
+                self.assertEqual(answer, (True, "fixture API answer", None))
+                self.assertEqual(len(relay.notices), 1)
+                self.assertIn("fixture official window", relay.notices[0])
 
-    def test_model_limit_never_enables_paid_api_under_subscription_only(self):
-        from makewand.providers.grok import execute_grok_task
+    def test_quota_refusal_never_enables_paid_api_under_subscription_only(self):
+        from makewand.providers.base import ProviderAPIRelay
         health.record_engine_limit("grok", "fixture cached model refusal", self.reset, model="grok-4.7")
         with patch.dict(os.environ, MAKEWAND_API_POLICY="subscription_only"), \
              patch("makewand.config.has_subscription_configured", return_value=True), \
              patch("makewand.config.has_api_configured", return_value=True), \
              patch("makewand.providers.api_client.call_api_chat") as api, \
-             patch("makewand.providers.grok.run_subprocess") as cli:
-            result = execute_grok_task("fixture", cwd=str(self.root), model="grok-4.7", readonly=True)
-        self.assertFalse(result[0])
+             redirect_stderr(io.StringIO()):
+            relay = ProviderAPIRelay("grok", color="")
+            self.assertFalse(relay.available)
+            # The stored refusal reminds and the subscription CLI is used.
+            self.assertIsNone(model_quota.before_cli_launch("grok", "grok-4.7", relay=relay, cwd=str(self.root)))
+            with patch.object(model_quota, "official_quota_reason", return_value="fixture official window"):
+                refused = model_quota.before_cli_launch("grok", "grok-4.7", relay=relay, cwd=str(self.root))
+            self.assertEqual((refused[0], refused[2]), (False, "fixture official window"))
         api.assert_not_called()
-        cli.assert_not_called()
 
     def test_api_relay_after_model_refusal_still_spends_one_dispatch(self):
         from makewand.execution_runtime import mark_provider_invocation
@@ -432,9 +460,10 @@ class ModelQuotaScopeTests(unittest.TestCase):
             def __call__(self, notice, *, cwd):
                 mark_provider_invocation()
                 return True, "fixture API answer", None
-        result, attempt = self.execute_fixture(
-            lambda request: model_quota.before_cli_launch("agy", request.model, relay=Relay(), cwd=str(self.root)),
-            limited=True, api_policy="allow_paid")
+        with patch.object(model_quota, "official_quota_reason", return_value="fixture official window"):
+            result, attempt = self.execute_fixture(
+                lambda request: model_quota.before_cli_launch("agy", request.model, relay=Relay(), cwd=str(self.root)),
+                api_policy="allow_paid")
         self.assertEqual(result.status, "PASSED")
         self.assertEqual(result.output, "fixture API answer")
         self.assertEqual(attempt["status"], "completed")
@@ -464,20 +493,20 @@ class ModelQuotaScopeTests(unittest.TestCase):
         self.assertEqual(execute.call_args.args[0].api_policy, "subscription_only")
         may_relay.assert_not_called()
 
-    def test_guarded_review_refuses_model_removed_after_catalog_refresh(self):
+    def test_guarded_review_does_not_reread_the_catalog_at_launch(self):
+        """The catalog is a cache: a model it no longer lists is a reminder at validation, not a refusal here."""
         from makewand.execution_runtime import execution_context
         with execution_context(review_dispatch=("agy", "gemini-4-argon-high", None)), \
                 patch("makewand.discovery.discover_model_efforts",
-                      return_value={"agy": {"gemini-5-argon-high": ["high"]}}) as refreshed, \
-                patch.object(model_quota, "quota_reason") as quota:
+                      side_effect=AssertionError("catalog read at the launch boundary")), \
+                patch.object(model_quota, "official_quota_reason", return_value=None) as quota:
             result, attempt = self.execute_fixture(
-                lambda _: model_quota.before_cli_launch("agy", "gemini-4-argon-high"))
-        self.assertFalse(result.success)
-        self.assertEqual(attempt["status"], "released")
-        refreshed.assert_called_once_with(strict_catalogs=True)
-        quota.assert_not_called()
+                lambda _: model_quota.before_cli_launch("agy", "gemini-4-argon-high") or (True, "fixture answer", None))
+        self.assertTrue(result.success, result)
+        self.assertEqual(attempt["status"], "completed")
+        quota.assert_called_once()
 
-    def test_guarded_review_rechecks_catalog_after_sandbox_setup(self):
+    def test_guarded_review_keeps_the_validated_model_when_the_catalog_changes_during_setup(self):
         from makewand.execution_runtime import execution_context
         from makewand.providers.codex import execute_codex_task
 
@@ -486,7 +515,7 @@ class ModelQuotaScopeTests(unittest.TestCase):
         @contextmanager
         def prepare_sandbox(*args, **kwargs):
             catalog["codex"].clear()
-            yield SimpleNamespace()
+            yield SimpleNamespace(cmd=["codex"], pass_fds=(), env={})
 
         with execution_context(review_dispatch=("codex", model, "high")), \
                 patch("makewand.config.has_subscription_configured", return_value=True), \
@@ -494,10 +523,28 @@ class ModelQuotaScopeTests(unittest.TestCase):
                 patch("makewand.discovery._codex_model_efforts", return_value=["high"]), \
                 patch("makewand.sandbox.provider_sandbox_launch", side_effect=prepare_sandbox), \
                 patch("makewand.execution_runtime.mark_provider_invocation") as launched, \
+                patch("makewand.providers.codex.run_subprocess", return_value=(0, "fixture answer", "", None)) as transport:
+            _, _, error = execute_codex_task("fixture", cwd=str(self.root), model=model, effort="high", readonly=True)
+        # A catalog that changed while the sandbox was prepared no longer stops the validated model.
+        self.assertNotIn("请重新核对目录", error or "")
+        launched.assert_called_once()
+        transport.assert_called_once()
+
+    def test_guarded_review_refuses_another_effort_at_the_sandbox_boundary(self):
+        from makewand.execution_runtime import execution_context
+        from makewand.providers.codex import execute_codex_task
+
+        model = "gpt-6.2-astra"
+        with execution_context(review_dispatch=("codex", model, "high")), \
+                patch("makewand.config.has_subscription_configured", return_value=True), \
+                patch("makewand.discovery._codex_model_efforts", return_value=["high", "xhigh"]), \
+                patch("makewand.sandbox.provider_sandbox_launch") as sandbox, \
+                patch("makewand.execution_runtime.mark_provider_invocation") as launched, \
                 patch("makewand.providers.codex.run_subprocess") as transport:
-            ok, _, error = execute_codex_task("fixture", cwd=str(self.root), model=model, effort="high", readonly=True)
+            ok, _, error = execute_codex_task("fixture", cwd=str(self.root), model=model, effort="xhigh", readonly=True)
         self.assertFalse(ok)
         self.assertIn("请重新核对目录", error)
+        sandbox.assert_not_called()
         launched.assert_not_called()
         transport.assert_not_called()
 
@@ -590,11 +637,24 @@ class ModelQuotaScopeTests(unittest.TestCase):
                 quota["windows"][0].update(fields)
                 self.assertIsNone(model_quota.quota_reason("codex", "gpt-6.1-sol", quota=quota, info={}))
 
-    def test_cached_refusal_before_transport_does_not_spend_budget(self):
-        result, attempt = self.execute_fixture(lambda request: model_quota.before_cli_launch("agy", request.model), limited=True)
+    def test_official_refusal_before_transport_does_not_spend_budget(self):
+        with patch.object(model_quota, "official_quota_reason", return_value="fixture official window"):
+            result, attempt = self.execute_fixture(lambda request: model_quota.before_cli_launch("agy", request.model))
         self.assertEqual(result.error_kind, "quota_preflight")
         self.assertEqual(attempt["status"], "released")
         self.assertEqual(attempt["resolved_model"], "gemini-4-argon-high")
+
+    def test_cached_refusal_reminds_and_the_dispatch_goes_ahead(self):
+        warnings = io.StringIO()
+        with redirect_stderr(warnings):
+            result, attempt = self.execute_fixture(
+                lambda request: model_quota.before_cli_launch("agy", request.model) or (True, "fixture answer", None),
+                limited=True)
+        self.assertEqual(result.status, "PASSED")
+        self.assertEqual(result.output, "fixture answer")
+        self.assertEqual(attempt["status"], "completed")
+        self.assertIn("提醒（不拦截）：当前账号/模型额度受限：fixture refusal", warnings.getvalue())
+        self.assertIn("以供应商当场的答复为准", warnings.getvalue())
 
     def test_generic_failure_still_spends_budget(self):
         result, attempt = self.execute_fixture(lambda request: (False, None, "fixture failure"))
