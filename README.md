@@ -137,7 +137,7 @@ makewand muse "检查系统配置项"
 makewand route implement normal --self claude
 makewand route review hard --self claude --not codex --json
 
-# 派活遇到 429 或额度用完：标记该工具，到期前 route 跳过它
+# 派活遇到 429 或额度用完：标记该工具，到期前 route 把它排在后面并提醒（不拦截）
 makewand mark codex 6h --reason 429
 
 # 验收后记录成绩，route 据此调整之后的排序

@@ -171,7 +171,8 @@ class ProviderOutcomeTests(unittest.TestCase):
                     result = execute("Review fixture", cwd=self.directory, readonly=True)
                     self.assertIs(result, typed)
                     self.assertEqual(api.call_args.kwargs["role"], "reviewer")
-                    self.assertEqual(process.call_count, 1 if mode == "quota" else 0)
+                    # A cached limit is a reminder: the CLI runs and its live refusal starts the relay.
+                    self.assertEqual(process.call_count, 0 if mode == "missing" else 1)
 
     def test_actual_codex_disconnect_stops_review_fallback(self):
         with self.adapter("codex") as (_, process, api), \

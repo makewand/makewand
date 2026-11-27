@@ -117,6 +117,7 @@ def admission(data, engine, account, capacity_policy=None):
     for key in list(limits):
         if key not in referenced:
             del limits[key]
+    requested = []
     for index, (key, variable, default) in enumerate(zip(wanted, (
             "MAKEWAND_PROVIDER_CONCURRENCY", "MAKEWAND_ACCOUNT_CONCURRENCY", "MAKEWAND_POOL_CONCURRENCY"), (64, 1, 1))):
         if capacity_policy:
@@ -124,7 +125,8 @@ def admission(data, engine, account, capacity_policy=None):
             limit = min(positive(os.environ.get(variable) or policy_limit), policy_limit)
         else:
             limit = positive(os.environ.get(variable, default))
-        limits[key] = min(limits.get(key, limit), limit)
+        requested.append(limit)
+        limits[key] = _floor(leases, limits, key, limit)
         def conflicts(lease):
             if key in lease["keys"]:
                 return True
@@ -135,7 +137,34 @@ def admission(data, engine, account, capacity_policy=None):
         if sum(conflicts(lease) for lease in leases.values()) >= limits[key]:
             raise ConcurrencyBusyError("account concurrency capacity exhausted")
     return {"keys": wanted, "owner": process_ref(os.getpid()), "workers": [],
-            "expires_at": now + TTL, "heartbeat_at": now, "launch_pending": False}
+            "expires_at": now + TTL, "heartbeat_at": now, "launch_pending": False, "limits": requested}
+
+
+def own_limits(lease):
+    """The limits this lease was admitted with, or None for one written before they were stored."""
+    value = lease.get("limits")
+    if (isinstance(value, list) and len(value) == 3
+            and all(type(v) is int and 0 < v <= 9223372036854775807 for v in value)):
+        return value
+    return None
+
+
+def _floor(leases, limits, key, limit):
+    """The lowest limit among this request and the live leases that hold key.
+
+    A running lease keeps the limit it was admitted with (a caller that asked
+    for less must not be overrun), but only while it runs: a floor stored for
+    the key alone used to be inherited by every later lease, so raising the
+    capacity policy had no effect while the tool stayed busy. A lease written
+    before limits were stored keeps the stored floor until it ends.
+    """
+    floor = limit
+    for lease in leases.values():
+        if key not in lease["keys"]:
+            continue
+        own = own_limits(lease)
+        floor = min(floor, own[lease["keys"].index(key)] if own else limits.get(key, floor))
+    return floor
 
 
 def validate(data):

@@ -211,11 +211,9 @@ def execute_muse_task(
     if cache.get("muse", {}).get("status") == "needs_auth" and relay.available:
         return relay("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", cwd=cwd)
 
-    if cache.get("muse", {}).get("status") == "limited":
-        if relay.available:
-            return relay("[Makewand -> Muse] 订阅不可用或受限，无缝自动降级为 Meta API 模式接力执行...", cwd=cwd)
-        from makewand.model_quota import refuse_before_launch
-        return refuse_before_launch(relay.unavailable(f"Muse Code 当前不可用: {cache['muse'].get('reason')}", "可配置 META_API_KEY 作为备用 API 自动接力"))
+    # A stored "limited" status is a reminder (model_quota.before_cli_launch prints
+    # it): only the provider's own answer or a current official reading stops or
+    # relays a launch.
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:

@@ -31,7 +31,7 @@ import random
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping, Optional, Sequence, Union
@@ -142,6 +142,10 @@ class RouteResult:
     skipped: list
     escalate_tier: Optional[int]
     retry_approval_required: bool = False
+    # (provider, text) of candidates that stay available but are listed after
+    # the others: a quota mark or a stored refusal. Local records remind; they
+    # do not gate.
+    reminders: list = field(default_factory=list)
 
 
 def default_policy_path() -> Path:
@@ -331,7 +335,7 @@ def select(
     blocked_early = []
     for row in rows:
         if (row.provider in task_skips or _pause_reason(policy, row.provider, moment)
-                or _mark_reason(marks.get(row.provider), moment) or row.provider in request_blocks):
+                or row.provider in request_blocks):
             blocked_early.append(row.provider)
     quota = _read_quota(rows, blocked_early, quota_reader)
     # Explicit readers keep deterministic/offline callers free of wall-clock
@@ -363,23 +367,33 @@ def select(
     quota_models = {}
     open_models = {}
     available = []
+    # provider → {reminder text: models it applies to}; a reminder never removes a candidate.
+    reminded = {}
+    clean_models = {}
     for index, row in enumerate(rows):
         provider_reason = (
             task_skips.get(row.provider)
             or _pause_reason(policy, row.provider, moment)
-            or _mark_reason(marks.get(row.provider), moment)
             or request_blocks.get(row.provider)
             or unavailable.get(row.provider)
         )
         # The quota gate comes first: a redeemable Codex reset is keyed on its reason.
-        quota_reason = None if provider_reason else (
-            _quota_reason(row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
-            or _model_mark_reason(marks, row.provider, _row_model(row), moment))
+        quota_reason = None if provider_reason else _quota_reason(
+            row.provider, quota, policy, model=_row_model(row), info=cached_status.get(row.provider, {}))
         reason = provider_reason or quota_reason or _family_reason(row.provider, not_tool)
+        note = None
+        if not reason:
+            note = (_mark_reason(marks.get(row.provider), moment)
+                    or _stored_refusal(row.provider, _row_model(row), cached_status.get(row.provider, {}))
+                    or _model_mark_reason(marks, row.provider, _row_model(row), moment))
         if not reason and review_policy is not None:
+            # The high-risk list stays the verified strong tier. A direct dispatch of
+            # another model is not refused, only reminded (review_policy.review_currency_reminder).
             reason = review_policy.check_family(row.provider, row.model)
             if not reason and (row.provider, row.model, row.effort) not in verified_models:
                 reason = "型号未列入当前目录的最新强档，或缺少高推理档证据"
+            if reason:
+                note = None
         if quota_reason:
             quota_models.setdefault(row.provider, set()).add(_row_model(row))
         elif not provider_reason:
@@ -394,11 +408,25 @@ def select(
             if model and model not in family_models.setdefault(row.provider, []):
                 family_models[row.provider].append(model)
             continue
-        available.append((index, row))
+        available.append((index, row, note))
     if review_policy is not None:
-        cross_family = [(i, row) for i, row in available
-                        if review_model_family(row.provider, row.model) != review_policy.author_family]
+        cross_family = [item for item in available
+                        if review_model_family(item[1].provider, item[1].model) != review_policy.author_family]
         available = cross_family or available
+    # Only candidates that are offered are reminded about.
+    for _index, row, note in available:
+        if note:
+            reminded.setdefault(row.provider, {}).setdefault(note, set()).add(_row_model(row))
+        else:
+            clean_models.setdefault(row.provider, set()).add(_row_model(row))
+    reminders = []
+    for provider, notes in reminded.items():
+        for text, models in notes.items():
+            # A reminder on every offered model of the provider needs no model list.
+            named = sorted(model for model in models if model)
+            partial_note = bool(clean_models.get(provider)) or len(notes) > 1
+            reminders.append((provider, "部分模型（" + ", ".join(named) + "）：" + text
+                              if partial_note and named else text))
     # 按 provider 计的原因同一家所有组合都一样；按模型家族跳过的列出具体模型。
     skipped = [
         (provider, reason or _model_family_reason(family_models[provider], not_tool))
@@ -413,7 +441,7 @@ def select(
     batch_requests = [
         (row.provider, tier, task_type,
          getattr(row, "model", None), getattr(row, "effort", None))
-        for _index, row in available
+        for _index, row, _note in available
     ]
     stats_many = getattr(ledger, "stats_many", None)
     if callable(stats_many):
@@ -429,7 +457,7 @@ def select(
         ]
 
     scored = []
-    for (index, row), stats in zip(available, batch_stats):
+    for (index, row, note), stats in zip(available, batch_stats):
         alpha = _positive_param(stats.alpha)
         beta = _positive_param(stats.beta)
         score = float(rng.betavariate(alpha, beta))
@@ -439,7 +467,8 @@ def select(
         # Without outcomes cheaper candidates are tried more often; a costlier one that keeps
         # passing still overtakes them.
         weight = 1.0 - COST_WEIGHT_SPREAD * (index / (len(rows) - 1)) if len(rows) > 1 else 1.0
-        scored.append((1 if is_self else 0, -(score * weight), index, row, score, is_self))
+        # Candidates with a reminder come after every candidate without one.
+        scored.append((1 if is_self else 0, 1 if note else 0, -(score * weight), index, row, score, is_self))
     scored.sort()
 
     chosen = [
@@ -453,7 +482,7 @@ def select(
             effort=getattr(row, "effort", None),
             candidate_id=getattr(row, "candidate_id", None),
         )
-        for _self_flag, _neg_score, _index, row, score, is_self in scored
+        for _self_flag, _noted, _neg_score, _index, row, score, is_self in scored
     ]
     return RouteResult(
         tier=tier,
@@ -461,6 +490,7 @@ def select(
         skipped=skipped,
         escalate_tier=escalate(tier),
         retry_approval_required=any(kind in ("unknown", "timeout") for kind, _ in blocks.values()),
+        reminders=reminders,
     )
 
 
@@ -557,8 +587,15 @@ def _model_mark_reason(marks: Mapping, provider: str, model, now: float) -> Opti
 
 
 def _quota_reason(provider: str, quota: Mapping, policy: Policy, model=None, info=None) -> Optional[str]:
-    from makewand.model_quota import quota_reason
-    return quota_reason(provider, model, quota=quota.get(provider, False), info=info, policy=policy)
+    """The official usage gate; a stored refusal is a reminder (_stored_refusal)."""
+    from makewand.model_quota import official_quota_reason
+    return official_quota_reason(provider, model, quota=quota.get(provider, False), policy=policy)
+
+
+def _stored_refusal(provider: str, model, info) -> Optional[str]:
+    """A refusal the provider gave earlier and that has not expired: a reminder (model_quota.stored_refusal_reason)."""
+    from makewand.model_quota import stored_refusal_reason
+    return stored_refusal_reason(provider, model, info=info)
 
 
 def _validate_not_tool(not_tool: Optional[str]) -> None:

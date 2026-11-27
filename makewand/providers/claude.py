@@ -98,12 +98,9 @@ def execute_claude_task(
     if cache.get("claude", {}).get("status") == "needs_auth" and relay.available:
         return relay("[Makewand -> Claude] 订阅登录失效，自动降级为 Anthropic API 模式接力执行...", cwd=cwd)
 
-    if cache.get("claude", {}).get("status") == "limited":
-        if relay.available:
-            return relay("[Makewand -> Claude] 订阅额度受限，无缝自动降级为 Anthropic API 模式接力执行...", cwd=cwd)
-        from makewand.model_quota import refuse_before_launch
-        return refuse_before_launch(relay.unavailable(f"Claude Code 当前额度受限: {cache['claude'].get('reason')}",
-                                     "可配置 ANTHROPIC_API_KEY 作为备用 API 自动接力"))
+    # A stored "limited" status is a reminder (model_quota.before_cli_launch prints
+    # it): only the provider's own answer or a current official reading stops or
+    # relays a launch.
 
     # Normalize cwd and repo_root to ensure sandbox is never bypassed
     if not cwd:

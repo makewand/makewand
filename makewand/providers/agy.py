@@ -241,11 +241,9 @@ def execute_agy_task(
     if cache.get("agy", {}).get("status") == "needs_auth" and relay.available:
         return relay("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", cwd=cwd)
 
-    if cache.get("agy", {}).get("status") == "limited":
-        if relay.available:
-            return relay("[Makewand -> Antigravity] 订阅当前受限，无缝自动降级为 Gemini API 模式接力执行...", cwd=cwd)
-        from makewand.model_quota import refuse_before_launch
-        return refuse_before_launch(relay.unavailable(f"Antigravity 当前不可用: {cache['agy'].get('reason')}", "可配置 GEMINI_API_KEY 作为备用 API 自动接力"))
+    # A stored "limited" status is a reminder (model_quota.before_cli_launch prints
+    # it): only the provider's own answer or a current official reading stops or
+    # relays a launch.
 
     # Fail-closed enforcement: if writable, sandbox is mandatory unless explicitly authorized
     host_auth_source = None
