@@ -178,6 +178,13 @@ def calculate_dynamic_pacing(
 
     # Confirmed hard limits / broken or unavailable providers.
     official_empty = source == "official" and percentage is not None and percentage <= 0
+    if status == "limited" and source != "official":
+        # Only a record of an earlier refusal: it reminds, it does not exclude (owner, 2026-11-27).
+        from makewand.model_quota import recorded_limit_only
+        if recorded_limit_only(provider, {"status": "limited"}):
+            reset_hint = f"（记录的重置时间: {resets_at}）" if resets_at else ""
+            return _neutral(provider, f"{provider.upper()} 有额度受限的记录{reset_hint}：只提醒、不排除，"
+                                      "排在其他引擎之后，以供应商当场的答复为准", percentage=percentage, signal="record")
     if status in ("limited", "needs_auth", "error", "disabled", "missing") or official_empty:
         reset_hint = f" (解封时间: {resets_at})" if resets_at else ""
         if status == "needs_auth":

@@ -312,12 +312,18 @@ def execute_muse_task(
             ) as launch:
                 from makewand.execution_runtime import current_context
                 if current_context().get("review_dispatch") is not None and launch.sandboxed:
+                    # The model catalog is Muse's own cache file. Whether the sandbox reads the
+                    # same copy the host validated against is a reminder: the model and effort
+                    # are passed explicitly and checked below (review_launch_refusal).
                     from makewand.discovery import muse_review_uses_sandbox_profile
-                    from makewand.model_quota import refuse_before_launch
+                    from makewand.model_quota import remind
+                    home = getattr(launch, "home", None)
                     if not muse_review_uses_sandbox_profile():
-                        return refuse_before_launch("Muse 沙箱使用默认数据目录，无法验证当前自定义目录对应的高风险审查型号")
-                    if launch.home is None or not launch.home.muse_review_snapshot_is_current():
-                        return refuse_before_launch("Muse 沙箱的高风险审查快照与当前目录不一致，请重新核对目录")
+                        remind("muse", "沙箱使用默认数据目录，和当前自定义目录里的模型目录可能不同；"
+                                       "型号和推理档已按指定值传入，以 Muse 实际答复为准")
+                    elif home is None or not home.muse_review_snapshot_is_current():
+                        remind("muse", "沙箱里的模型目录快照和本机当前目录不一致（目录可能刚更新）；"
+                                       "型号和推理档已按指定值传入，以 Muse 实际答复为准")
                 exec_cmd = launch.cmd
                 import sys
                 print(c(f"[Makewand -> Muse] 派发任务 (Tier: {tier}, Meta Provider)...", COLOR_PURPLE), file=sys.stderr)

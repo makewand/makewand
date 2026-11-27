@@ -393,6 +393,9 @@ def _run_review_impl(cwd: Optional[str] = None, stream: bool = False, timeout: i
             ("codex", "派发给 Codex CLI 进行红队审计 (gpt-6-astra, 只读隔离)...", COLOR_CYAN),
             ("agy", "由 Antigravity 进行红队审计 (只读隔离)...", COLOR_GREEN),
         ]
+        # An engine with only a record of an earlier limit is not skipped; it is tried after the others.
+        from makewand.model_quota import recorded_limit_only
+        reviewer_ladder.sort(key=lambda step: recorded_limit_only(step[0], (cache or {}).get(step[0])))
     review_res = None
     reviewer_engine = None
     attempted = []

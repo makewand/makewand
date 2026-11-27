@@ -122,6 +122,10 @@ def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy
     if require_healthy and status != "healthy":
         return False, f"健康状态为 {status or 'unknown'}"
     if status in _UNUSABLE_ENGINE_STATUSES and not _failure_verdict_expired(info):
+        from makewand.model_quota import recorded_limit_only
+        if recorded_limit_only(engine, info):
+            # A record of an earlier refusal reminds, it does not exclude (owner, 2026-11-27).
+            return True, ""
         reason = str(info.get("reason") or "").strip()
         if status == "needs_auth":
             from makewand.health import get_reauth_hint
@@ -252,6 +256,13 @@ def select_optimal_engine_pair(
             status_fn = get_or_update_status
         cache = status_fn(force_probe=False)
     cache = _without_expired_failures(cache)
+    # Engines whose "limited" verdict is only a record of an earlier refusal stay selectable
+    # and rank after every other engine (owner, 2026-11-27). Where an API relay is allowed
+    # the relay scoring below applies as before.
+    from makewand.config import api_relay_available as _relay_available
+    from makewand.model_quota import recorded_limit_only
+    demoted = {name for name, info in (cache or {}).items()
+               if isinstance(name, str) and recorded_limit_only(name, info) and not _relay_available(name)}
 
     p_lower = prompt.lower()
     reasons = []
@@ -444,7 +455,9 @@ def select_optimal_engine_pair(
         # The adapters relay to the API only when the policy allows paid calls.
         api_ok = api_relay_available(model_name)
         if status == "limited":
-            if api_ok:
+            if model_name in demoted:
+                reasons.append(f"{model_name} 有额度受限的记录：只提醒、不排除，排在其他引擎之后，以供应商当场的答复为准")
+            elif api_ok:
                 scores[model_name] -= 1.0
                 reasons.append(f"{model_name} 订阅额度受限，已自动启用备用 API 兜底 (轻微降权 -1.0)")
             else:
@@ -481,7 +494,8 @@ def select_optimal_engine_pair(
         require_file_editing = (classify_prompt_intent(prompt) == "code")
 
     # Sort coder candidates
-    available_coders = [m for m, sc in sorted(scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
+    available_coders = [m for m, sc in sorted(scores.items(), key=lambda x: (x[0] not in demoted, x[1]), reverse=True)
+                        if sc > 0]
     if require_file_editing:
         filtered_coders = [m for m in available_coders if m not in NON_AGENTIC_CHAT_MODELS]
         if filtered_coders:
@@ -557,7 +571,7 @@ def select_optimal_engine_pair(
         else:
             status = cache.get(model_name, {}).get("status", "unknown")
         api_ok = api_relay_available(model_name)
-        if status in ("limited", "needs_auth", "missing"):
+        if status in ("limited", "needs_auth", "missing") and model_name not in demoted:
             if api_ok and model_name not in ("local", "ollama"):
                 reviewer_base_scores[model_name] -= 0.8
             else:
@@ -582,7 +596,8 @@ def select_optimal_engine_pair(
                 if reviewer_base_scores[model_name] > 0 else reviewer_base_scores[model_name]
             )
 
-    available_reviewers = [m for m, sc in sorted(reviewer_base_scores.items(), key=lambda x: x[1], reverse=True) if sc > 0]
+    available_reviewers = [m for m, sc in sorted(reviewer_base_scores.items(),
+                                                key=lambda x: (x[0] not in demoted, x[1]), reverse=True) if sc > 0]
     single_tool_mode = False
     if len(active_pool) <= 1:
         available_reviewers = [primary_coder]

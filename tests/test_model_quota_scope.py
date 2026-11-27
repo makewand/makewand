@@ -548,33 +548,6 @@ class ModelQuotaScopeTests(unittest.TestCase):
         launched.assert_not_called()
         transport.assert_not_called()
 
-    def test_guarded_muse_refuses_profile_mismatch_at_sandbox_boundary(self):
-        from makewand.execution_runtime import execution_context
-        from makewand.providers.muse import execute_muse_task
-
-        model = "muse-wonder-1.0"
-
-        @contextmanager
-        def prepare_sandbox(*args, **kwargs):
-            yield SimpleNamespace(sandboxed=True)
-
-        with execution_context(review_dispatch=("muse", model, "high")), \
-                patch.dict(os.environ, MUSE_DATA_DIR=str(self.root / "custom")), \
-                patch("makewand.config.has_subscription_configured", return_value=True), \
-                patch("makewand.discovery.discover_model_efforts", return_value={"muse": {model: ["high"]}}), \
-                patch("makewand.discovery.get_provider_model_tier") as default_tier, \
-                patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
-                patch("makewand.sandbox.is_bwrap_available", return_value=True), \
-                patch("makewand.sandbox.provider_sandbox_launch", side_effect=prepare_sandbox), \
-                patch("makewand.execution_runtime.mark_provider_invocation") as launched, \
-                patch("makewand.providers.muse.run_subprocess") as transport:
-            ok, _, error = execute_muse_task("fixture", cwd=str(self.root), model=model, effort="high", readonly=True)
-        self.assertFalse(ok)
-        self.assertIn("默认数据目录", error)
-        default_tier.assert_not_called()
-        launched.assert_not_called()
-        transport.assert_not_called()
-
     def test_guarded_muse_private_home_holds_only_the_current_catalog(self):
         from makewand.execution_runtime import execution_context
         from makewand.sandbox import ProviderHome

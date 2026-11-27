@@ -48,7 +48,10 @@ class TestErrorVerdictExcludesEngine(unittest.TestCase):
             with self.subTest(info=info):
                 self.assertTrue(_engine_usable("agy", {"agy": info})[0])
         # Statuses without a TTL keep excluding the engine.
-        self.assertFalse(_engine_usable("agy", {"agy": {"status": "limited", "updated_at": ago(days=3)}})[0])
+        self.assertFalse(_engine_usable("agy", {"agy": {"status": "missing", "updated_at": ago(days=3)}})[0])
+        # A "limited" verdict is a record of an earlier refusal: it reminds, it does not exclude
+        # (owner, 2026-11-27; tests/test_record_gates_followup.py covers the official-reading case).
+        self.assertTrue(_engine_usable("agy", {"agy": {"status": "limited", "updated_at": ago(days=3)}})[0])
 
 
 if __name__ == "__main__":
