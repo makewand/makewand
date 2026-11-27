@@ -1253,28 +1253,52 @@ def _codex_effort_map() -> Dict[str, List[str]]:
     return found
 
 
-def _claude_effort_map() -> Dict[str, List[str]]:
-    found: Dict[str, List[str]] = {}
+def _claude_catalog_models() -> List[dict]:
+    """The model entries of Claude Code's catalog cache (~/.claude/cache/model-catalog).
+
+    The directory holds several files of the same shape. Besides the catalog
+    proper, Claude Code writes a "*.badges.json" whose entries are bare ids,
+    with the same modification time. Taking the newest file alone picked that
+    one whenever the times tied, so no model had an effort level and every
+    Claude model failed the high-risk review check (2026-11-27). The newest
+    file that describes its models (a name, thinking or runtime data) is used;
+    only when no file does, the newest one that lists any model.
+    """
     cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
     try:
-        files = sorted(cat_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        files = sorted(cat_dir.glob("*.json"), key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
     except OSError:
-        return found
-    if not files:
-        return found
-    try:
-        cat_data = json.loads(files[0].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return found
-    cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", []) if isinstance(cat_data, dict) else []
-    for entry in cfg_models if isinstance(cfg_models, list) else []:
-        if not isinstance(entry, dict):
+        return []
+    bare: List[dict] = []
+    for path in files:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        mid = entry.get("id")
-        if not _valid_model_id(mid) or mid in found:
-            continue
-        thinking = entry.get("thinking") if isinstance(entry.get("thinking"), dict) else {}
-        found[str(mid)] = _effort_names(thinking.get("effort_options") or [])
+        catalog = data.get("catalog") if isinstance(data, dict) else None
+        config = catalog.get("config") if isinstance(catalog, dict) else None
+        entries = config.get("models") if isinstance(config, dict) else None
+        entries = [entry for entry in entries if isinstance(entry, dict) and _valid_model_id(entry.get("id"))] \
+            if isinstance(entries, list) else []
+        if any(isinstance(entry.get(key), expected) and entry.get(key) for entry in entries
+               for key, expected in (("name", str), ("thinking", dict), ("runtime", dict))):
+            return entries
+        if entries and not bare:
+            bare = entries
+    return bare
+
+
+def _claude_entry_efforts(entry: dict) -> List[str]:
+    """Effort levels of a catalog entry: the selectable options, else the runtime's list."""
+    thinking = entry.get("thinking") if isinstance(entry.get("thinking"), dict) else {}
+    runtime = entry.get("runtime") if isinstance(entry.get("runtime"), dict) else {}
+    return _effort_names(thinking.get("effort_options") or []) or _effort_names(runtime.get("effort_levels") or [])
+
+
+def _claude_effort_map() -> Dict[str, List[str]]:
+    found: Dict[str, List[str]] = {}
+    for entry in _claude_catalog_models():
+        found.setdefault(str(entry["id"]), _claude_entry_efforts(entry))
     return found
 
 
@@ -1390,25 +1414,19 @@ def discover_available_models(refresh: bool = False) -> Dict[str, Any]:
 
     # Discover Claude models from official catalog cache (~/.claude/cache/model-catalog/*.json) and ~/.claude.json
     try:
-        cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
-        if cat_dir.exists():
-            json_files = sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-            if json_files:
-                cat_data = json.loads(json_files[0].read_text(encoding="utf-8"))
-                cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", [])
-                catalog_by_id: Dict[str, str] = {}
-                for m in cfg_models:
-                    if not isinstance(m, dict):
-                        continue
-                    mid = m.get("id")
-                    mname = m.get("name")
-                    if not _valid_model_id(mid):
-                        continue
-                    lbl = f"{mid} ({mname})" if isinstance(mname, str) and mname.strip() else mid
-                    _merge_model_label(catalog_by_id, lbl)
-                if catalog_by_id:
-                    models["claude"]["available"] = list(catalog_by_id.values())
-                    models["claude"]["source"] = "detected"
+        catalog_by_id: Dict[str, str] = {}
+        for m in _claude_catalog_models():
+            if not isinstance(m, dict):
+                continue
+            mid = m.get("id")
+            mname = m.get("name")
+            if not _valid_model_id(mid):
+                continue
+            lbl = f"{mid} ({mname})" if isinstance(mname, str) and mname.strip() else mid
+            _merge_model_label(catalog_by_id, lbl)
+        if catalog_by_id:
+            models["claude"]["available"] = list(catalog_by_id.values())
+            models["claude"]["source"] = "detected"
     except Exception:
         pass
 
@@ -1653,53 +1671,47 @@ def get_provider_model_tier(provider: str, tier: str = "standard") -> Dict[str, 
     if provider == "claude":
         # Check Anthropic official model catalog
         try:
-            cat_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser() / "cache" / "model-catalog"
-            if cat_dir.exists():
-                files = sorted(cat_dir.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
-                if files:
-                    cat_data = json.loads(files[0].read_text(encoding="utf-8"))
-                    cfg_models = cat_data.get("catalog", {}).get("config", {}).get("models", [])
-                    claude_catalog = []
-                    efforts_map = {}
-                    for m in cfg_models:
-                        if not isinstance(m, dict):
-                            continue
-                        mid = m.get("id", "")
-                        if not _valid_model_id(mid):
-                            continue
-                        mname = m.get("name", "")
-                        mdesc = m.get("description", "")
-                        notice = (m.get("notice", {}).get("text") or "") if m.get("notice") else ""
-                        thinking = m.get("thinking") if isinstance(m.get("thinking"), dict) else {}
-                        efforts = [o.get("id") for o in thinking.get("effort_options", [])
-                                   if isinstance(o, dict) and isinstance(o.get("id"), str)
-                                   and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", o["id"])]
-                        efforts_map[mid] = efforts
-                        claude_catalog.append((mid, f"{mname} {mdesc} {notice}"))
+            claude_catalog = []
+            efforts_map = {}
+            for m in _claude_catalog_models():
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id", "")
+                if not _valid_model_id(mid):
+                    continue
+                mname = m.get("name", "")
+                mdesc = m.get("description", "")
+                notice = (m.get("notice", {}).get("text") or "") if m.get("notice") else ""
+                thinking = m.get("thinking") if isinstance(m.get("thinking"), dict) else {}
+                efforts = [o.get("id") for o in thinking.get("effort_options", [])
+                           if isinstance(o, dict) and isinstance(o.get("id"), str)
+                           and re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", o["id"])]
+                efforts_map[mid] = efforts
+                claude_catalog.append((mid, f"{mname} {mdesc} {notice}"))
 
-                    if claude_catalog:
-                        ranked = rank_models_for_tier(claude_catalog, tier)
-                        if ranked:
-                            top_id = ranked[0][1]
-                            alias = top_id  # Do not invent an alias absent from the selected catalog.
-                            efforts = efforts_map.get(top_id, [])
-                            if tier == "deep":
-                                effort = efforts[-1] if efforts else "max"
-                            elif tier == "fast":
-                                effort = "low"
-                            else:
-                                effort = "medium" if "medium" in efforts else ("high" if "high" in efforts else "medium")
-                            # Only a listed effort is detected. A static tier
-                            # preference never implies a model capability.
-                            if efforts and effort not in efforts:
-                                effort = efforts[0] if tier == "fast" else efforts[-1]
-                            result = _tier_resolution(alias, effort, is_dynamic=True, full_id=top_id,
-                                                      effort_source="detected" if efforts else "builtin")
-                            result["selection_reason"] = f"tier={tier}: 按版本、家族和能力关键词评分，选择 {top_id} (score={ranked[0][0]})"
-                            result["ranking"] = [dict(model=mid, score=score, selected=mid == top_id,
-                                                      reason="本档位排名第一" if mid == top_id else f"本档位排名低于 {top_id}")
-                                                 for score, mid, _ in ranked]
-                            return result
+            if claude_catalog:
+                ranked = rank_models_for_tier(claude_catalog, tier)
+                if ranked:
+                    top_id = ranked[0][1]
+                    alias = top_id  # Do not invent an alias absent from the selected catalog.
+                    efforts = efforts_map.get(top_id, [])
+                    if tier == "deep":
+                        effort = efforts[-1] if efforts else "max"
+                    elif tier == "fast":
+                        effort = "low"
+                    else:
+                        effort = "medium" if "medium" in efforts else ("high" if "high" in efforts else "medium")
+                    # Only a listed effort is detected. A static tier
+                    # preference never implies a model capability.
+                    if efforts and effort not in efforts:
+                        effort = efforts[0] if tier == "fast" else efforts[-1]
+                    result = _tier_resolution(alias, effort, is_dynamic=True, full_id=top_id,
+                                              effort_source="detected" if efforts else "builtin")
+                    result["selection_reason"] = f"tier={tier}: 按版本、家族和能力关键词评分，选择 {top_id} (score={ranked[0][0]})"
+                    result["ranking"] = [dict(model=mid, score=score, selected=mid == top_id,
+                                              reason="本档位排名第一" if mid == top_id else f"本档位排名低于 {top_id}")
+                                         for score, mid, _ in ranked]
+                    return result
         except Exception:
             pass
 

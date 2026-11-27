@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- 高风险审查不再把所有 Claude 模型判为“型号未列入当前目录的最新强档，或缺少高推理档证据”。Claude Code 在目录缓存 `~/.claude/cache/model-catalog/` 里新写了一个 `*-cc.badges.json`，结构相同但只有模型 ID、没有推理档；它和目录文件修改时间相同，而读取逻辑只取“最新的一个文件”，两者时间相同时会读到它（11-27 19:59 起出现）。现在读最新的、带模型描述的那个文件，三处读取共用同一逻辑。
 - Claude 可以用专用长期令牌派发：把 `claude setup-token` 的输出存成 `~/.config/makewand/credential-backups/claude/setup-token`（`0600`）后，沙箱不再拷贝 `~/.claude/.credentials.json`，改用由令牌生成的私有登录（令牌不进命令行和环境变量）。此前每次派发都拷一份交互登录，沙箱和宿主会话各自刷新同一个刷新令牌，后刷新的一方失效：宿主被要求重新登录，或这次调用失败（11-26 17:49 和 11-27 09:52 两次看到两边都改了凭据）。没有这个文件时行为不变。
 - Codex 和 Claude 默认可用完订阅额度，周用量达到 100% 或供应商拒绝时停止。Codex 的低额度提醒不会按默认策略触发限流，仍可显式配置保留阈值。
 - 高风险审查按本机目录校验精确模型 ID、版本、推理档和实际家族，路由生成的只读命令在派发时复核。无跨家族候选时，同家族回退需要显式批准。
