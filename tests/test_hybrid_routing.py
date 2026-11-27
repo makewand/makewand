@@ -101,7 +101,7 @@ class TestHybridRouting(unittest.TestCase):
         with patch("makewand.sandbox.provider_sandbox_launch", side_effect=launch), \
                 patch("makewand.providers.codex.run_subprocess", return_value=(0, "cli answer", "", None)) as cli, \
                 contextlib.redirect_stderr(io.StringIO()):
-            ok, out, err = execute_codex_task("Fix bug in auth.py")
+            ok, out, err = execute_codex_task("Fix bug in auth.py", readonly=True)
         self.assertTrue(ok)
         self.assertEqual(out, "cli answer")
         cli.assert_called_once()
@@ -113,7 +113,7 @@ class TestHybridRouting(unittest.TestCase):
                 patch("makewand.providers.codex.run_subprocess", return_value=refusal) as cli, \
                 patch("makewand.codex_reset_credit.restore_quota", return_value=False), \
                 patch("makewand.health.record_engine_limit"), contextlib.redirect_stderr(io.StringIO()):
-            ok, out, err = execute_codex_task("Fix bug in auth.py")
+            ok, out, err = execute_codex_task("Fix bug in auth.py", readonly=True)
         self.assertTrue(ok)
         self.assertEqual(out, "Generated code via OpenAI API fallback")
         self.assertIsNone(err)

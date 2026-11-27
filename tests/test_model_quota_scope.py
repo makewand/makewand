@@ -690,9 +690,6 @@ class ModelQuotaScopeTests(unittest.TestCase):
         return result, attempt
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class ReminderScopeTests(unittest.TestCase):
     """Checks added after the first review of the reminder change."""
@@ -742,3 +739,6 @@ class ReminderScopeTests(unittest.TestCase):
         self.assertEqual(validate_review_dispatch(policy, "claude", "claude-fable-5-2", "high", {}), "high")
         self.assertEqual(validate_review_dispatch(ReviewPolicy.from_options("codex", (), False), "agy",
                                                   "gemini-4-argon-high", None, {}), "high")
+
+if __name__ == "__main__":
+    unittest.main()
