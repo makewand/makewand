@@ -9,6 +9,7 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+- Claude 可以用专用长期令牌派发：把 `claude setup-token` 的输出存成 `~/.config/makewand/credential-backups/claude/setup-token`（`0600`）后，沙箱不再拷贝 `~/.claude/.credentials.json`，改用 `CLAUDE_CODE_OAUTH_TOKEN`。此前每次派发都拷一份交互登录，沙箱和宿主会话各自刷新同一个刷新令牌，后刷新的一方失效：宿主被要求重新登录，或这次调用失败（11-26 17:49 和 11-27 09:52 两次看到两边都改了凭据）。没有这个文件时行为不变。
 - Codex 和 Claude 默认可用完订阅额度，周用量达到 100% 或供应商拒绝时停止。Codex 的低额度提醒不会按默认策略触发限流，仍可显式配置保留阈值。
 - 高风险审查按本机目录校验精确模型 ID、版本、推理档和实际家族，路由生成的只读命令在派发时复核。无跨家族候选时，同家族回退需要显式批准。
 - `route`、`review` 和直接派发支持 `--no-capacity-wait`。名额已满时只尝试一次准入，减少长时间排队。观察报告区分调用方的重试批准声明，并排除没有实际准入的后续预约。

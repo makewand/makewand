@@ -1070,6 +1070,14 @@ CREDENTIAL_MAX_BYTES = 4 * 1024 * 1024
 # a mount shows them again (wrap_bwrap); never used where the directory
 # resolves outside HOME and the masked host roots (_credential_backup_path).
 CREDENTIAL_BACKUP_DIR = ".config/makewand/credential-backups"
+# A long-lived Claude token (`claude setup-token`) kept by the user below
+# CREDENTIAL_BACKUP_DIR. While it exists, sandboxed Claude runs get it as
+# CLAUDE_CODE_OAUTH_TOKEN and no copy of the interactive login
+# (~/.claude/.credentials.json): a copy refreshed inside the sandbox spends the
+# refresh token the host sessions still hold, and logs one side out.
+CLAUDE_SETUP_TOKEN_REL = "claude/setup-token"
+CLAUDE_SETUP_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+_CLAUDE_SETUP_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~+/=-]{19,4095}")
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
@@ -1349,6 +1357,37 @@ def _credential_backup_path(user_home: str, backup_rel: str) -> Optional[str]:
         _warn(f"makewand 保管的凭据副本目录 {parent} 实际位于 {real_parent}，沙箱可能看得到，不使用这份副本")
         return None
     return path
+
+
+def _claude_setup_token(user_home: str) -> Optional[str]:
+    """
+    The user's long-lived Claude token (CLAUDE_SETUP_TOKEN_REL), or None when
+    none is kept or the run selects another login (CLAUDE_CONFIG_DIR, an API
+    key). A file that exists but cannot be used refuses the launch instead of
+    falling back to a copy of the interactive login.
+    """
+    if any(os.environ.get(name) for name in ("CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_API_KEY")):
+        return None
+    if not os.path.lexists(os.path.join(user_home, CREDENTIAL_BACKUP_DIR, CLAUDE_SETUP_TOKEN_REL)):
+        return None
+    path = _credential_backup_path(user_home, CLAUDE_SETUP_TOKEN_REL)
+    state = _read_host_state(path) if path else None
+    problem = None
+    if state is None:
+        problem = "不是可读取的普通文件，或所在目录沙箱可能看得到"
+    elif state[1] & 0o077:
+        problem = "权限过宽（应为 600）"
+    else:
+        try:
+            token = state[0].decode("ascii").strip()
+        except UnicodeDecodeError:
+            token = ""
+        if _CLAUDE_SETUP_TOKEN.fullmatch(token):
+            return token
+        problem = "内容不是单行令牌"
+    raise SandboxConfigError(
+        f"Claude 专用令牌文件 ~/{CREDENTIAL_BACKUP_DIR}/{CLAUDE_SETUP_TOKEN_REL} {problem}，拒绝启动 (fail closed)；"
+        "请用 claude setup-token 重新生成并以 600 权限保存，或删除该文件以改回使用交互登录")
 
 
 def _mirror_credential_backup(host_p: str, backup: str) -> None:
@@ -1836,6 +1875,7 @@ class _CredentialCopy:
     mode: int = 0o600
     minted: Tuple[str, ...] = ()  # minted keys of this file (_credential_writeback_merge)
     backup: bool = False  # host_path is makewand's backup copy: never followed through a symlink
+    detached: bool = False  # the run uses CLAUDE_SETUP_TOKEN_ENV: nothing copied in, nothing written back
 
 
 ACCOUNT_DIR_VARS = {"codex": "CODEX_HOME", "claude": "CLAUDE_CONFIG_DIR"}
@@ -2062,6 +2102,7 @@ class ProviderHome:
         self.scan_roots: List[str] = []
         self.credentials: List[_CredentialCopy] = []
         self.identity_file: Optional[Tuple[str, str]] = None
+        self.env_token: Optional[str] = None  # _claude_setup_token, passed as CLAUDE_SETUP_TOKEN_ENV
         self._materialized = False
         self._lock = threading.Lock()
         self._private_roots: Dict[str, str] = {}
@@ -2100,11 +2141,15 @@ class ProviderHome:
             if not profile:
                 self._materialized = True
                 return []
+            if self.provider == "claude":
+                self.env_token = _claude_setup_token(self.user_home)
             try:
                 self._build(profile, paths, absent_root_ok)
             except BaseException:
                 self._remove_private_dir()
                 raise
+            if self.env_token:
+                self.bwrap_args = self.bwrap_args + ["--setenv", CLAUDE_SETUP_TOKEN_ENV, self.env_token]
             self._materialized = True
             return list(self.bwrap_args)
 
@@ -2212,7 +2257,8 @@ class ProviderHome:
             self.credentials.append(_CredentialCopy(private_root=priv, rel=rel, host_path=host_p,
                                                     initial_digest=_digest(found[0]) if found else None,
                                                     mode=found[1] if found else 0o600,
-                                                    minted=tuple(minted.get((root_rel, rel), ())), backup=is_backup))
+                                                    minted=tuple(minted.get((root_rel, rel), ())), backup=is_backup,
+                                                    detached=self.env_token is not None))
 
     def _build(self, profile: dict, project_paths: Sequence[str],
                absent_root_ok: Optional[Callable[[str], bool]] = None) -> None:
@@ -2256,6 +2302,12 @@ class ProviderHome:
                     if e_root != root_rel:
                         continue
                     host_p = os.path.join(real, rel)
+                    if kind == "credentials" and self.env_token:
+                        # The private root stays known to execution evidence;
+                        # the interactive login itself never enters the sandbox.
+                        self.credentials.append(_CredentialCopy(
+                            private_root=priv, rel=rel, host_path=host_p, initial_digest=None, detached=True))
+                        continue
                     found = self._copy_in(host_p, priv, rel)
                     if kind == "credentials":
                         host_p, found, is_backup = self._credential_source(
@@ -2378,6 +2430,8 @@ class ProviderHome:
 
     def _write_back_one(self, cred: _CredentialCopy) -> Optional[str]:
         """Merges one changed credential copy into its host file; returns the written host path."""
+        if cred.detached:
+            return None
         if self.provider == "agy" and cred.rel in AGY_SETTINGS_RELS:
             # The sanitized agy settings in the private home are generated by
             # makewand itself (useG1Credits=false): never a user login, never
