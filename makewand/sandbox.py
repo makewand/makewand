@@ -42,7 +42,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Collection, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import atexit
 import contextlib
 import errno
@@ -852,6 +852,8 @@ def _scan_tree(
     unbounded_paths: Iterable[str] = (),
     unscanned_dirs: Optional[Set[str]] = None,
     masked_cache_dirs: Optional[Set[str]] = None,
+    first_dirs: Collection[str] = frozenset(),
+    first_roots: Iterable[str] = (),
 ) -> Tuple[Set[str], Set[str], bool]:
     """
     Iteratively scans roots in breadth-first order without following symlinks.
@@ -863,29 +865,65 @@ def _scan_tree(
     primary workspace directories; any subdirectories not entered due to
     max_depth, entry_limit, timeout_seconds, or OSError are recorded in
     unscanned_dirs.
+
+    The directories in first_dirs (normalized paths) and everything below
+    first_roots are walked before the others and whatever the time: with them,
+    timeout_seconds starts at the first other directory and entry_limit alone
+    stops them. A read-only review names its tracked directories and .git this
+    way, so that what a truncated scan leaves unscanned is untracked content.
     """
     git_paths: Set[str] = set()
     sockets: Set[str] = set()
     skip_abs = {_norm(p) for p in skip_paths}
     priority_abs = [_norm(p) for p in priority_paths if p]
     unbounded_abs = [_norm(p) for p in unbounded_paths if p]
+    first_roots_abs = [_norm(p) for p in first_roots if p]
     seen = 0
     truncated = False   # entry or time budget exhausted: stop walking non-spine subtrees
+    exhausted = False   # entry budget exhausted: stop walking first_dirs and first_roots too
     incomplete = False  # an unreadable/errored directory was encountered
+    budget = timeout_seconds if timeout_seconds is not None and timeout_seconds > 0 else None
+    # With directories to walk first, the time budget starts at the first other directory.
     deadline: Optional[float] = (
-        time.monotonic() + timeout_seconds
-        if timeout_seconds is not None and timeout_seconds > 0
-        else None
+        time.monotonic() + budget if budget is not None and not (first_dirs or first_roots_abs) else None
     )
     dir_hard_limit = max(entry_limit * 10, 1_000_000)
     # (path, depth, inside_git, in_bulk): .git entries below a .git directory are not recorded
     queue = deque((_norm(r), 0, False, False) for r in roots if r)
     bulk_queue: deque = deque()
+    dropped = False  # the queues were cut back when the scan was truncated
+
+    def keeps_walking(path: str) -> bool:
+        """Walked even when the scan is truncated: the way to a priority path, and
+        until the entry limit is reached the directories to walk first."""
+        if any(_norm_is_within(p, path) for p in priority_abs):
+            return True
+        return not exhausted and (
+            path in first_dirs or any(_norm_is_within(path, root) for root in first_roots_abs))
+
+    def drop_queued() -> None:
+        """Once truncated, what is queued and does not keep walking is left unscanned."""
+        nonlocal queue, dropped
+        if dropped:
+            return  # only directories that keep walking were queued since; the loop skips one that no longer does
+        kept: deque = deque()
+        for pending in (queue, bulk_queue):
+            while pending:
+                item = pending.popleft()
+                if keeps_walking(item[0]):
+                    kept.append(item)
+                elif unscanned_dirs is not None:
+                    unscanned_dirs.add(item[0])
+        queue = kept
+        dropped = True
+
     while queue or bulk_queue:
         if seen > 0 and deadline is not None and time.monotonic() >= deadline:
             truncated = True
         cur, depth, in_git, in_bulk = queue.popleft() if queue else bulk_queue.popleft()
-        cur_on_spine = any(_norm_is_within(p, cur) for p in priority_abs)
+        cur_on_spine = keeps_walking(cur)
+        if deadline is None and budget is not None and not cur_on_spine:
+            deadline = time.monotonic() + budget
         if truncated and not cur_on_spine:
             if unscanned_dirs is not None:
                 unscanned_dirs.add(cur)
@@ -914,14 +952,17 @@ def _scan_tree(
                 for entry in it:
                     seen += 1
                     dir_seen += 1
-                    if not truncated and (
-                        seen > entry_limit
-                        or (deadline is not None and (seen & 0x3F) == 0 and time.monotonic() >= deadline)
-                    ):
-                        truncated = True
-                        if not cur_on_spine:
-                            cur_aborted = True
-                            break
+                    if seen > entry_limit and not exhausted:
+                        truncated = exhausted = tripped = True
+                        cur_on_spine = keeps_walking(cur)  # the entry limit stops a directory walked first too
+                    elif (not truncated and deadline is not None and (seen & 0x3F) == 0
+                          and time.monotonic() >= deadline):
+                        truncated = tripped = True
+                    else:
+                        tripped = False
+                    if tripped and not cur_on_spine:
+                        cur_aborted = True
+                        break
                     if dir_seen > dir_hard_limit:
                         incomplete = True
                         cur_failed = True
@@ -980,19 +1021,10 @@ def _scan_tree(
             if unscanned_dirs is not None:
                 unscanned_dirs.add(cur)
             if truncated:
-                kept_spine = deque()
-                for q in (queue, bulk_queue):
-                    while q:
-                        q_path, q_depth, q_git, q_bulk = q.popleft()
-                        if any(_norm_is_within(p, q_path) for p in priority_abs):
-                            kept_spine.append((q_path, q_depth, q_git, q_bulk))
-                        elif unscanned_dirs is not None:
-                            unscanned_dirs.add(q_path)
-                queue = kept_spine
-                bulk_queue.clear()
+                drop_queued()
             continue
         for d_path, d_depth, d_git, d_bulk in cur_dirs:
-            on_spine = any(_norm_is_within(p, d_path) for p in priority_abs)
+            on_spine = keeps_walking(d_path)
             if truncated and not on_spine:
                 if unscanned_dirs is not None:
                     unscanned_dirs.add(d_path)
@@ -1003,16 +1035,7 @@ def _scan_tree(
             else:
                 queue.append((d_path, d_depth, d_git, False))
         if truncated:
-            kept_spine: deque = deque()
-            for q in (queue, bulk_queue):
-                while q:
-                    q_path, q_depth, q_git, q_bulk = q.popleft()
-                    if any(_norm_is_within(p, q_path) for p in priority_abs):
-                        kept_spine.append((q_path, q_depth, q_git, q_bulk))
-                    elif unscanned_dirs is not None:
-                        unscanned_dirs.add(q_path)
-            queue = kept_spine
-            bulk_queue.clear()
+            drop_queued()
     return git_paths, sockets, truncated or incomplete
 
 
@@ -2952,6 +2975,22 @@ def wrap_bwrap(
     scan_timeout = _workspace_scan_timeout(readonly=readonly)
     unscanned_dirs: Set[str] = set()
     masked_cache_dirs: Set[str] = set()
+    # A read-only session walks each checkout's tracked directories and .git first, so that a
+    # scan cut short hides untracked content, not the files and history under review. The
+    # directories come from the index file; no git runs here (see mount_root above).
+    tracked_dirs: Set[str] = set()
+    checkout_git_dirs: List[str] = []
+    indexes_read: List[bool] = []  # per checkout; the warning below speaks for all of them only when all were read
+    if readonly and not broad:
+        from makewand.git_helper import tracked_directories
+        for checkout in dict.fromkeys(p for p in (mount_root, repo_abs if repo_needed else None) if p and p != "/"):
+            if os.path.isdir(os.path.join(checkout, ".git")):
+                checkout_git_dirs.append(os.path.join(checkout, ".git"))
+            names = tracked_directories(checkout)
+            indexes_read.append(names is not None)
+            if names is not None:
+                tracked_dirs.update(checkout + os.sep + name for name in names)
+    index_read = bool(indexes_read) and all(indexes_read)
     git_paths, ws_sockets, truncated = _scan_tree(
         scan_roots,
         max_depth=BROAD_SCAN_DEPTH if broad else None,
@@ -2966,6 +3005,8 @@ def wrap_bwrap(
         unbounded_paths=unbounded_ws,
         unscanned_dirs=unscanned_dirs,
         masked_cache_dirs=masked_cache_dirs,
+        first_dirs=tracked_dirs,
+        first_roots=checkout_git_dirs,
     )
     if not readonly and (truncated or unscanned_dirs):
         raise SandboxConfigError(
@@ -2983,7 +3024,34 @@ def wrap_bwrap(
                 "拒绝只读沙箱 (fail closed)。"
             )
         if truncated:
-            _warn(f"工作区扫描未能完成（条目超过 {scan_limit} 或有不可读目录），未扫描子目录已由 tmpfs 遮蔽（只读会话）")
+            masks = set(workspace_tmpfs_masks)
+            # tracked_dirs holds every directory with its parents, so a mask hides tracked files
+            # exactly when the mask is one of them (a count per mask, whatever the depth of the names).
+            hidden = sum(1 for mask in masks if mask in tracked_dirs)
+            history = any(_norm_is_within(mask, git_dir) or _norm_is_within(git_dir, mask)
+                          for git_dir in checkout_git_dirs for mask in masks)
+            limits = f"条目超过 {scan_limit}" if scan_timeout is None else f"超过 {scan_timeout:g} 秒、条目超过 {scan_limit}"
+            raise_entries = "调高 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT"
+            raise_time = raise_entries if scan_timeout is None else f"调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒），条目超限时{raise_entries}"
+            if hidden or history:
+                lost = ([f"{hidden} 个含受版本管理文件的目录"] if hidden else []) + ([".git 里的内容"] if history else [])
+                # These are walked without a time limit. A mask over one of them that the scan did
+                # walk comes from folding more than MAX_UNSCANNED_DIR_MASKS unscanned directories into
+                # a parent; otherwise the entry limit or an unreadable directory stopped the walk.
+                folded = any(mask not in unscanned_dirs and mask not in masked_cache_dirs
+                             and (mask in tracked_dirs or any(_norm_is_within(mask, git_dir) for git_dir in checkout_git_dirs))
+                             for mask in masks)
+                if folded:
+                    why = f"未扫描的目录多于 {MAX_UNSCANNED_DIR_MASKS} 个，合并成上级目录遮蔽时把它们一并遮住了；要看到它们，{raise_time}，让更多目录被扫到"
+                else:
+                    why = f"这部分不计时，要看到它们，{raise_entries}或恢复目录的读取权限"
+                what = f"被遮住的包括{'和'.join(lost)}，在沙箱里读不到；{why}。"
+            elif index_read:
+                what = f"受版本管理的目录和 .git 已先扫完，被遮住的都是未纳入版本管理的内容。要全部可见，{raise_time}。"
+            else:
+                what = f"没有读到完整的 git 索引，不能保证受版本管理的目录先扫完，被遮住的可能包含源文件。要全部可见，{raise_time}。"
+            _warn(f"工作区扫描未能完成（{limits}，或有不可读目录）：{len(masks)} 个未扫描的目录已由 tmpfs 遮蔽，"
+                  f"在只读会话里显示为空。{what}")
     else:
         collapsed_cache = _collapse_unscanned_dirs(masked_cache_dirs, protected_ws)
         if collapsed_cache is None:

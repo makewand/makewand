@@ -381,7 +381,7 @@ class TestCatalogIsMirrorableData(unittest.TestCase):
     """router/cli.go mirrors CLI_MESSAGE_CATALOG, so every pattern must be RE2 syntax."""
 
     def test_patterns_are_re2_compatible_and_compile(self):
-        kinds = {"quota", "rate", "overload", "auth", "region"}
+        kinds = {"quota", "rate", "overload", "auth", "region", "model"}
         for provider, table in health.CLI_MESSAGE_CATALOG.items():
             self.assertIn(provider, health.CLI_OWN_STREAMS)
             for kind, patterns in table.items():

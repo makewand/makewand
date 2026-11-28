@@ -406,7 +406,7 @@ class TestCatalogIsOneMirrorableDataFile(unittest.TestCase):
                 self.assertEqual("transcript" in entry["selection"].values(), "transcript" in entry)
                 self.assertIn(entry.get("json_reports", False), (True, False))
                 for kind in entry["kinds"]:
-                    self.assertIn(kind.replace(".marked", ""), {"quota", "rate", "overload", "auth", "region"})
+                    self.assertIn(kind.replace(".marked", ""), {"quota", "rate", "overload", "auth", "region", "model"})
         # Only codex exec writes a transcript (its rules are read by health._transcript_rules).
         self.assertEqual([p for p, entry in providers.items() if "transcript" in entry], ["codex"])
 
