@@ -420,6 +420,24 @@ def official_quota_reason(provider, model=None, *, quota=None, policy=None):
     return None
 
 
+def recorded_limit_only(provider, info):
+    """Whether a cached "limited" verdict is only the record of an earlier refusal.
+
+    True when no current official usage reading confirms it. Automatic engine
+    selection then keeps the engine and ranks it after the others, as route
+    does for a stored refusal (stored_refusal_reason); the launch prints the
+    reminder and the provider's own answer decides. False for any other
+    status, and when the reading a launch checks (official_quota_reason)
+    shows the account used up: that launch would be refused anyway.
+    """
+    if not isinstance(info, dict) or info.get("status") != "limited":
+        return False
+    try:
+        return official_quota_reason(provider) is None
+    except Exception:  # noqa: BLE001 - unreadable evidence confirms nothing
+        return True
+
+
 def remind(provider, text):
     """One stderr line for a reminder that does not stop the dispatch."""
     import sys

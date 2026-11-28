@@ -284,6 +284,9 @@ def cmd_route(args) -> None:
         except ValueError as error:
             _fail(f"错误：--self {error}")
     simple = bool(getattr(args, "simple", False))
+    rereview = bool(getattr(args, "rereview", False))
+    if rereview and task_type != "review":
+        _fail("错误：--rereview 只用于 route review（复审轮）")
     review_policy = None
     author = getattr(args, "review_author", None)
     excludes = getattr(args, "exclude_review_family", [])
@@ -322,6 +325,7 @@ def cmd_route(args) -> None:
         request_id=request_id,
         retry_approved=retry_approved,
         status_reader=load_status_cache,
+        rereview=rereview,
     )
     try:
         try:
@@ -440,6 +444,8 @@ def cmd_route(args) -> None:
             escalate_cmd += f" --self {self_tool}"
         if not_tool and str(not_tool).strip():
             escalate_cmd += f" --not {str(not_tool).strip()}"
+        if rereview:
+            escalate_cmd += " --rereview"
         if simple:
             escalate_cmd += " --simple"
         elif bool(getattr(args, "legacy", False)):

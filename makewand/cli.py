@@ -1124,6 +1124,7 @@ def _main():
     p_route.add_argument("--tier", dest="route_tier", type=int, default=None, metavar="N", help="直接指定档位（1, 2, 3），覆盖按难度推算的起始档")
     p_route.add_argument("--self", dest="self_tool", default=None, metavar="T", help="你自己是哪家工具（codex, claude, agy, grok, muse），同家候选排最后（含 agy 代理的同家族模型）")
     p_route.add_argument("--not", dest="not_tool", default=None, metavar="T", help="排除与该工具同家族的候选（含 agy 代理的同家族模型，如 claude-*、gpt-oss）")
+    p_route.add_argument("--rereview", action="store_true", default=False, help="复审轮（第 2、3 轮，只核对上一轮的问题）：本机任何一家都可列入，包括首轮审查不派的 Grok")
     p_route.add_argument("--simple", action="store_true", default=False, help="只用精简三档表，不展开全部模型和推理深度")
     p_route.add_argument("--legacy", action="store_true", default=False, help="完整目录里把旧版本模型也纳入排序（与 --simple 一起用时无效）")
     p_route.add_argument("--json", action="store_true", default=False, help="输出机器可读的 JSON 结果")
@@ -1340,6 +1341,9 @@ def _main():
                     raise ValueError("高风险审查需要 subscription_only，关闭 Makewand 的 API 接力")
                 discovered = discover_model_efforts(strict_catalogs=True)
                 effort = validate_review_dispatch(policy, args.subcommand, args.model, args.effort, discovered)
+                if args.subcommand != "agy" and args.effort and effort != args.effort:
+                    print(f"[Makewand] 提醒（不拦截）：{args.subcommand} 的 {args.model} 不提供推理档 {args.effort}，"
+                          f"本次按 {effort} 执行", file=sys.stderr)
                 reminder = review_currency_reminder(args.subcommand, args.model, effort, discovered)
                 if reminder:
                     print(f"[Makewand] 提醒（不拦截）：{reminder}", file=sys.stderr)

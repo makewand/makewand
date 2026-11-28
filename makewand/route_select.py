@@ -5,7 +5,7 @@
 
 不可用的原因按这个顺序取第一条：
 
-- 这类任务不派给这一家（``TASK_TYPE_SKIPS``：审查不派 grok）；
+- 这类任务不派给这一家（``TASK_TYPE_SKIPS``：审查不派 grok；``rereview=True`` 的复审轮不适用）；
 - policy 的 PAUSED 里还没到期的；
 - 账本里还没过期的额度标记；
 - 当前账号/模型的有效拒绝记录、官方周额度策略及各额度窗口保护阈值；
@@ -289,6 +289,7 @@ def select(
     retry_approved: bool = False,
     status_reader=None,
     review_policy=None,
+    rereview: bool = False,
 ) -> RouteResult:
     """选择这一档要派的候选。
 
@@ -296,6 +297,9 @@ def select(
     各调用一次。``rng`` 用 ``random.Random(seed)`` 时排序可以复现。
 
     ``full=True`` 在完整目录里选，并用候选级账本统计做 Thompson 采样。
+
+    ``rereview=True`` 是复审轮（只核对上一轮问题的第 2、3 轮审查）：
+    ``TASK_TYPE_SKIPS`` 不生效，本机任何一家都可以列入（站主 2026-11-27 定）。
     """
     if policy is None:
         policy = load_policy()
@@ -331,7 +335,7 @@ def select(
     blocks = ledger.request_blocks(request_id, now=moment) if request_id and not retry_approved else {}
     request_blocks = {provider: reason for provider, (_, reason) in blocks.items()}
 
-    task_skips = TASK_TYPE_SKIPS.get(task_type, {})
+    task_skips = {} if rereview else TASK_TYPE_SKIPS.get(task_type, {})
     blocked_early = []
     for row in rows:
         if (row.provider in task_skips or _pause_reason(policy, row.provider, moment)
@@ -427,6 +431,10 @@ def select(
             partial_note = bool(clean_models.get(provider)) or len(notes) > 1
             reminders.append((provider, "部分模型（" + ", ".join(named) + "）：" + text
                               if partial_note and named else text))
+    # A reason recorded for one combination must not read as if the whole provider were
+    # skipped while its other combinations are offered: those get "部分型号：" in front.
+    # (A model-family skip already names its models.)
+    some_only = {provider for provider, reason in skipped if reason} & {row.provider for _index, row, _note in available}
     # 按 provider 计的原因同一家所有组合都一样；按模型家族跳过的列出具体模型。
     skipped = [
         (provider, reason or _model_family_reason(family_models[provider], not_tool))
@@ -435,7 +443,9 @@ def select(
     # A provider whose other models are only filtered out here (family, tier) is still not out of quota.
     partial = set(open_models) & set(quota_models)
     skipped = [(provider, "部分模型受限（" + ", ".join(sorted(quota_models[provider])) + "）：" + reason
-                if provider in partial and reason else reason) for provider, reason in skipped]
+                if provider in partial and reason
+                else "部分型号：" + reason if provider in some_only else reason)
+               for provider, reason in skipped]
 
     # 一次读出账本快照批量算统计，避免每个候选都全量读 outcomes.jsonl。
     batch_requests = [

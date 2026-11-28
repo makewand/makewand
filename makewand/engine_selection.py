@@ -122,6 +122,12 @@ def _engine_usable(engine: str, cache: Optional[Dict[str, Any]], require_healthy
     if require_healthy and status != "healthy":
         return False, f"健康状态为 {status or 'unknown'}"
     if status in _UNUSABLE_ENGINE_STATUSES and not _failure_verdict_expired(info):
+        from makewand.model_quota import recorded_limit_only
+        if recorded_limit_only(engine, info):
+            # A record of an earlier refusal reminds, it does not exclude (owner, 2026-11-27).
+            # select_optimal_engine_pair still scores such an engine out of its recommendation
+            # and reaches it through its fallbacks, after every engine that scores.
+            return True, ""
         reason = str(info.get("reason") or "").strip()
         if status == "needs_auth":
             from makewand.health import get_reauth_hint

@@ -1207,6 +1207,39 @@ class RoutingCliTests(unittest.TestCase):
         self.assertEqual(routed.returncode, 0, routed.stderr)
         self.assertIn("子任务：implement / mechanical", routed.stdout)
 
+    def test_high_risk_dispatch_translates_the_effort_instead_of_refusing_it(self):
+        common = ("--readonly", "--risk", "high", "--review-author", "codex", "fixture")
+        translated = self.run_cli("claude", "--model", "claude-fable-5-2", "--effort", "ultra", *common)
+        self.assertNotEqual(translated.returncode, 2, translated.stderr)
+        self.assertIn("提醒（不拦截）：claude 的 claude-fable-5-2 不提供推理档 ultra，本次按 max 执行", translated.stderr)
+        self.assertNotIn("型号或推理档已变化", translated.stderr)
+        same = self.run_cli("claude", "--model", "claude-fable-5-2", "--effort", "max", *common)
+        self.assertNotIn("不提供推理档", same.stderr)
+        no_model = self.run_cli("claude", "--effort", "high", *common)
+        self.assertEqual(no_model.returncode, 2, no_model.stderr)
+        self.assertIn("需要用 --model 指定精确型号", no_model.stderr)
+
+    def test_rereview_lists_grok_and_carries_the_option(self):
+        # First reviews leave Grok out (owner, 2026-11-06); re-review rounds may use any model (2026-11-27).
+        first = self.route_json("review", "normal", quota={})
+        self.assertNotIn("grok", {item["provider"] for item in first["candidates"]})
+        self.assertIn({"provider": "grok", "reason": "不派审查：11-04 修好后仍有约一半审查没给出结论"}, first["skipped"])
+        again = self.route_json("review", "normal", "--rereview", quota={})
+        grok = [item for item in again["candidates"] if item["provider"] == "grok"]
+        self.assertTrue(grok)
+        self.assertIn("--readonly", grok[0]["command"])
+        self.assertNotIn("grok", {item["provider"] for item in again["skipped"]})
+        text = self.run_cli("route", "review", "normal", "--rereview", "--tier", "2", quota={})
+        self.assertEqual(text.returncode, 0, text.stderr)
+        hint = next(line for line in text.stdout.splitlines() if line.startswith("验收不过就升一档："))
+        self.assertIn("--rereview", hint.split())
+        # The high-risk rule keeps excluding Grok whatever the round.
+        strict = self.route_json("review", "hard", "--risk", "high", "--not", "codex", "--rereview", quota={})
+        self.assertNotIn("grok", {item["provider"] for item in strict["candidates"]})
+        wrong = self.run_cli("route", "implement", "normal", "--rereview", quota={})
+        self.assertEqual(wrong.returncode, 2, wrong.stderr)
+        self.assertIn("--rereview 只用于 route review", wrong.stderr)
+
     def write_discovery_cache(self):
         """把只有这次测试才有的模型写进 discovery 会读的本地缓存。"""
         codex = self.home / ".codex" / "models_cache.json"

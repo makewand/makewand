@@ -135,6 +135,18 @@ def review_models(discovered):
 
 
 def validate_review_dispatch(policy, provider, model, effort, discovered):
+    """The effort this high-risk review launches with, or ValueError saying what to change.
+
+    Other providers' adapters translate the requested effort into what their
+    CLI accepts (Claude runs "ultra" as "max", Codex clamps to the levels the
+    model lists). The translated value is returned, so the launch check
+    compares like with like instead of refusing a "changed" effort. A high
+    effort that would launch below the high efforts is refused here, as the
+    launch check refused it before, with the reason.
+    """
+    if not model and provider != "grok":
+        # Without it the adapter picks a default model and the family check below cannot name one.
+        raise ValueError("高风险审查需要用 --model 指定精确型号（route review hard --risk high 给出的命令里带型号）")
     if provider == "agy":
         suffix = _split_agy_suffix(model or "")[1]
         # AGY carries its effective effort in the model ID.
@@ -147,6 +159,13 @@ def validate_review_dispatch(policy, provider, model, effort, discovered):
     if not effort:
         # Without it the adapter picks a default and the launch check would refuse a "changed" effort.
         raise ValueError("高风险审查需要明确的推理档：用 --effort 指定（AGY 用带推理档后缀的模型 ID，如 gemini-4-argon-high）")
+    if provider != "agy":
+        from makewand.discovery import normalize_provider_effort
+        launched = normalize_provider_effort(provider, effort, model=model) or effort
+        if effort in HIGH_EFFORTS and launched not in HIGH_EFFORTS:
+            raise ValueError(f"{provider} 的 {model} 最高只提供推理档 {launched}，达不到所要求的 {effort}；"
+                             "高风险审查请换一个有高推理档的型号")
+        effort = launched
     return effort
 
 

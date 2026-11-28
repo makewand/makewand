@@ -60,7 +60,14 @@ class TestDynamicQuotaPacing(unittest.TestCase):
         self.assertIsNone(p_loc["quota_percentage"])
 
     def test_limited_provider_pacing(self):
-        p_ltd = calculate_dynamic_pacing("claude", {"status": "limited", "reason": "limit reached", "resets_at": "tomorrow"})
+        info = {"status": "limited", "reason": "limit reached", "resets_at": "tomorrow"}
+        # A stored refusal is a record: neutral pacing, the engine is not excluded (owner, 2026-11-27).
+        p_record = calculate_dynamic_pacing("claude", info)
+        self.assertEqual(p_record["pacing_state"], PACING_BALANCED)
+        self.assertEqual((p_record["routing_boost"], p_record["signal"]), (0.0, "record"))
+        # The official reading a launch checks still excludes.
+        with patch("makewand.model_quota.official_quota_reason", return_value="周额度已用 100%，达到阈值 100%"):
+            p_ltd = calculate_dynamic_pacing("claude", info)
         self.assertEqual(p_ltd["pacing_state"], PACING_LIMITED)
         self.assertIsNone(p_ltd["quota_percentage"])
         self.assertEqual(p_ltd["routing_boost"], -999.0)
