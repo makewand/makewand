@@ -81,6 +81,17 @@ class ScopeOptionsTests(unittest.TestCase):
         self.assertIn("MemoryMax=8G", prefix)
         self.assertTrue(any(arg.startswith("--unit=makewand-sandbox-") for arg in prefix))
 
+    def test_a_hung_probe_is_not_waited_for_twice(self):
+        calls = []
+
+        def run(args, **_kwargs):
+            calls.append(args)
+            raise subprocess.TimeoutExpired(args, 10)
+
+        with patch("subprocess.run", side_effect=run):
+            self.assertFalse(sandbox._systemd_scope_usable("/usr/bin/systemd-run"))
+        self.assertEqual(1, len(calls))
+
     def test_no_usable_scope_falls_back_as_before(self):
         usable, calls = self.probe(accepts_oom_policy=True, works=False)
         self.assertFalse(usable)
@@ -141,6 +152,19 @@ class JournalLookupTests(unittest.TestCase):
             self.assertIsNone(found, cmd)
             self.assertEqual([], calls, cmd)
 
+    def test_an_unreadable_journal_is_asked_once(self):
+        calls = []
+
+        def run(args, **_kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=1, stdout=b"")
+
+        with patch("makewand.sandbox._trusted_system_binary", side_effect=binaries("journalctl")), \
+                patch("subprocess.run", side_effect=run), patch("makewand.sandbox.time.sleep") as sleep:
+            self.assertIsNone(sandbox.sandbox_scope_memory_kill(self.CMD, attempts=3))
+        self.assertEqual(1, len(calls))
+        sleep.assert_not_called()
+
     def test_without_journalctl_or_with_a_broken_journal_it_is_none(self):
         self.assertEqual((None, []), self.lookup([[KERNEL]], journalctl=False))
         with patch("makewand.sandbox._trusted_system_binary", side_effect=binaries("journalctl")), \
@@ -149,6 +173,65 @@ class JournalLookupTests(unittest.TestCase):
         with patch("makewand.sandbox._trusted_system_binary", side_effect=binaries("journalctl")), \
                 patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=b"not json\n[1]\n\"x\"\n")):
             self.assertIsNone(sandbox.sandbox_scope_memory_kill(self.CMD))
+
+
+class PreflightScopeTests(unittest.TestCase):
+    """The socket probe and the launch after it must not ask for the same scope name: the probe's
+    scope may still be unloading when the launch starts ("Unit ... already exists")."""
+
+    def test_the_probe_runs_in_a_scope_of_its_own(self):
+        provider = ["agy", "-p", "review"]
+        unit = "--unit=makewand-sandbox-0123456789abcdef"
+        command = ["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", unit,
+                   "-p", "OOMPolicy=continue", "-p", "MemoryMax=8G", "--",
+                   "/usr/bin/bwrap", "--ro-bind", "/", "/", "--", *provider]
+        seen = []
+
+        def run(cmd, **_kwargs):
+            seen.append(list(cmd))
+            return 0, "", "", None
+
+        with patch("makewand.sandbox.run_subprocess", side_effect=run):
+            sandbox._provider_socket_preflight(command, provider, cwd="/tmp", allow_network=True)
+        self.assertEqual(1, len(seen))
+        probe = seen[0]
+        units = [arg for arg in probe if arg.startswith("--unit=")]
+        self.assertEqual(1, len(units))
+        self.assertRegex(units[0], r"^--unit=makewand-sandbox-[0-9a-f]{16}$")
+        self.assertNotEqual(unit, units[0])
+        # Everything else before the provider command is the launch's own prefix.
+        prefix = command[:-len(provider)]
+        self.assertEqual([arg for arg in prefix if arg != unit], [arg for arg in probe[:len(prefix)] if arg != units[0]])
+        self.assertIn(unit, command)  # the launch keeps its name
+
+    def test_a_launch_through_the_real_prefix_and_its_probe_use_two_names(self):
+        saved = dict(sandbox._limits_probe)
+        self.addCleanup(lambda: (sandbox._limits_probe.clear(), sandbox._limits_probe.update(saved)))
+        sandbox._limits_probe.update(systemd=True, oom_policy=True)
+        seen = []
+
+        def run(cmd, **_kwargs):
+            seen.append(list(cmd))
+            return 0, "", "", None
+
+        import contextlib
+
+        def fake_bwrap(cmd, **kwargs):
+            fd = kwargs.get("seccomp_fd")
+            return ["/usr/bin/bwrap", *(["--seccomp", str(fd)] if fd is not None else []), "--", *cmd]
+
+        with patch("makewand.sandbox._trusted_system_binary", side_effect=binaries("systemd-run", "python3")), \
+                patch("makewand.sandbox.seccomp_filter_context", side_effect=lambda **_k: contextlib.nullcontext((97, ()))), \
+                patch("makewand.sandbox.wrap_bwrap", side_effect=fake_bwrap), \
+                patch("makewand.sandbox.is_bwrap_available", return_value=True), \
+                patch("makewand.sandbox.run_subprocess", side_effect=run):
+            with sandbox.provider_sandbox_launch("codex", ["codex", "exec", "x"], "/tmp", readonly=True) as launch:
+                launched = list(launch.cmd)
+        names = lambda cmd: [arg for arg in cmd if str(arg).startswith("--unit=makewand-sandbox-")]
+        self.assertEqual(1, len(names(launched)))
+        self.assertTrue(seen, "the socket probe ran")
+        self.assertEqual(1, len(names(seen[0])))
+        self.assertNotEqual(names(launched), names(seen[0]))
 
 
 class RunnerTests(unittest.TestCase):
@@ -222,6 +305,59 @@ class FailureMessageTests(unittest.TestCase):
             result = base.model_process_failure("agy", -15, "", "provider says\n", error, readonly=True)
         self.assertEqual("provider says\n", result[2])
         plain.assert_called_once()
+
+
+class KilledProviderTests(unittest.TestCase):
+    """A provider killed with its scope's memory kill on record is not reclassified from an older
+    stderr line; a run that went on after a child was killed is classified as usual."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        root = tempfile.TemporaryDirectory(prefix="mw-killed-")
+        self.addCleanup(root.cleanup)
+        self.root = Path(root.name)
+        from makewand import health
+        cache = patch.object(health, "STATUS_CACHE_FILE", self.root / "status.json")
+        cache.start()
+        self.addCleanup(cache.stop)
+
+    def dispatch(self, code, stderr):
+        import contextlib
+        import io
+        from makewand.providers import muse
+        note = base.ProcessExecutionError("沙箱达到内存上限（MemoryMax=8G），内核杀掉了沙箱里的进程", "UNKNOWN")
+        note.memory_kill = "kernel"
+        with patch("makewand.config.has_subscription_configured", return_value=True), \
+                patch("makewand.config.has_api_configured", return_value=False), \
+                patch("makewand.sandbox.is_bwrap_available", return_value=False), \
+                patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+                patch("makewand.sandbox.audit_unsafe_host_exec"), \
+                patch("makewand.providers.muse.detect_muse_guard", return_value=(False, None)), \
+                patch.object(muse, "run_subprocess", return_value=(code, "", base.CapturedStderr(stderr), note)), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = muse.execute_muse_task("review", cwd=str(self.root), model="muse-wonder-1.0", readonly=True)
+        from makewand import health
+        return result, health.load_status_cache().get("muse", {}).get("quota_limits") or []
+
+    def test_a_killed_provider_with_a_recovered_retry_line_stays_unknown(self):
+        result, rows = self.dispatch(137, "rate limited (HTTP 429 · attempt 1)\n")
+        self.assertEqual("UNKNOWN", result.status)
+        self.assertTrue(result[2].startswith("沙箱达到内存上限"))
+        self.assertEqual([], rows)
+
+    def test_a_run_that_ended_with_its_own_refusal_is_classified_as_usual(self):
+        result, rows = self.dispatch(1, "rate limited (HTTP 429 · attempt 1)\n")
+        self.assertFalse(result[0])
+        self.assertEqual(1, len(rows))
+
+    def test_the_muse_slice_names_its_own_setting(self):
+        cmd = ["/usr/bin/systemd-run", "--user", "--scope", "--slice=muse", "--unit=makewand-sandbox-0123456789abcdef",
+               "-p", "MemoryMax=16G", "--", "bwrap"]
+        with patch("makewand.sandbox.sandbox_scope_memory_kill", return_value=("kernel", "16G")):
+            noted = base._with_memory_kill(base.ProcessExecutionError("x", "UNKNOWN"), cmd, -9)
+        self.assertIn("MUSE_MEM", noted)
+        self.assertNotIn("MAKEWAND_SANDBOX_MEMORY_MAX", noted)
 
 
 class MuseScopeTests(unittest.TestCase):

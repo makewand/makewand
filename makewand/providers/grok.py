@@ -8,7 +8,7 @@ import re
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_YELLOW
 from makewand.execution_contract import ExecutionResult
-from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart, killed_for_memory
 
 
 def parse_grok_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
@@ -281,7 +281,7 @@ def execute_grok_task(
                 status="FAILED", engine="grok", readonly=readonly, outcome_known=True, error_kind="incomplete_turn")
         return True, text, None
 
-    if is_process_timeout(ex) or code < 0:
+    if is_process_timeout(ex) or code < 0 or killed_for_memory(code, ex):
         return model_process_failure("grok", code, combined, err, ex, readonly)
 
     if apart and _MAX_TURNS_ERROR.search(err or ""):

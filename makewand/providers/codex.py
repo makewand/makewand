@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_CYAN
-from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart, killed_for_memory
 
 _CODEX_WEEKLY_HINT_RE = re.compile(r"weekly\s*limit", re.IGNORECASE)
 
@@ -232,7 +232,7 @@ def execute_codex_task(
                 out = "\n".join(messages)
         return True, out, None
 
-    if is_process_timeout(ex) or code < 0:
+    if is_process_timeout(ex) or code < 0 or killed_for_memory(code, ex):
         return model_process_failure("codex", code, combined, err, ex, readonly)
 
     is_limited, reason, resets = parse_codex_quota(out, err if apart else None, prompt=prompt, allow_reserve=False)

@@ -3780,13 +3780,18 @@ def _systemd_scope_usable(systemd_run: str) -> bool:
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
             )
         except Exception:
-            continue
+            break  # a hung bus or a launch error is not about the policy: no second wait
         if res.returncode == 0:
             ok = True
             _limits_probe["oom_policy"] = bool(oom_policy)
             break
     _limits_probe["systemd"] = ok
     return ok
+
+
+def _fresh_scope_name() -> str:
+    import secrets
+    return f"{SANDBOX_SCOPE_PREFIX}{secrets.token_hex(8)}"
 
 
 def sandbox_scope_options() -> List[str]:
@@ -3796,8 +3801,7 @@ def sandbox_scope_options() -> List[str]:
     used up the memory took the reviewer down with it (2026-11-28 21:29, after 17 minutes). With
     continue the kernel still kills the largest process and the memory cap holds; the others go
     on and see that process killed, as with any memory-limited command on this host."""
-    import secrets
-    options = [f"--unit={SANDBOX_SCOPE_PREFIX}{secrets.token_hex(8)}"]
+    options = [f"--unit={_fresh_scope_name()}"]
     if _limits_probe.get("oom_policy"):
         options += ["-p", "OOMPolicy=continue"]
     return options
@@ -3840,6 +3844,8 @@ def sandbox_scope_memory_kill(cmd, attempts: int = 1) -> Optional[Tuple[str, str
             )
         except Exception:
             return None
+        if res.returncode != 0:
+            return None  # no readable user journal: asking again finds nothing either
         for line in res.stdout.splitlines()[:200]:
             try:
                 kind = SCOPE_MEMORY_KILL_MESSAGE_IDS.get(json.loads(line).get("MESSAGE_ID"))
@@ -3960,6 +3966,11 @@ def _provider_socket_preflight(command, provider_command, *, cwd, allow_network,
         except SandboxConfigError as error:
             raise ProviderStartupError(f"启动环境检查失败：无法准备 socket 探针的 seccomp 隔离 ({error})") from error
         prefix = list(command[:-len(provider_command)])
+        # The probe gets a scope of its own: the launch that follows starts the scope named in
+        # `command`, and a probe scope of that name may still be unloading then ("already exists").
+        prefix = [f"--unit={_fresh_scope_name()}"
+                  if isinstance(arg, str) and arg.startswith("--unit=") and _SANDBOX_SCOPE_RE.fullmatch(arg[len("--unit="):])
+                  else arg for arg in prefix]
         if seccomp_fd is not None:
             try:
                 index = prefix.index("--seccomp")

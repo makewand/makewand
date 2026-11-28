@@ -130,6 +130,14 @@ def model_process_failure(engine, code, output, stderr=None, exception=None, rea
         readonly=readonly, outcome_known=status == "FAILED",
         error_kind="deadline" if status == "TIMEOUT" else "process_start" if status == "FAILED" else "process_exit")
 
+def killed_for_memory(code, error):
+    """Whether the provider process itself was killed and its sandbox scope recorded a memory
+    kill. Its stderr may still hold a line from a recovered retry ("rate limited ... attempt 1"):
+    such a run is not read as a refusal. A run that went on after a child was killed and ended
+    with its own exit code is classified as usual."""
+    return bool(getattr(error, "memory_kill", None)) and (code < 0 or code in (128 + signal.SIGKILL, 128 + signal.SIGTERM))
+
+
 def _with_memory_kill(error, cmd, ret):
     """The runner's error for a nonzero exit, saying so when the sandbox scope the command ran
     in recorded a memory kill (sandbox.sandbox_scope_memory_kill). The outcome stays what it was:
@@ -144,8 +152,9 @@ def _with_memory_kill(error, cmd, ret):
         return error
     kind, memory = found
     if kind == "kernel":
+        setting = "MUSE_MEM" if "--slice=muse" in cmd else "MAKEWAND_SANDBOX_MEMORY_MAX"
         text = (f"沙箱达到内存上限（MemoryMax={memory}），内核杀掉了沙箱里的进程（systemd 日志有记录）；"
-                f"进程以退出码 {ret} 结束，模型是否已经运行不确定。要给沙箱更多内存，设 MAKEWAND_SANDBOX_MEMORY_MAX。")
+                f"进程以退出码 {ret} 结束，模型是否已经运行不确定。要给沙箱更多内存，设 {setting}。")
     else:
         text = (f"主机内存紧张，systemd-oomd 杀掉了沙箱里的进程（systemd 日志有记录）；"
                 f"进程以退出码 {ret} 结束，模型是否已经运行不确定。")

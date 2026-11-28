@@ -7,7 +7,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Tuple, Optional
 from makewand.config import c, COLOR_BLUE
-from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart, killed_for_memory
 
 # Built-in tools available to read-only Claude tasks (review / analysis).
 CLAUDE_READONLY_TOOLS = "Read,Grep,Glob"
@@ -200,7 +200,7 @@ def execute_claude_task(
     if code == 0:
         return True, out, None
 
-    if is_process_timeout(ex) or code < 0:
+    if is_process_timeout(ex) or code < 0 or killed_for_memory(code, ex):
         return model_process_failure("claude", code, combined, err, ex, readonly)
 
     is_limited, reason, resets = parse_claude_quota(out, err if apart else None)

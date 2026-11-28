@@ -6,7 +6,7 @@ import os
 import re
 from typing import Tuple, Optional, List
 from makewand.config import c, COLOR_PURPLE
-from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart, killed_for_memory
 
 def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """Login prompts and limit refusals Muse Code prints itself
@@ -379,7 +379,7 @@ def execute_muse_task(
     if code == 0:
         return True, out, None
 
-    if is_process_timeout(ex) or code < 0:
+    if is_process_timeout(ex) or code < 0 or killed_for_memory(code, ex):
         return model_process_failure("muse", code, combined, err, ex, readonly)
 
     is_limited, reason, resets = parse_muse_quota(out, err if apart else None)
