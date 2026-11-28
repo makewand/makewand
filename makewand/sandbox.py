@@ -806,12 +806,15 @@ def _fold_untracked_branches(
     Folds unscanned directories (none above another) into the directory where
     they branch apart, deepest branch first, until at most max_masks are left or
     nothing more can be folded. A branch is folded only where two or more masks
-    become one, and only into a directory that is not in keep, not at or below
-    keep_roots and holds no protected path: the directories with tracked files
-    and .git stay visible. One sorted pass builds the tree of branch points and
-    one pass folds it, so the cost does not grow with the depth of the paths.
+    become one, and only into a directory that is not in keep, neither holds
+    nor lies in a keep_roots entry and holds no protected path: the directories
+    with tracked files and .git stay visible. keep must name every kept
+    directory together with its parents (a set, as wrap_bwrap builds it): a
+    directory above a kept one is recognized by being in keep itself. One
+    sorted pass builds the tree of branch points and one pass folds it, so the
+    cost does not grow with the depth of the paths.
     """
-    if not entries or any(not path.startswith("/") or path.startswith("//") for path in entries):
+    if not entries or any(path == "/" or not path.startswith("/") or path.startswith("//") for path in entries):
         return set(entries)
     # below[d]: the entries and branch points directly under branch point d (a compressed tree).
     below: Dict[str, List[str]] = {}
@@ -839,7 +842,7 @@ def _fold_untracked_branches(
         # branch point came earlier: `left` is what is under this one now, at least two masks.
         left = sum(masks.get(child, 1) for child in below[node])
         if (node not in keep
-                and not any(_norm_is_within(node, root) for root in keep_roots)
+                and not any(_norm_is_within(node, root) or _norm_is_within(root, node) for root in keep_roots)
                 and not any(_norm_is_within(path, node) for path in protected)):
             count -= left - 1
             folded.add(node)
@@ -880,7 +883,7 @@ def _collapse_unscanned_dirs(
         return None
     kept = _dedup_norm_ancestors(normed)
     if len(kept) > max_masks and (keep or keep_roots):
-        kept = _fold_untracked_branches(kept, prot, keep, keep_roots, max_masks)
+        kept = _fold_untracked_branches(kept, prot, keep, [_norm(p) for p in keep_roots if p], max_masks)
     while len(kept) > max_masks:
         by_parent: Dict[str, List[str]] = {}
         for d in kept:

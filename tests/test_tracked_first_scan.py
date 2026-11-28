@@ -408,6 +408,15 @@ class FoldBranchesTests(unittest.TestCase):
         many = {f"/w/.git/objects/{n:02x}" for n in range(8)} | {f"/w/junk/d{n}" for n in range(8)}
         self.assertEqual(sorted({f"/w/.git/objects/{n:02x}" for n in range(8)} | {"/w/junk"}),
                          self.fold(many, max_masks=9))
+        self.assertEqual(self.fold(many, max_masks=9), self.fold(many, max_masks=9, roots=["/w/.git/"]))
+        # A kept root below an unprotected directory: that directory is not folded over it either.
+        nested = {"/w/sub/.git/objects/00", "/w/sub/untracked", "/w/junk/a", "/w/junk/b"}
+        self.assertEqual(["/w/junk", "/w/sub/.git/objects/00", "/w/sub/untracked"],
+                         self.fold(nested, max_masks=3, roots=["/w/sub/.git"]))
+
+    def test_the_root_is_never_an_entry_of_the_fold(self):
+        self.assertEqual({"/"}, sandbox._fold_untracked_branches({"/"}, [], frozenset(), [], 0))
+        self.assertEqual({"/", "/x"}, sandbox._fold_untracked_branches({"/", "/x"}, [], frozenset(), [], 0))
 
     def test_a_tracked_parent_is_folded_when_nothing_else_is_left(self):
         unscanned = {f"/w/src/cache{n}" for n in range(6)} | {"/w/lib/tmp"}
@@ -434,20 +443,25 @@ class FoldBranchesTests(unittest.TestCase):
         mask into one, and stops only when it fits or no branch is left to fold."""
         import random
         rng = random.Random(147)
-        names = "abcde"
+        # Names with characters that sort before and after the separator ("-", "." < "/" < "0", "a").
+        names = ("a", "b", "c", "a-", "a.", "-b", ".c", "a0", "ab")
         for case in range(400):
             def path(top):
                 return top + "/" + "/".join(rng.choice(names) for _ in range(rng.randint(1, 7)))
+            also_protected = path("/w")  # a second protected path somewhere inside the first
             entries = {path("/w") for _ in range(rng.randint(2, 60))} | {path("/w/.git") for _ in range(rng.randint(0, 4))}
-            entries = sandbox._dedup_norm_ancestors(entries)
+            entries = {entry for entry in sandbox._dedup_norm_ancestors(entries) if not within(also_protected, entry)}
+            if len(entries) < 2:
+                continue
             keep = parents_of(*[path("/w") for _ in range(rng.randint(0, 8))])
             limit = rng.randint(1, max(1, len(entries) - 1))
-            got = sandbox._fold_untracked_branches(set(entries), ["/w"], keep, self.GIT, limit)
-            label = (case, sorted(entries), sorted(keep), limit)
+            got = sandbox._fold_untracked_branches(set(entries), ["/w", also_protected], keep, self.GIT, limit)
+            label = (case, sorted(entries), sorted(keep), limit, also_protected)
             for entry in entries:
                 self.assertEqual(1, sum(within(entry, mask) for mask in got), label)
             for mask in got - entries:
                 self.assertFalse(within("/w", mask), label)
+                self.assertFalse(within(also_protected, mask), label)
                 self.assertNotIn(mask, keep, label)
                 self.assertFalse(within(mask, "/w/.git"), label)
                 self.assertFalse(any(within(kept_dir, mask) for kept_dir in keep), label)
@@ -462,12 +476,14 @@ class FoldBranchesTests(unittest.TestCase):
                         candidates.add(parent)
                         parent = os.path.dirname(parent)
                 for candidate in candidates:
-                    if candidate in keep or within(candidate, "/w/.git"):
+                    if candidate in keep or within(candidate, "/w/.git") or within(also_protected, candidate):
                         continue
                     self.assertLess(sum(within(mask, candidate) for mask in got), 2, (label, candidate))
             # With the plain folding after it, the answer exists exactly when the plain one does.
-            self.assertEqual(self.plain(entries, limit) is None, self.fold(entries, keep, limit) is None, label)
-            whole = self.fold(entries, keep, limit)
+            protected = ("/w", also_protected)
+            plain = sandbox._collapse_unscanned_dirs(set(entries), protected, max_masks=limit)
+            whole = sandbox._collapse_unscanned_dirs(set(entries), protected, max_masks=limit, keep=keep, keep_roots=self.GIT)
+            self.assertEqual(plain is None, whole is None, label)
             if whole is not None:
                 self.assertLessEqual(len(whole), limit, label)
                 for entry in entries:
@@ -625,16 +641,33 @@ class ReadOnlySandboxTests(unittest.TestCase):
             for name in ("u1", "u2"):
                 (root / "src" / "pkg" / name / "deep").mkdir(parents=True)
             for name in ("j1", "j2", "j3", "j4"):
-                (root / "junk" / "tree" / name / "deep").mkdir(parents=True)
+                (root / "junk" / name / "deep").mkdir(parents=True)
             real = sandbox._collapse_unscanned_dirs
-            with clock_past_every_budget(), \
-                    patch.object(sandbox, "_collapse_unscanned_dirs", side_effect=lambda *a, **k: real(*a, max_masks=3, **k)):
+            given = []
+
+            def three_masks(unscanned, protected, **named):
+                given.append(set(unscanned))
+                return real(unscanned, protected, max_masks=3, **named)
+
+            def three_masks_plain(unscanned, protected, **_named):
+                return real(unscanned, protected, max_masks=3)
+
+            def inside(masks):
+                return {os.path.relpath(mask, root) for mask in masks if mask.startswith(str(root) + os.sep)}
+
+            with clock_past_every_budget(), patch.object(sandbox, "_collapse_unscanned_dirs", side_effect=three_masks):
                 masks, warning = self.build(root)
-            inside = {os.path.relpath(mask, root) for mask in masks if mask.startswith(str(root) + os.sep)}
-            self.assertLessEqual(len(inside), 3)
-            self.assertFalse(inside & {"src", "src/pkg", "src/pkg/sub"}, inside)
-            self.assertTrue(inside & {"junk", "junk/tree"}, inside)
+            # junk is the one directory walked on the budget; its four children and the two
+            # untracked ones under the tracked src/pkg stay unscanned: six, and three fit.
+            self.assertEqual({str(root / "junk" / name) for name in ("j1", "j2", "j3", "j4")}
+                             | {str(root / "src" / "pkg" / name) for name in ("u1", "u2")}, given[0])
+            self.assertEqual({"junk", "src/pkg/u1", "src/pkg/u2"}, inside(masks))
             self.assertIn("受版本管理的目录和 .git 已先扫完", warning)
+            # Without the tracked directories the plain order folds the deeper parent first: the tracked one.
+            with clock_past_every_budget(), patch.object(sandbox, "_collapse_unscanned_dirs", side_effect=three_masks_plain):
+                masks, warning = self.build(root)
+            self.assertEqual({"junk", "src/pkg"}, inside(masks))
+            self.assertIn("被遮住的包括1 个含受版本管理文件的目录", warning)
 
     def test_the_warning_says_when_folding_hid_a_tracked_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
