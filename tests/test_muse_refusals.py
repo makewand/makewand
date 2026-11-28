@@ -54,6 +54,9 @@ class MuseRefusalLinesTests(unittest.TestCase):
             self.assertEqual((False, "", None), parse_muse_quota(output, stderr))
         retried = NO_ACCESS.replace("model failed:", "model failed after 3 attempts:")
         self.assertEqual("muse-wonder-full-1.0", muse_model_refusal("", retried))
+        # The name is the one in the refusal itself, however the line is spelled or introduced.
+        self.assertEqual("muse-wonder-full-1.0", muse_model_refusal("", NO_ACCESS.replace("model `", "Model `")))
+        self.assertEqual("muse-wonder-full-1.0", muse_model_refusal("", "Error: " + NO_ACCESS))
 
     def test_other_lines_keep_their_meaning(self):
         limited, reason, reset = parse_muse_quota("", QUOTA)

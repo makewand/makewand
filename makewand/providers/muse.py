@@ -37,7 +37,8 @@ def muse_model_refusal(output: str, stderr: Optional[str] = None) -> Optional[st
     line = find_cli_message("muse", ("model",), output, stderr)
     if line is None:
         return None
-    named = re.search(r"model `([^`]+)`", line)
+    named = re.search(r"model failed(?: after \d+ attempts)?: model `([^`]+)` does not exist or you lack access\b",
+                      line, re.IGNORECASE)
     return named.group(1) if named else ""
 
 def _is_dbus_systemd_available() -> bool:

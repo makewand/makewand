@@ -322,23 +322,29 @@ def _git_common_dir(git_dir: Path) -> Path:
     return Path(os.path.realpath(os.path.join(git_dir, target)))
 
 
-# A larger index is not read; the caller then keeps its own order. The other bounds keep a
-# crafted index from costing memory: git writes no path longer than PATH_MAX, and a checkout
-# with more directories than this is ordered the plain way.
-_GIT_INDEX_MAX_BYTES = 64 << 20
+# A larger index (about 150,000 tracked files) is not read; the caller then keeps its own order.
+# The other bounds keep a crafted index from costing time and memory (a few deep paths name
+# thousands of long parent directories each): git writes no path longer than PATH_MAX, and a
+# checkout with more directories, or longer directory names in total, than these is ordered the
+# plain way. At these bounds the costliest index tried (14 MB of maximal paths) took 0.4 seconds.
+_GIT_INDEX_MAX_BYTES = 16 << 20
 _GIT_INDEX_MAX_PATH_BYTES = 4096
 _GIT_INDEX_MAX_DIRECTORIES = 100_000
+_GIT_INDEX_MAX_DIRECTORY_BYTES = 8 << 20
 
 
 def _index_entry_directories(data: bytes, version: int, count: int, oid_bytes: int) -> Optional[set]:
     """The directories of the `count` entries that follow an index header, with their parents;
-    None when the bytes are not such entries (an object name of another size, a damaged file)."""
+    None when the bytes are not such an index (an object name of another size, a damaged file,
+    one beyond the bounds above)."""
     fixed = 40 + oid_bytes  # ten 32-bit stat fields, then the object name
     directories: set = set()
-    position, previous, last = 12, b"", None
+    position, previous, last, total = 12, b"", None, 0
     try:
         for _ in range(count):
             flags = (data[position + fixed] << 8) | data[position + fixed + 1]
+            if flags & 0x4000 and version == 2:
+                return None  # version 2 has no extended flags
             name_at = position + fixed + (4 if flags & 0x4000 else 2)  # 16 more flag bits when extended
             if version == 4:
                 # Prefix compression: drop `strip` bytes from the previous path, append the rest.
@@ -370,10 +376,19 @@ def _index_entry_directories(data: bytes, version: int, count: int, oid_bytes: i
                 last = directory
                 while directory and directory not in directories:
                     directories.add(directory)
+                    total += len(directory)
+                    if len(directories) > _GIT_INDEX_MAX_DIRECTORIES or total > _GIT_INDEX_MAX_DIRECTORY_BYTES:
+                        return None
                     cut = directory.rfind(b"/")
                     directory = directory[:cut] if cut > 0 else b""
-                if len(directories) > _GIT_INDEX_MAX_DIRECTORIES:
-                    return None
+        # What follows the entries tells a real index from bytes that only parsed: extensions
+        # (a 4-byte signature and a 32-bit size each), then the checksum, as long as an object name.
+        while len(data) - position > oid_bytes:
+            if len(data) - position < 8 + oid_bytes:
+                return None
+            position += 8 + int.from_bytes(data[position + 4:position + 8], "big")
+        if len(data) - position != oid_bytes:
+            return None
     except (IndexError, ValueError):
         return None
     return directories

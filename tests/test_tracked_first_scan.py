@@ -192,6 +192,10 @@ class TrackedDirectoriesTests(unittest.TestCase):
             "name length does not match": index_bytes([b"a/b", b"c/d"], flags=[3, 9]),
             "prefix longer than the previous path": index_bytes([b"a/b"], version=4)[:74] + b"\x05b\0" + bytes(20),
             "varint that never ends": index_bytes([b"a/b"], version=4)[:74] + b"\xff" * 12 + bytes(20),
+            "no checksum after the entries": good[:-20],
+            "entry without its padding or a checksum": good[:12] + bytes(60) + b"\x00\x03a/b\0",
+            "extended flag in version 2": index_bytes([b"a/b"], flags=[0x4003]),
+            "extension longer than the file": good[:-20] + b"TREE" + (99).to_bytes(4, "big") + bytes(20),
             "empty": b"",
         }
         for label, data in cases.items():
@@ -211,6 +215,19 @@ class TrackedDirectoriesTests(unittest.TestCase):
                 self.assertIsNone(git_helper.tracked_directories(tmp), "too many directories")
             (Path(tmp) / ".git" / "index").write_bytes(index_bytes([b"d" * 4096 + b"/f"], version=4))
             self.assertIsNone(git_helper.tracked_directories(tmp), "a path no checkout can hold")
+            (Path(tmp) / ".git" / "index").write_bytes(good[:-20] + b"TREE" + (3).to_bytes(4, "big") + b"abc" + bytes(20))
+            self.assertEqual({"a", "c"}, git_helper.tracked_directories(tmp), "an extension before the checksum")
+
+    def test_a_few_deep_paths_cannot_name_megabytes_of_directories(self):
+        # Review round 1: 49 paths of 2000 levels (a 200 KB index) named 98,049 parent directories of
+        # 2 KB on average: 600 MB, and 110 seconds in the launch that counted the hidden ones.
+        deep = sorted((f"{number:02d}/" + "a/" * 2000 + "f").encode() for number in range(49))
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".git").mkdir()
+            (Path(tmp) / ".git" / "index").write_bytes(index_bytes(deep))
+            self.assertIsNone(git_helper.tracked_directories(tmp))
+            (Path(tmp) / ".git" / "index").write_bytes(index_bytes(deep[:1]))
+            self.assertEqual(2001, len(git_helper.tracked_directories(tmp)))
 
     def test_an_index_that_is_not_a_file_never_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,6 +346,15 @@ class FoldMasksTests(unittest.TestCase):
         self.assertEqual(sorted({f"/w/src/cache{n}" for n in range(4)} | {"/w/junk"}),
                          sandbox._collapse_unscanned_dirs(shallow, ("/w",), max_masks=5, keep={"/w/src"}))
 
+    def test_git_is_not_folded_before_a_tracked_parent(self):
+        # Review round 1: one unscanned directory in .git climbed to .git itself (hiding all history)
+        # before the tracked parent with 600 unscanned children was folded.
+        unscanned = {f"/w/a/b/c/d/pkg/cache{n}" for n in range(600)} | {"/w/.git/objects/ab"}
+        keep = {"/w/a", "/w/a/b", "/w/a/b/c", "/w/a/b/c/d", "/w/a/b/c/d/pkg"}
+        self.assertEqual(["/w/.git/objects/ab", "/w/a/b/c/d/pkg"],
+                         sandbox._collapse_unscanned_dirs(unscanned, ("/w",), keep=keep, keep_roots=["/w/.git"]))
+        self.assertEqual(["/w/.git/objects/ab", "/w/a/b/c/d/pkg"], sandbox._collapse_unscanned_dirs(unscanned, ("/w",)))
+
     def test_a_tracked_parent_is_folded_when_nothing_else_is_left(self):
         unscanned = {f"/w/src/cache{n}" for n in range(6)} | {"/w/lib/tmp"}
         without = sandbox._collapse_unscanned_dirs(unscanned, ("/w",), max_masks=3)
@@ -378,8 +404,11 @@ class ReadOnlySandboxTests(unittest.TestCase):
             masks, warning = self.build(root, READONLY_SCAN_ENTRY_LIMIT=30)
             self.assertIn(str(root / "src"), masks)
             self.assertIn(str(root / ".git"), masks)
-            self.assertIn("被遮住的包括5 个含受版本管理文件的目录和.git 里的内容，在沙箱里读不到", warning)
+            # One mask (src) holds the five tracked directories; they stopped at the entry limit, not at the time.
+            self.assertIn("被遮住的包括1 个含受版本管理文件的目录和.git 里的内容，在沙箱里读不到", warning)
+            self.assertIn("这部分不计时，要看到它们，调高 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT或恢复目录的读取权限", warning)
             self.assertNotIn("已先扫完", warning)
+            self.assertNotIn("MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS", warning)
 
     def test_the_warning_says_when_only_history_is_hidden(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -396,6 +425,26 @@ class ReadOnlySandboxTests(unittest.TestCase):
                 masks, warning = self.build(root)
             self.assertEqual({unreadable}, {mask for mask in masks if mask.startswith(str(root) + os.sep)})
             self.assertIn("被遮住的包括.git 里的内容，在沙箱里读不到", warning)
+            self.assertNotIn("MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS", warning)
+
+    def test_counting_what_is_hidden_does_not_walk_up_every_tracked_directory(self):
+        # Review round 1: the count walked up from each tracked directory; 2000 levels of one path cost seconds.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            (root / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+            (root / ".git" / "index").write_bytes(index_bytes([("a/" * 2000 + "f").encode()]))
+            (root / "one" / "sub").mkdir(parents=True)
+            (root / "two").mkdir()
+            self.assertEqual(2000, len(git_helper.tracked_directories(root)))
+            steps = []
+            real = sandbox._covered_by_norm_set
+            with patch.object(sandbox, "_covered_by_norm_set", side_effect=lambda *a: steps.append(1) or real(*a)), \
+                    clock_past_every_budget():
+                masks, warning = self.build(root)
+            self.assertIn("工作区扫描未能完成", warning)
+            self.assertIn("已先扫完", warning)
+            self.assertLess(len(steps), 20)
 
     def test_the_warning_says_when_there_is_no_index(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,6 +456,7 @@ class ReadOnlySandboxTests(unittest.TestCase):
             self.assertEqual({str(root / "one"), str(root / "two")},
                              {mask for mask in masks if mask.startswith(str(root) + os.sep)})
             self.assertIn("没有读到 git 索引", warning)
+            self.assertIn("调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒），条目超限时调高 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT", warning)
 
     def test_a_writable_session_is_not_reordered_and_still_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

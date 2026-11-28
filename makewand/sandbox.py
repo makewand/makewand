@@ -800,13 +800,15 @@ def _collapse_unscanned_dirs(
     protected_paths: Sequence[str],
     max_masks: int = MAX_UNSCANNED_DIR_MASKS,
     keep: Collection[str] = frozenset(),
+    keep_roots: Sequence[str] = (),
 ) -> Optional[List[str]]:
     """
     Normalizes and bounds a set of unscanned directory paths so each can be
     masked with a read-only tmpfs. Returns None if any unscanned directory
     contains a protected path (e.g. the workspace root itself) or cannot be
     collapsed within max_masks. Directories in keep (those holding tracked
-    files) are folded into one mask only when no other parent is left to fold.
+    files) and at or below keep_roots (.git) are folded into one mask only
+    when no other parent is left to fold.
     """
     if not unscanned_dirs:
         return []
@@ -824,7 +826,8 @@ def _collapse_unscanned_dirs(
             by_parent.setdefault(parent, []).append(d)
         if not by_parent:
             return None
-        foldable = {parent: children for parent, children in by_parent.items() if parent not in keep} or by_parent
+        foldable = {parent: children for parent, children in by_parent.items()
+                    if parent not in keep and not any(_norm_is_within(parent, root) for root in keep_roots)} or by_parent
         for parent, children in sorted(
             foldable.items(),
             key=lambda kv: (kv[0].count(os.sep), len(kv[1]), kv[0]),
@@ -3018,7 +3021,7 @@ def wrap_bwrap(
         )
     if readonly:
         workspace_tmpfs_masks = _collapse_unscanned_dirs(
-            masked_cache_dirs | unscanned_dirs, protected_ws, keep=tracked_dirs
+            masked_cache_dirs | unscanned_dirs, protected_ws, keep=tracked_dirs, keep_roots=checkout_git_dirs
         )
         if workspace_tmpfs_masks is None:
             raise SandboxConfigError(
@@ -3027,19 +3030,24 @@ def wrap_bwrap(
             )
         if truncated:
             masks = set(workspace_tmpfs_masks)
-            hidden = sum(1 for d in tracked_dirs if _covered_by_norm_set(d, masks))
+            # tracked_dirs holds every directory with its parents, so a mask hides tracked files
+            # exactly when the mask is one of them (a count per mask, whatever the depth of the names).
+            hidden = sum(1 for mask in masks if mask in tracked_dirs)
             history = any(_norm_is_within(mask, git_dir) or _norm_is_within(git_dir, mask)
                           for git_dir in checkout_git_dirs for mask in masks)
             limits = f"条目超过 {scan_limit}" if scan_timeout is None else f"超过 {scan_timeout:g} 秒、条目超过 {scan_limit}"
+            raise_entries = "调高 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT"
+            raise_time = raise_entries if scan_timeout is None else f"调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒），条目超限时{raise_entries}"
             if hidden or history:
                 lost = ([f"{hidden} 个含受版本管理文件的目录"] if hidden else []) + ([".git 里的内容"] if history else [])
-                what = f"被遮住的包括{'和'.join(lost)}，在沙箱里读不到。"
+                # These are walked without a time limit: only the entry limit or an unreadable directory stops them.
+                what = f"被遮住的包括{'和'.join(lost)}，在沙箱里读不到；这部分不计时，要看到它们，{raise_entries}或恢复目录的读取权限。"
             elif index_read:
-                what = "受版本管理的目录和 .git 已先扫完，被遮住的都是未纳入版本管理的内容。"
+                what = f"受版本管理的目录和 .git 已先扫完，被遮住的都是未纳入版本管理的内容。要全部可见，{raise_time}。"
             else:
-                what = "没有读到 git 索引，无法先扫受版本管理的目录，被遮住的可能包含源文件。"
+                what = f"没有读到 git 索引，无法先扫受版本管理的目录，被遮住的可能包含源文件。要全部可见，{raise_time}。"
             _warn(f"工作区扫描未能完成（{limits}，或有不可读目录）：{len(masks)} 个未扫描的目录已由 tmpfs 遮蔽，"
-                  f"在只读会话里显示为空。{what}要全部可见，调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒）。")
+                  f"在只读会话里显示为空。{what}")
     else:
         collapsed_cache = _collapse_unscanned_dirs(masked_cache_dirs, protected_ws)
         if collapsed_cache is None:
