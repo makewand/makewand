@@ -52,6 +52,9 @@
           "claude(?: ai| code)? usage limit reached\\b",
           "(?:weekly|session|5-hour|five-hour|daily|monthly|opus|sonnet|fable|usage|spend(?:ing)?)(?: (?:weekly|daily|monthly|usage|spend(?:ing)?))? limit reached(?: ?[·•∙|]|\\.?$)"
         ],
+        "model": [
+          "there's an issue with the selected model \\([^)]{1,120}\\)\\. it may not exist or you may not have access to it\\."
+        ],
         "rate": [
           "api error: (?:request rejected \\()?429\\b",
           "api error: (?:\\d{3} )?\\{.*\\\"type\\\": ?\\\"rate_limit_error\\\"",
@@ -166,6 +169,9 @@
         ],
         "quota.marked": [
           "(?:usage limit reached|spending limit reached|usage balance exhausted|usage[_ ]pool[_ ]exhausted|usage_limit_reached)\\b"
+        ],
+        "model": [
+          "couldn't set model '[^']{1,120}': .{1,400}\\. run 'grok models' to see available models\\.?$"
         ],
         "rate": [
           "api error \\(status 429\\)",

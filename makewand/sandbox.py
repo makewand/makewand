@@ -3722,7 +3722,18 @@ DEFAULT_SANDBOX_NOFILE = 4096
 TRUSTED_SYSTEM_BIN_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/run/current-system/sw/bin")
 _MEM_RE = re.compile(r"^(\d+[KMGT]?|infinity)$")
 _TASKS_RE = re.compile(r"^(\d+|infinity)$")
-_limits_probe: Dict[str, Any] = {"systemd": None, "warned": False}
+_limits_probe: Dict[str, Any] = {"systemd": None, "oom_policy": None, "warned": False}
+# A sandbox's transient scope is named, so its journal can be read after it ended (--collect
+# unloads the unit at once): makewand-sandbox- and 16 hexadecimal digits.
+SANDBOX_SCOPE_PREFIX = "makewand-sandbox-"
+_SANDBOX_SCOPE_RE = re.compile(re.escape(SANDBOX_SCOPE_PREFIX) + r"[0-9a-f]{16}")
+# What the service manager writes to a unit's journal when processes in it were killed for
+# memory (systemd's sd-messages.h): the kernel OOM killer at the unit's MemoryMax, or
+# systemd-oomd when the host ran short.
+SCOPE_MEMORY_KILL_MESSAGE_IDS = {
+    "fe6faa94e7774663a0da52717891d8ef": "kernel",        # SD_MESSAGE_UNIT_OUT_OF_MEMORY
+    "d989611b15e44c9dbf31e3c81256e4ed": "systemd-oomd",  # SD_MESSAGE_UNIT_OOMD_KILL
+}
 
 
 def _trusted_system_binary(name: str) -> Optional[str]:
@@ -3754,21 +3765,95 @@ def _env_limit(env: str, default: str, pattern) -> str:
 
 
 def _systemd_scope_usable(systemd_run: str) -> bool:
+    """Whether a transient user scope can be started; also learns whether it takes
+    OOMPolicy=continue (scopes do since systemd 253), tried first."""
     cached = _limits_probe.get("systemd")
     if cached is not None:
         return bool(cached)
+    import subprocess
     ok = False
-    try:
-        import subprocess
-        res = subprocess.run(
-            [systemd_run, "--user", "--scope", "--quiet", "--collect", "-p", "TasksMax=16", "--", "true"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
-        )
-        ok = res.returncode == 0
-    except Exception:
-        ok = False
+    for oom_policy in (["-p", "OOMPolicy=continue"], []):
+        try:
+            res = subprocess.run(
+                [systemd_run, "--user", "--scope", "--quiet", "--collect", *oom_policy,
+                 "-p", "TasksMax=16", "--", "true"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except Exception:
+            break  # a hung bus or a launch error is not about the policy: no second wait
+        if res.returncode == 0:
+            ok = True
+            _limits_probe["oom_policy"] = bool(oom_policy)
+            break
     _limits_probe["systemd"] = ok
     return ok
+
+
+def _fresh_scope_name() -> str:
+    import secrets
+    return f"{SANDBOX_SCOPE_PREFIX}{secrets.token_hex(8)}"
+
+
+def sandbox_scope_options() -> List[str]:
+    """systemd-run options every sandbox scope gets: a fresh unit name, and OOMPolicy=continue
+    where the probe found it accepted. With the default policy (stop) the service manager stops
+    the whole scope as soon as the kernel kills one process at MemoryMax: a reviewer's test that
+    used up the memory took the reviewer down with it (2026-11-28 21:29, after 17 minutes). With
+    continue the kernel still kills the largest process and the memory cap holds; the others go
+    on and see that process killed, as with any memory-limited command on this host."""
+    options = [f"--unit={_fresh_scope_name()}"]
+    if _limits_probe.get("oom_policy"):
+        options += ["-p", "OOMPolicy=continue"]
+    return options
+
+
+def sandbox_scope_memory_kill(cmd, attempts: int = 1) -> Optional[Tuple[str, str]]:
+    """Whether processes in the sandbox scope `cmd` started were killed for memory, from the
+    user journal: ("kernel", MemoryMax) when the scope reached its memory cap, ("systemd-oomd",
+    MemoryMax) when the host ran short, None when there is no such record or `cmd` did not
+    start a named makewand scope. The service manager writes the record moments after the kill,
+    so a lookup that finds nothing is repeated up to `attempts` times, 0.2 seconds apart."""
+    if not isinstance(cmd, (list, tuple)):
+        return None
+    launcher = next((index for index, arg in enumerate(cmd)
+                     if isinstance(arg, str) and os.path.basename(arg) == "systemd-run"), None)
+    if launcher is None:
+        return None
+    unit = memory = None
+    for arg in cmd[launcher + 1:]:
+        if arg == "--" or not isinstance(arg, str):
+            break
+        if arg.startswith("--unit="):
+            unit = arg[len("--unit="):]
+        elif arg.startswith("MemoryMax="):
+            memory = arg[len("MemoryMax="):]
+    if unit is None or not _SANDBOX_SCOPE_RE.fullmatch(unit):
+        return None
+    journalctl = _trusted_system_binary("journalctl")
+    if not journalctl:
+        return None
+    import subprocess
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(0.2)
+        try:
+            res = subprocess.run(
+                [journalctl, "--user", f"--unit={unit}.scope", "--output=json",
+                 "--output-fields=MESSAGE_ID", "--no-pager", "--quiet"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:
+            return None
+        if res.returncode != 0:
+            return None  # no readable user journal: asking again finds nothing either
+        for line in res.stdout.splitlines()[:200]:
+            try:
+                kind = SCOPE_MEMORY_KILL_MESSAGE_IDS.get(json.loads(line).get("MESSAGE_ID"))
+            except (ValueError, AttributeError, TypeError):
+                continue
+            if kind:
+                return kind, memory or "?"
+    return None
 
 
 def _rlimit_arg(resource_mod, which: int, want: int) -> str:
@@ -3799,7 +3884,7 @@ def sandbox_resource_limit_prefix() -> List[str]:
     tasks = _env_limit(SANDBOX_TASKS_MAX_ENV, DEFAULT_SANDBOX_TASKS_MAX, _TASKS_RE)
     systemd_run = _trusted_system_binary("systemd-run")
     if systemd_run and _systemd_scope_usable(systemd_run):
-        return [systemd_run, "--user", "--scope", "--quiet", "--collect",
+        return [systemd_run, "--user", "--scope", "--quiet", "--collect", *sandbox_scope_options(),
                 "-p", f"MemoryMax={mem}", "-p", "MemorySwapMax=0", "-p", f"TasksMax={tasks}", "--"]
     if systemd_run:
         logging.getLogger(__name__).debug("systemd user scope unavailable; falling back to prlimit")
@@ -3881,6 +3966,11 @@ def _provider_socket_preflight(command, provider_command, *, cwd, allow_network,
         except SandboxConfigError as error:
             raise ProviderStartupError(f"启动环境检查失败：无法准备 socket 探针的 seccomp 隔离 ({error})") from error
         prefix = list(command[:-len(provider_command)])
+        # The probe gets a scope of its own: the launch that follows starts the scope named in
+        # `command`, and a probe scope of that name may still be unloading then ("already exists").
+        prefix = [f"--unit={_fresh_scope_name()}"
+                  if isinstance(arg, str) and arg.startswith("--unit=") and _SANDBOX_SCOPE_RE.fullmatch(arg[len("--unit="):])
+                  else arg for arg in prefix]
         if seccomp_fd is not None:
             try:
                 index = prefix.index("--seccomp")

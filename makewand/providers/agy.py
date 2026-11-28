@@ -7,7 +7,7 @@ import re
 from functools import lru_cache
 from typing import List, Tuple, Optional
 from makewand.config import c, COLOR_GREEN
-from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart
+from makewand.providers.base import ProviderAPIRelay, run_subprocess, model_process_failure, is_process_timeout, stderr_captured_apart, killed_for_memory
 
 # Quota, region and login failures count only where agy prints them itself: one
 # of agy's messages (health.CLI_MESSAGE_CATALOG["agy"]) on its own lines, which
@@ -376,7 +376,7 @@ def execute_agy_task(
             return True, answer, None
         return False, None, "Antigravity 执行完成但未能产生有效输出内容"
 
-    if is_process_timeout(ex) or code < 0:
+    if is_process_timeout(ex) or code < 0 or killed_for_memory(code, ex):
         return model_process_failure("agy", code, combined, err, ex, readonly)
 
     rejection = _agy_invocation_rejection(_agy_user_facing(err if apart else out))
