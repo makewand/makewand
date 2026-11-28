@@ -86,9 +86,19 @@ class TestObserver(unittest.TestCase):
         ext_sessions = [
             {"tty": "pts/36", "ai_type": "codex", "pid": 3867843, "cwd": "/mock/projects/service_app", "etime": "10:00"}
         ]
-        opts = analyze_makewand_optimizations(reports, metrics, external_sessions=ext_sessions)
+        from unittest.mock import patch
+        with patch("makewand.observer.os.cpu_count", return_value=8):
+            opts = analyze_makewand_optimizations(reports, metrics, external_sessions=ext_sessions)
         self.assertTrue(any(o["priority"] == "CRITICAL" for o in opts))
-        self.assertTrue(any("背压" in o["proposal"] or "限流" in o["target"] for o in opts))
+        self.assertTrue(any("主机负载高于 CPU 数" in o["target"] for o in opts))
+        # The same load on a host with more CPUs than that is not reported (a fixed 15 used to be).
+        with patch("makewand.observer.os.cpu_count", return_value=104):
+            calm = analyze_makewand_optimizations(reports, metrics, external_sessions=ext_sessions)
+        self.assertFalse(any("主机负载" in o["target"] for o in calm))
+        # No advice names a command that no longer exists.
+        for option in opts:
+            for gone in ("makewand run", "makewand race", "makewand ensemble"):
+                self.assertNotIn(gone, option["proposal"])
         self.assertTrue(any("数据库查询" in o["target"] for o in opts))
         self.assertTrue(any("亲和调度" in o["target"] for o in opts))
         self.assertTrue(any("防踩踏守卫" in o["target"] for o in opts))

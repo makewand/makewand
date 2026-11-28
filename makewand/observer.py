@@ -654,13 +654,15 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
                 "proposal": f"建议对会话 [{s['name']}] 涉及的慢 SQL (如 measurements 表模糊匹配) 建立专用索引或限制扫描区间，必要时执行取消以释放宿主机 I/O。"
             })
 
-    # Check if load is high (> 15)
-    if metrics["load_1m"] > 15:
+    # A load above the number of CPUs means runnable tasks are waiting for one. A fixed
+    # threshold (it was 15) raised this on a 104-CPU host at a sixth of its capacity.
+    cpus = os.cpu_count() or 1
+    if metrics["load_1m"] > cpus:
         optimizations.append({
-            "target": "并发任务调度限流 (Concurrency Throttling)",
+            "target": "主机负载高于 CPU 数 (Host Load)",
             "priority": "HIGH",
-            "reason": f"当前主机 1 分钟平均负载达到 {metrics['load_1m']}，主要由大型 SQL 聚合与并发测试引起。",
-            "proposal": "在 Makewand 流水线与沙箱运行器中，增加基于 load average 的动态背压保护：当系统负载超过 12 时，自动将并发任务数限制为 1~2。"
+            "reason": f"当前主机 1 分钟平均负载 {metrics['load_1m']}，高于 CPU 数 {cpus}，有任务在排队等 CPU。",
+            "proposal": "先看是哪些进程在占用（上表的长时运行项，或 top）。Makewand 的并发上限在 ~/.config/makewand/capacity-policy.json，是否调低由用户决定。"
         })
 
     # Check for data pipeline sessions
@@ -690,10 +692,10 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
     if active_coders:
         names = ", ".join(s["name"] for s in active_coders)
         optimizations.append({
-            "target": "多模型红队盲审与并发竞速赋能 (Makewand Race / Review)",
+            "target": "交付前的独立审查 (Makewand Review)",
             "priority": "MEDIUM",
             "reason": f"会话 [{names}] 正在进行高频代码修改与用例调试。",
-            "proposal": "可针对重构瓶颈直接调用 `makewand review` 或 `makewand race` 派发独立工作树比拼，利用 Codex (gpt-6-astra) 的算法能力加速单测攻坚与边界排查。"
+            "proposal": "涉及安全、并发、数据丢失、资金或生产发布的改动，交付前用 `makewand route review <难度> --self <调用方> --not <实现方>` 选一个审查方做独立只读审查。"
         })
 
     # Check for quota exhausted sessions
@@ -704,7 +706,7 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
             "target": "会话额度枯竭无缝接管 (Quota Exhaustion Handover)",
             "priority": "HIGH",
             "reason": f"监测到会话 [{names}] 的底层模型配额已彻底耗尽 (0% left)，直接输入将被限流阻断。",
-            "proposal": f"建议在该工作区改用 `makewand run ... --tier deep`，无缝分流至 Google AI Pro (Gemini 3.8) 或 Grok 4.7 顶格算力接续开发。"
+            "proposal": "用 `makewand route <类型> <难度> --self <该工具>` 查看现在还能派的其他工具，把后续子任务派过去。"
         })
 
     # Check for active external sessions
@@ -714,7 +716,7 @@ def analyze_makewand_optimizations(session_reports, metrics, external_sessions=N
             "target": "多 Session 目录隔离防踩踏守卫 (Session Isolation Guard)",
             "priority": "LOW",
             "reason": f"检测到宿主机存在 {len(external_sessions)} 个外部独立终端正在操作工作目录 ({', '.join(sorted(ext_cwds))})。",
-            "proposal": "Makewand 派发流水线与沙箱竞速时已启用工作树防冲突探测，避免跨终端踩踏。"
+            "proposal": "同一目录同时只跑一个会改文件的任务；要并行改动，各用各的 git worktree。"
         })
 
     # Standard healthy check

@@ -20,11 +20,25 @@ def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
     # A retry's rate limit may print first; only the quota line knows when the subscription resets.
     line = found.get("quota") or found.get("rate")
     if line is not None:
+        if re.search(r"\bapi error 402\b", line, re.IGNORECASE):
+            # Meta refuses the whole account until its billing is settled; no reset time exists.
+            return True, "Meta 账单验证未通过 (402 billing_error)，账单处理好之前整个 Muse 订阅不可用", "待重置"
         reset_time = extract_reset_phrase(line)
         if reset_time:
             return True, f"Meta 订阅额度耗尽或频次受限 ({reset_time})", reset_time
         return True, "Meta 订阅额度耗尽或频次受限", "待重置"
     return False, "", None
+
+
+def muse_model_refusal(output: str, stderr: Optional[str] = None) -> Optional[str]:
+    """The model Muse Code says it does not offer to this account, from the error it ends with:
+    model `<name>` does not exist or you lack access. No model ran. `stderr` as in parse_muse_quota."""
+    from makewand.health import find_cli_message
+    line = find_cli_message("muse", ("model",), output, stderr)
+    if line is None:
+        return None
+    named = re.search(r"model `([^`]+)`", line)
+    return named.group(1) if named else ""
 
 def _is_dbus_systemd_available() -> bool:
     """Checks whether user-level systemd / D-Bus session bus is functional."""
@@ -378,5 +392,13 @@ def execute_muse_task(
         if relay.available:
             return relay(f"[Makewand -> Muse] 订阅触发限流 ({reason})，无缝切换为 Meta API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Muse Code 执行中检测到限制: {reason}", "可配置 META_API_KEY 实现自动接力")
+
+    refused_model = muse_model_refusal(out, err if apart else None)
+    if refused_model is not None:
+        # Meta answered before any model ran: a known refusal of this model, not an unknown outcome.
+        refused_model = refused_model or target_model
+        reason = f"Meta 不向当前账号提供型号 {refused_model}（不存在或无权使用）"
+        record_engine_limit("muse", reason, "待重置", model=refused_model)
+        return False, None, f"Muse Code 拒绝了这次调用: {reason}"
 
     return model_process_failure("muse", code, combined, err, ex, readonly)

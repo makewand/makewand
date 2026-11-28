@@ -322,6 +322,92 @@ def _git_common_dir(git_dir: Path) -> Path:
     return Path(os.path.realpath(os.path.join(git_dir, target)))
 
 
+# A larger index is not read; the caller then keeps its own order. The other bounds keep a
+# crafted index from costing memory: git writes no path longer than PATH_MAX, and a checkout
+# with more directories than this is ordered the plain way.
+_GIT_INDEX_MAX_BYTES = 64 << 20
+_GIT_INDEX_MAX_PATH_BYTES = 4096
+_GIT_INDEX_MAX_DIRECTORIES = 100_000
+
+
+def _index_entry_directories(data: bytes, version: int, count: int, oid_bytes: int) -> Optional[set]:
+    """The directories of the `count` entries that follow an index header, with their parents;
+    None when the bytes are not such entries (an object name of another size, a damaged file)."""
+    fixed = 40 + oid_bytes  # ten 32-bit stat fields, then the object name
+    directories: set = set()
+    position, previous, last = 12, b"", None
+    try:
+        for _ in range(count):
+            flags = (data[position + fixed] << 8) | data[position + fixed + 1]
+            name_at = position + fixed + (4 if flags & 0x4000 else 2)  # 16 more flag bits when extended
+            if version == 4:
+                # Prefix compression: drop `strip` bytes from the previous path, append the rest.
+                # `strip` is git's offset varint; a path length needs at most five bytes of it.
+                byte = data[name_at]
+                name_at += 1
+                strip = byte & 0x7F
+                for _more in range(4):
+                    if not byte & 0x80:
+                        break
+                    byte = data[name_at]
+                    name_at += 1
+                    strip = ((strip + 1) << 7) + (byte & 0x7F)
+                if byte & 0x80 or strip > len(previous):
+                    return None
+                end = data.index(b"\0", name_at)
+                path = previous[:len(previous) - strip] + data[name_at:end]
+                position = end + 1
+            else:
+                end = data.index(b"\0", name_at)
+                path = data[name_at:end]
+                position += (name_at - position + len(path) + 8) & ~7  # NUL-padded to a multiple of eight
+            if not path or len(path) > _GIT_INDEX_MAX_PATH_BYTES or min(len(path), 0xFFF) != flags & 0xFFF:
+                return None
+            previous = path
+            cut = path.rfind(b"/")
+            directory = path[:cut] if cut > 0 else b""
+            if directory != last:
+                last = directory
+                while directory and directory not in directories:
+                    directories.add(directory)
+                    cut = directory.rfind(b"/")
+                    directory = directory[:cut] if cut > 0 else b""
+                if len(directories) > _GIT_INDEX_MAX_DIRECTORIES:
+                    return None
+    except (IndexError, ValueError):
+        return None
+    return directories
+
+
+def tracked_directories(checkout: Union[str, Path]) -> Optional[set]:
+    """Directories below the checkout at `checkout` that hold its tracked files, each with
+    its parents, as the "/"-separated paths the index stores (the checkout itself is not listed).
+
+    Read from the index file (.git/index, or the one a .git file names) without running git,
+    which a repository's configuration could turn into a command on the host. It is a hint for
+    ordering a walk and nothing else: a split index lists only part of the paths, and None means
+    there is no index this reads (no checkout, a damaged file, one beyond the bounds above).
+    """
+    dot_git = Path(checkout) / ".git"
+    try:
+        git_dir = dot_git if dot_git.is_dir() else _gitfile_target(dot_git)
+        if git_dir is None:
+            return None
+        data = _read_git_pointer(Path(git_dir) / "index", _GIT_INDEX_MAX_BYTES)
+    except (OSError, ValueError):
+        return None
+    if len(data) < 12 or data[:4] != b"DIRC":
+        return None
+    version, count = int.from_bytes(data[4:8], "big"), int.from_bytes(data[8:12], "big")
+    if version not in (2, 3, 4):
+        return None
+    for oid_bytes in (20, 32):  # SHA-1 or SHA-256 names: each entry's own name length tells which
+        directories = _index_entry_directories(data, version, count, oid_bytes)
+        if directories is not None:
+            return {os.fsdecode(name) for name in directories}
+    return None
+
+
 def _valid_git_head(head: Path) -> bool:
     """git's validate_headref: a symbolic ref into refs/, as file content or symlink, or an object id."""
     path = _fs_path(head)
