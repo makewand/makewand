@@ -384,8 +384,8 @@ def _index_entry_directories(data: bytes, version: int, count: int, oid_bytes: i
         # What follows the entries tells a real index from bytes that only parsed: extensions
         # (a 4-byte signature and a 32-bit size each), then the checksum, as long as an object name.
         while len(data) - position > oid_bytes:
-            if len(data) - position < 8 + oid_bytes:
-                return None
+            if len(data) - position < 8 + oid_bytes or data[position:position + 4] == b"link":
+                return None  # damaged, or a split index: its paths are in a shared index file this does not read
             position += 8 + int.from_bytes(data[position + 4:position + 8], "big")
         if len(data) - position != oid_bytes:
             return None
@@ -400,8 +400,8 @@ def tracked_directories(checkout: Union[str, Path]) -> Optional[set]:
 
     Read from the index file (.git/index, or the one a .git file names) without running git,
     which a repository's configuration could turn into a command on the host. It is a hint for
-    ordering a walk and nothing else: a split index lists only part of the paths, and None means
-    there is no index this reads (no checkout, a damaged file, one beyond the bounds above).
+    ordering a walk and nothing else. None means there is no index this reads: no checkout, a
+    damaged file, one beyond the bounds above, or a split index (core.splitIndex).
     """
     dot_git = Path(checkout) / ".git"
     try:

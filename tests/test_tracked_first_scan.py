@@ -196,6 +196,7 @@ class TrackedDirectoriesTests(unittest.TestCase):
             "entry without its padding or a checksum": good[:12] + bytes(60) + b"\x00\x03a/b\0",
             "extended flag in version 2": index_bytes([b"a/b"], flags=[0x4003]),
             "extension longer than the file": good[:-20] + b"TREE" + (99).to_bytes(4, "big") + bytes(20),
+            "split index": good[:-20] + b"link" + (20).to_bytes(4, "big") + bytes(20) + bytes(20),
             "empty": b"",
         }
         for label, data in cases.items():
@@ -217,6 +218,16 @@ class TrackedDirectoriesTests(unittest.TestCase):
             self.assertIsNone(git_helper.tracked_directories(tmp), "a path no checkout can hold")
             (Path(tmp) / ".git" / "index").write_bytes(good[:-20] + b"TREE" + (3).to_bytes(4, "big") + b"abc" + bytes(20))
             self.assertEqual({"a", "c"}, git_helper.tracked_directories(tmp), "an extension before the checksum")
+
+    def test_a_split_index_is_not_read(self):
+        # Review round 2: with core.splitIndex the paths sit in .git/sharedindex.<id>; the index
+        # itself lists none, and an empty answer would read as "nothing tracked".
+        with tempfile.TemporaryDirectory() as tmp:
+            root = checkout(tmp)
+            self.assertEqual(TREE_DIRS, git_helper.tracked_directories(root))
+            git(root, "update-index", "--split-index")
+            self.assertTrue(list((root / ".git").glob("sharedindex.*")))
+            self.assertIsNone(git_helper.tracked_directories(root))
 
     def test_a_few_deep_paths_cannot_name_megabytes_of_directories(self):
         # Review round 1: 49 paths of 2000 levels (a 200 KB index) named 98,049 parent directories of
@@ -346,6 +357,38 @@ class FoldMasksTests(unittest.TestCase):
         self.assertEqual(sorted({f"/w/src/cache{n}" for n in range(4)} | {"/w/junk"}),
                          sandbox._collapse_unscanned_dirs(shallow, ("/w",), max_masks=5, keep={"/w/src"}))
 
+    def test_a_lone_directory_is_not_lifted_for_nothing(self):
+        # Review round 2: one unscanned directory below untracked parents was lifted level by level
+        # (to /w/notes, hiding files the scan had walked) without saving a mask, before the tracked
+        # parent was folded anyway.
+        unscanned = {f"/w/src/pkg/cache{n}" for n in range(600)} | {"/w/notes/drafts/roi-image-cache"}
+        plain = sandbox._collapse_unscanned_dirs(unscanned, ("/w",))
+        self.assertEqual(["/w/notes/drafts/roi-image-cache", "/w/src/pkg"], plain)
+        self.assertEqual(plain, sandbox._collapse_unscanned_dirs(
+            unscanned, ("/w",), keep={"/w/src", "/w/src/pkg"}, keep_roots=["/w/.git"]))
+
+    def test_deep_lone_directories_cost_one_pass(self):
+        # Review round 2: with 512 unscanned directories under a kept parent 100 levels down, one
+        # deep untracked directory made the loop run once per level (3 seconds; minutes at 1000).
+        depth = 150
+        tracked = "/w/" + "t/" * depth
+        keep, parent = set(), tracked.rstrip("/")
+        while parent != "/w":
+            keep.add(parent)
+            parent = os.path.dirname(parent)
+        in_git = "/w/.git/refs/heads/" + "a/" * depth
+        lone = "/w/" + "u/" * depth + "roi-image-cache"
+        for label, unscanned, kept in (
+                ("kept parent", {tracked + f"c{n:03d}" for n in range(512)} | {lone}, keep),
+                ("below .git", {in_git + f"b{n:03d}" for n in range(512)} | {lone}, set())):
+            passes = []
+            real = sandbox._dedup_norm_ancestors
+            with patch.object(sandbox, "_dedup_norm_ancestors", side_effect=lambda paths: passes.append(1) or real(paths)):
+                got = sandbox._collapse_unscanned_dirs(unscanned, ("/w",), keep=kept, keep_roots=["/w/.git"])
+            self.assertEqual(2, len(passes), label)  # once before the loop, once after the single fold
+            self.assertEqual(sandbox._collapse_unscanned_dirs(unscanned, ("/w",)), got, label)
+            self.assertIn(lone, got, label)
+
     def test_git_is_not_folded_before_a_tracked_parent(self):
         # Review round 1: one unscanned directory in .git climbed to .git itself (hiding all history)
         # before the tracked parent with 600 unscanned children was folded.
@@ -455,8 +498,36 @@ class ReadOnlySandboxTests(unittest.TestCase):
                 masks, warning = self.build(root)
             self.assertEqual({str(root / "one"), str(root / "two")},
                              {mask for mask in masks if mask.startswith(str(root) + os.sep)})
-            self.assertIn("没有读到 git 索引", warning)
+            self.assertIn("没有读到完整的 git 索引", warning)
             self.assertIn("调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒），条目超限时调高 MAKEWAND_SANDBOX_SCAN_ENTRY_LIMIT", warning)
+
+    def test_the_warning_does_not_speak_for_a_checkout_whose_index_it_could_not_read(self):
+        # Review round 2: two checkouts are mounted, one index is read and the other is not.
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            root = self.repo(tmp)
+            second = checkout(other, files=("lib/x.py",))
+            git(second, "update-index", "--split-index")
+            (second / "extra" / "deep").mkdir(parents=True)
+            err = io.StringIO()
+            with clock_past_every_budget(), patch("sys.stderr", err):
+                cmd = wrap_bwrap(["true"], workspace=str(root), repo_root=str(second), readonly=True)
+            self.assertTrue({mask for mask in tmpfs_masks(cmd) if mask.startswith((str(root) + os.sep, str(second) + os.sep))})
+            self.assertIn("没有读到完整的 git 索引", err.getvalue())
+            self.assertNotIn("已先扫完", err.getvalue())
+
+    def test_the_warning_says_when_folding_hid_a_tracked_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = checkout(tmp, files=("src/pkg/m.py",))
+            for name in ("u1", "u2", "u3", "u4"):
+                (root / "src" / "pkg" / name / "deep").mkdir(parents=True)
+            real = sandbox._collapse_unscanned_dirs
+            with clock_past_every_budget(), \
+                    patch.object(sandbox, "_collapse_unscanned_dirs", side_effect=lambda *a, **k: real(*a, max_masks=2, **k)):
+                masks, warning = self.build(root)
+            self.assertEqual({str(root / "src" / "pkg")}, {mask for mask in masks if mask.startswith(str(root) + os.sep)})
+            self.assertIn("被遮住的包括1 个含受版本管理文件的目录，在沙箱里读不到", warning)
+            self.assertIn("未扫描的目录多于 512 个，合并成上级目录遮蔽时把它们一并遮住了", warning)
+            self.assertIn("调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒）", warning)
 
     def test_a_writable_session_is_not_reordered_and_still_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:

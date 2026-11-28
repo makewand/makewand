@@ -806,9 +806,9 @@ def _collapse_unscanned_dirs(
     Normalizes and bounds a set of unscanned directory paths so each can be
     masked with a read-only tmpfs. Returns None if any unscanned directory
     contains a protected path (e.g. the workspace root itself) or cannot be
-    collapsed within max_masks. Directories in keep (those holding tracked
-    files) and at or below keep_roots (.git) are folded into one mask only
-    when no other parent is left to fold.
+    collapsed within max_masks. While another parent has two or more
+    unscanned children, directories in keep (those holding tracked files)
+    and at or below keep_roots (.git) are not folded into one mask.
     """
     if not unscanned_dirs:
         return []
@@ -826,8 +826,12 @@ def _collapse_unscanned_dirs(
             by_parent.setdefault(parent, []).append(d)
         if not by_parent:
             return None
+        # Fold first where it saves masks without hiding a kept directory: a parent with two or
+        # more unscanned children that is neither kept nor at or below a kept root. With no such
+        # parent the order is the plain one; lifting a lone directory saves nothing by itself.
         foldable = {parent: children for parent, children in by_parent.items()
-                    if parent not in keep and not any(_norm_is_within(parent, root) for root in keep_roots)} or by_parent
+                    if len(children) > 1 and parent not in keep
+                    and not any(_norm_is_within(parent, root) for root in keep_roots)} or by_parent
         for parent, children in sorted(
             foldable.items(),
             key=lambda kv: (kv[0].count(os.sep), len(kv[1]), kv[0]),
@@ -2986,16 +2990,17 @@ def wrap_bwrap(
     # directories come from the index file; no git runs here (see mount_root above).
     tracked_dirs: Set[str] = set()
     checkout_git_dirs: List[str] = []
-    index_read = False
+    indexes_read: List[bool] = []  # per checkout; the warning below speaks for all of them only when all were read
     if readonly and not broad:
         from makewand.git_helper import tracked_directories
         for checkout in dict.fromkeys(p for p in (mount_root, repo_abs if repo_needed else None) if p and p != "/"):
             if os.path.isdir(os.path.join(checkout, ".git")):
                 checkout_git_dirs.append(os.path.join(checkout, ".git"))
             names = tracked_directories(checkout)
+            indexes_read.append(names is not None)
             if names is not None:
-                index_read = True
                 tracked_dirs.update(checkout + os.sep + name for name in names)
+    index_read = bool(indexes_read) and all(indexes_read)
     git_paths, ws_sockets, truncated = _scan_tree(
         scan_roots,
         max_depth=BROAD_SCAN_DEPTH if broad else None,
@@ -3040,12 +3045,21 @@ def wrap_bwrap(
             raise_time = raise_entries if scan_timeout is None else f"调高 MAKEWAND_SANDBOX_SCAN_TIMEOUT_SECONDS（秒），条目超限时{raise_entries}"
             if hidden or history:
                 lost = ([f"{hidden} 个含受版本管理文件的目录"] if hidden else []) + ([".git 里的内容"] if history else [])
-                # These are walked without a time limit: only the entry limit or an unreadable directory stops them.
-                what = f"被遮住的包括{'和'.join(lost)}，在沙箱里读不到；这部分不计时，要看到它们，{raise_entries}或恢复目录的读取权限。"
+                # These are walked without a time limit. A mask over one of them that the scan did
+                # walk comes from folding more than MAX_UNSCANNED_DIR_MASKS unscanned directories into
+                # a parent; otherwise the entry limit or an unreadable directory stopped the walk.
+                folded = any(mask not in unscanned_dirs and mask not in masked_cache_dirs
+                             and (mask in tracked_dirs or any(_norm_is_within(mask, git_dir) for git_dir in checkout_git_dirs))
+                             for mask in masks)
+                if folded:
+                    why = f"未扫描的目录多于 {MAX_UNSCANNED_DIR_MASKS} 个，合并成上级目录遮蔽时把它们一并遮住了；要看到它们，{raise_time}，让更多目录被扫到"
+                else:
+                    why = f"这部分不计时，要看到它们，{raise_entries}或恢复目录的读取权限"
+                what = f"被遮住的包括{'和'.join(lost)}，在沙箱里读不到；{why}。"
             elif index_read:
                 what = f"受版本管理的目录和 .git 已先扫完，被遮住的都是未纳入版本管理的内容。要全部可见，{raise_time}。"
             else:
-                what = f"没有读到 git 索引，无法先扫受版本管理的目录，被遮住的可能包含源文件。要全部可见，{raise_time}。"
+                what = f"没有读到完整的 git 索引，不能保证受版本管理的目录先扫完，被遮住的可能包含源文件。要全部可见，{raise_time}。"
             _warn(f"工作区扫描未能完成（{limits}，或有不可读目录）：{len(masks)} 个未扫描的目录已由 tmpfs 遮蔽，"
                   f"在只读会话里显示为空。{what}")
     else:
