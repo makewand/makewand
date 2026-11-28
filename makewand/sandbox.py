@@ -799,16 +799,12 @@ def _collapse_unscanned_dirs(
     unscanned_dirs: Set[str],
     protected_paths: Sequence[str],
     max_masks: int = MAX_UNSCANNED_DIR_MASKS,
-    keep: Collection[str] = frozenset(),
-    keep_roots: Sequence[str] = (),
 ) -> Optional[List[str]]:
     """
     Normalizes and bounds a set of unscanned directory paths so each can be
     masked with a read-only tmpfs. Returns None if any unscanned directory
     contains a protected path (e.g. the workspace root itself) or cannot be
-    collapsed within max_masks. While another parent has two or more
-    unscanned children, directories in keep (those holding tracked files)
-    and at or below keep_roots (.git) are not folded into one mask.
+    collapsed within max_masks.
     """
     if not unscanned_dirs:
         return []
@@ -826,14 +822,8 @@ def _collapse_unscanned_dirs(
             by_parent.setdefault(parent, []).append(d)
         if not by_parent:
             return None
-        # Fold first where it saves masks without hiding a kept directory: a parent with two or
-        # more unscanned children that is neither kept nor at or below a kept root. With no such
-        # parent the order is the plain one; lifting a lone directory saves nothing by itself.
-        foldable = {parent: children for parent, children in by_parent.items()
-                    if len(children) > 1 and parent not in keep
-                    and not any(_norm_is_within(parent, root) for root in keep_roots)} or by_parent
         for parent, children in sorted(
-            foldable.items(),
+            by_parent.items(),
             key=lambda kv: (kv[0].count(os.sep), len(kv[1]), kv[0]),
             reverse=True,
         ):
@@ -3026,7 +3016,7 @@ def wrap_bwrap(
         )
     if readonly:
         workspace_tmpfs_masks = _collapse_unscanned_dirs(
-            masked_cache_dirs | unscanned_dirs, protected_ws, keep=tracked_dirs, keep_roots=checkout_git_dirs
+            masked_cache_dirs | unscanned_dirs, protected_ws
         )
         if workspace_tmpfs_masks is None:
             raise SandboxConfigError(
