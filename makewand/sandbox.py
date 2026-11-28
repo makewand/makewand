@@ -795,16 +795,82 @@ def _dedup_norm_ancestors(paths: Set[str]) -> Set[str]:
     return kept
 
 
+def _fold_untracked_branches(
+    entries: Set[str],
+    protected: Sequence[str],
+    keep: Collection[str],
+    keep_roots: Sequence[str],
+    max_masks: int,
+) -> Set[str]:
+    """
+    Folds unscanned directories (none above another) into the directory where
+    they branch apart, deepest branch first, until at most max_masks are left or
+    nothing more can be folded. A branch is folded only where two or more masks
+    become one, and only into a directory that is not in keep, not at or below
+    keep_roots and holds no protected path: the directories with tracked files
+    and .git stay visible. One sorted pass builds the tree of branch points and
+    one pass folds it, so the cost does not grow with the depth of the paths.
+    """
+    if not entries or any(not path.startswith("/") or path.startswith("//") for path in entries):
+        return set(entries)
+    # below[d]: the entries and branch points directly under branch point d (a compressed tree).
+    below: Dict[str, List[str]] = {}
+    chain = ["/"]  # the branch points above the previous entry, then that entry
+    # Component by component (a directory right before what is under it): the separator sorts first.
+    for entry in sorted(entries, key=lambda path: path.replace(os.sep, "\0")):
+        common = os.path.commonpath([chain[-1], entry])
+        while len(chain) > 1 and len(chain[-2]) >= len(common):
+            below.setdefault(chain[-2], []).append(chain.pop())
+        if chain[-1] != common:
+            below.setdefault(common, []).append(chain.pop())
+            chain.append(common)
+        chain.append(entry)
+    while len(chain) > 1:
+        below.setdefault(chain[-2], []).append(chain.pop())
+
+    count = len(entries)
+    masks: Dict[str, int] = {}  # masks left under a branch point once it was looked at
+    folded: Set[str] = set()
+    for node in sorted((d for d in below if d != "/"),
+                       key=lambda d: (d.count(os.sep), len(below[d]), d), reverse=True):
+        if count <= max_masks:
+            break
+        # A branch point has two or more entries or branch points directly under it, and a deeper
+        # branch point came earlier: `left` is what is under this one now, at least two masks.
+        left = sum(masks.get(child, 1) for child in below[node])
+        if (node not in keep
+                and not any(_norm_is_within(node, root) for root in keep_roots)
+                and not any(_norm_is_within(path, node) for path in protected)):
+            count -= left - 1
+            folded.add(node)
+            left = 1
+        masks[node] = left
+    result: Set[str] = set()
+    pending = ["/"]
+    while pending:
+        node = pending.pop()
+        if node in folded or node not in below:
+            result.add(node)
+        else:
+            pending.extend(below[node])
+    return result
+
+
 def _collapse_unscanned_dirs(
     unscanned_dirs: Set[str],
     protected_paths: Sequence[str],
     max_masks: int = MAX_UNSCANNED_DIR_MASKS,
+    keep: Collection[str] = frozenset(),
+    keep_roots: Sequence[str] = (),
 ) -> Optional[List[str]]:
     """
     Normalizes and bounds a set of unscanned directory paths so each can be
     masked with a read-only tmpfs. Returns None if any unscanned directory
     contains a protected path (e.g. the workspace root itself) or cannot be
-    collapsed within max_masks.
+    collapsed within max_masks. With keep (directories holding tracked files,
+    each with its parents) or keep_roots (.git), directories are first folded
+    where that hides neither (_fold_untracked_branches); what is still too
+    many is folded as without them.
     """
     if not unscanned_dirs:
         return []
@@ -813,6 +879,8 @@ def _collapse_unscanned_dirs(
     if any(d == "/" or any(_norm_is_within(p, d) for p in prot) for d in normed):
         return None
     kept = _dedup_norm_ancestors(normed)
+    if len(kept) > max_masks and (keep or keep_roots):
+        kept = _fold_untracked_branches(kept, prot, keep, keep_roots, max_masks)
     while len(kept) > max_masks:
         by_parent: Dict[str, List[str]] = {}
         for d in kept:
@@ -3016,7 +3084,7 @@ def wrap_bwrap(
         )
     if readonly:
         workspace_tmpfs_masks = _collapse_unscanned_dirs(
-            masked_cache_dirs | unscanned_dirs, protected_ws
+            masked_cache_dirs | unscanned_dirs, protected_ws, keep=tracked_dirs, keep_roots=checkout_git_dirs
         )
         if workspace_tmpfs_masks is None:
             raise SandboxConfigError(
