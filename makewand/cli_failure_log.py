@@ -6,7 +6,9 @@ makewand's own reason when a provider never started (``startup``) or its
 sandbox could not be built (``sandbox``). Those ended UNVERIFIED or
 SANDBOX_UNAVAILABLE within a tenth of a second with nothing kept to explain them.
 An Antigravity sign-in that failed or timed out (``auth``) keeps agy's sign-in
-lines from stderr as well: its silent-auth reason is only logged there.
+lines from stderr as well: its silent-auth reason is only logged there. A
+provider whose sandbox scope recorded a memory kill (``memory``) keeps the
+runner's explanation instead of the CLI's last lines.
 
 A provider CLI that exits nonzero without a catalogued message (quota, rate,
 auth) is recorded as UNKNOWN, and nothing kept what it printed, so a missing

@@ -33,13 +33,9 @@ def parse_muse_quota(output: str, stderr: Optional[str] = None) -> Tuple[bool, s
 def muse_model_refusal(output: str, stderr: Optional[str] = None) -> Optional[str]:
     """The model Muse Code says it does not offer to this account, from the error it ends with:
     model `<name>` does not exist or you lack access. No model ran. `stderr` as in parse_muse_quota."""
-    from makewand.health import find_cli_message
-    line = find_cli_message("muse", ("model",), output, stderr)
-    if line is None:
-        return None
-    named = re.search(r"model failed(?: after \d+ attempts)?: model `([^`]+)` does not exist or you lack access\b",
-                      line, re.IGNORECASE)
-    return named.group(1) if named else ""
+    from makewand.health import cli_model_refusal
+    refused = cli_model_refusal("muse", output, stderr)
+    return None if refused is None else refused[0]
 
 def _is_dbus_systemd_available() -> bool:
     """Checks whether user-level systemd / D-Bus session bus is functional."""
@@ -304,10 +300,12 @@ def execute_muse_task(
         use_muse_slice = bool(systemd_run) and is_guard and _is_dbus_systemd_available()
         launch_prefix = []
         if use_muse_slice:
+            from makewand.sandbox import _systemd_scope_usable, sandbox_scope_options
+            _systemd_scope_usable(systemd_run)  # learns whether the scope takes OOMPolicy=continue
             muse_mem = os.environ.get("MUSE_MEM", "16G")
             launch_prefix = [
                 systemd_run, "--user", "--scope", "--quiet",
-                "--slice=muse", "--collect",
+                "--slice=muse", "--collect", *sandbox_scope_options(),
                 "-p", f"MemoryMax={muse_mem}",
                 "-p", "MemorySwapMax=0",
                 "-p", f"TasksMax={os.environ.get('MAKEWAND_SANDBOX_TASKS_MAX', '512')}",

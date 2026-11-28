@@ -866,6 +866,28 @@ def find_cli_message(provider: str, kinds: Tuple[str, ...], output: str,
     return next(iter(find_cli_messages(provider, kinds, output, stderr).values()), None)
 
 
+# The model each CLI names in its own message that it cannot use the requested model
+# (catalog kind "model"); the line is normalized, its apostrophes plain.
+_REFUSED_MODEL_NAME = {
+    "muse": re.compile(r"model failed(?: after \d+ attempts)?: model `([^`]+)` does not exist or you lack access\b",
+                       re.IGNORECASE),
+    "grok": re.compile(r"couldn't set model '([^']+)': ", re.IGNORECASE),
+    "claude": re.compile(r"there's an issue with the selected model \(([^)]+)\)\.", re.IGNORECASE),
+}
+
+
+def cli_model_refusal(provider: str, output: str, stderr: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    """(model, line) when `provider`'s CLI printed its own message that it cannot use the
+    requested model ("" when the line names none), else None. No prompt was sent then.
+    `output` and `stderr` as in find_cli_messages."""
+    line = find_cli_message(provider, ("model",), output, stderr)
+    if line is None:
+        return None
+    pattern = _REFUSED_MODEL_NAME.get(provider)
+    named = pattern.search(line) if pattern is not None else None
+    return (named.group(1) if named else ""), line
+
+
 def cli_own_lines(provider: str, output: str, stderr: Optional[str] = None, *,
                   prompt: Optional[str] = None, warnings: bool = False) -> Iterator[str]:
     """The (normalized) lines of `provider`'s CLI that find_cli_messages reads;

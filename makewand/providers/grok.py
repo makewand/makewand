@@ -297,4 +297,13 @@ def execute_grok_task(
             return relay(f"[Makewand -> Grok] 订阅触发限制 ({reason})，无缝切换为 xAI API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Grok Build 执行中检测到限制: {reason}", "可配置 XAI_API_KEY 实现自动接力")
 
+    from makewand.health import cli_model_refusal
+    refused = cli_model_refusal("grok", out, own_lines if apart else None)
+    if refused is not None:
+        # Grok could not select the model and sent no prompt: a known failure. It also says
+        # "unknown model id" when it could not fetch its model list (both times on 10-30, Muse and
+        # Codex could not reach their model catalogs in the same minutes), so no limit is recorded.
+        name, line = refused
+        return False, None, f"Grok 没能选用型号 {name or target_model}，没有发出提示词: {line}"
+
     return model_process_failure("grok", code, combined, err, ex, readonly)

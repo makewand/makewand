@@ -211,4 +211,15 @@ def execute_claude_task(
             return relay(f"[Makewand -> Claude] 订阅触发限流 ({reason})，无缝切换为 Anthropic API Key 模式接力执行...", cwd=cwd)
         return False, None, relay.unavailable(f"Claude Code 执行中触发额度限制: {reason}", "可配置 ANTHROPIC_API_KEY 实现自动接力")
 
+    from makewand.health import cli_model_refusal
+    refused = cli_model_refusal("claude", out, err if apart else None)
+    if refused is not None:
+        # The API answered that the model does not exist or the account cannot use it, before any
+        # model ran: a known failure, recorded for that model so route lists it after the others.
+        from makewand.health import record_engine_limit
+        name = refused[0] or target_model
+        reason = f"Anthropic 不向当前账号提供型号 {name}（不存在或无权使用）"
+        record_engine_limit("claude", reason, "待重置", model=name)
+        return False, None, f"Claude Code 拒绝了这次调用: {reason}"
+
     return model_process_failure("claude", code, combined, err, ex, readonly)

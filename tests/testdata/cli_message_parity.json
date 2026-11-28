@@ -6,7 +6,7 @@
   "want (Q: a CLI's own quota or rate refusal, N: task content) and prov label the corpus a case came from (the round-2 verifier, earlier Go and Python tests, engine edge cases); they are not expectations.",
   "expect.<provider>.<modes>.<kind> is the normalized line on which health.py finds a message of that kind, for every kind of the provider's catalog entry; <modes> joins the modes with the same findings by ','. A provider or mode that is absent finds nothing."
  ],
- "catalog_sha256": "c1fd09308a5f71c524a747ec98123df6e074ca8e85606080dd4ff1d79fd993c1",
+ "catalog_sha256": "8b9ec0db97e62a8f8ae06845b656a4dfc945173c1b5fbe06420a0a11aec52bd8",
  "cases": [
   {"id":"v1-r1-C1","text":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your limit \u00b7 resets 8pm (Asia/Shanghai)"}}}},
   {"id":"v1-r1-C2","text":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)","want":"Q","expect":{"claude":{"merged,stderr,stdout":{"quota":"You've hit your session limit \u00b7 resets 3pm (Asia/Shanghai)"}}}},
@@ -796,6 +796,11 @@
   {"id":"muse-quoted-billing-402","stdout":"I investigated this diagnostic:\nagent loop failed: model failed: API error 402 [request_id=00000000-0000-4000-8000-000000000001]: Billing verification failed. Billing Issue. To use this API key, your team needs to resolve a billing issue first. To resolve this issue, go here: https://dev.meta.ai/billing/?team_id=1 (billing_error)\nThe fix is complete.","stderr":"error: turn failed","want":"N","prov":"muse"},
   {"id":"muse-other-402","text":"agent loop failed: model failed: API error 402 [request_id=00000000-0000-4000-8000-000000000001]: Payment method declined. (billing_error)","want":"N","prov":"muse"},
   {"id":"muse-model-no-access","text":"agent loop failed: model failed: model `muse-wonder-full-1.0` does not exist or you lack access [request_id=00000000-0000-4000-8000-000000000001]","prov":"muse","expect":{"muse":{"merged,stderr,stdout":{"model":"agent loop failed: model failed: model `muse-wonder-full-1.0` does not exist or you lack access [request_id=00000000-0000-4000-8000-000000000001]"}}}},
-  {"id":"muse-quoted-model-no-access","stdout":"The log says:\nagent loop failed: model failed: model `muse-wonder-full-1.0` does not exist or you lack access [request_id=00000000-0000-4000-8000-000000000001]\nNothing else failed.","stderr":"error: turn failed","want":"N","prov":"muse"}
+  {"id":"muse-quoted-model-no-access","stdout":"The log says:\nagent loop failed: model failed: model `muse-wonder-full-1.0` does not exist or you lack access [request_id=00000000-0000-4000-8000-000000000001]\nNothing else failed.","stderr":"error: turn failed","want":"N","prov":"muse"},
+  {"id":"grok-set-model-refused","stdout":"","stderr":"Couldn't set model 'grok-4.7': Invalid params: \"unknown model id\". Run 'grok models' to see available models.\nError: Couldn't set model 'grok-4.7': Invalid params: \"unknown model id\". Run 'grok models' to see available models.","prov":"grok","expect":{"grok":{"apart":{"model":"Couldn't set model 'grok-4.7': Invalid params: \"unknown model id\". Run 'grok models' to see available models."}}}},
+  {"id":"grok-quoted-set-model","stdout":"The CLI printed this once:\nCouldn't set model 'grok-4.7': Invalid params: \"unknown model id\". Run 'grok models' to see available models.\nIt was a network outage.","stderr":"","want":"N","prov":"grok"},
+  {"id":"grok-set-model-other-error","stdout":"","stderr":"Error: Couldn't set model 'grok-4.7': timed out","want":"N","prov":"grok"},
+  {"id":"claude-model-not-found","text":"There's an issue with the selected model (claude-opus-4-1). It may not exist or you may not have access to it. Run /model to pick a different model.","prov":"claude","expect":{"claude":{"merged,stderr,stdout":{"model":"There's an issue with the selected model (claude-opus-4-1). It may not exist or you may not have access to it. Run /model to pick a different model."}}}},
+  {"id":"claude-quoted-model-not-found","text":"The report quotes it: There's an issue with the selected model (claude-opus-4-1). It may not exist or you may not have access to it. Run /model to pick a different model.","want":"N","prov":"claude"}
  ]
 }

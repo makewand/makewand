@@ -112,15 +112,47 @@ def model_process_failure(engine, code, output, stderr=None, exception=None, rea
     status = status or "UNKNOWN"
     # Keep useful stderr on generic exits without treating its text as proof of
     # remote completion. Timeout/spawn evidence takes precedence over stderr.
-    error = (exception or stderr) if status in ("TIMEOUT", "FAILED") else (stderr or exception)
+    memory_kill = getattr(exception, "memory_kill", None)
+    if memory_kill:
+        # The runner knows what killed the process; what the provider printed last follows.
+        error = "\n".join(part for part in (str(exception), str(stderr or "").strip()) if part)
+    else:
+        error = (exception or stderr) if status in ("TIMEOUT", "FAILED") else (stderr or exception)
     error = error or f"{engine} returned exit code {code}"
     if status == "UNKNOWN":
         # Keep what the CLI printed, so an uncatalogued refusal can be found later.
         from makewand import cli_failure_log
-        cli_failure_log.record(engine, code, stderr)
+        if memory_kill:
+            cli_failure_log.record_message(engine, "memory", exception)
+        else:
+            cli_failure_log.record(engine, code, stderr)
     return ExecutionResult(False, output, str(error), status=status, engine=engine,
         readonly=readonly, outcome_known=status == "FAILED",
         error_kind="deadline" if status == "TIMEOUT" else "process_start" if status == "FAILED" else "process_exit")
+
+def _with_memory_kill(error, cmd, ret):
+    """The runner's error for a nonzero exit, saying so when the sandbox scope the command ran
+    in recorded a memory kill (sandbox.sandbox_scope_memory_kill). The outcome stays what it was:
+    the model may have run before the process was killed."""
+    signal_exit = ret < 0 or ret in (128 + signal.SIGKILL, 128 + signal.SIGTERM)
+    try:
+        from makewand.sandbox import sandbox_scope_memory_kill
+        found = sandbox_scope_memory_kill(cmd, attempts=3 if signal_exit else 1)
+    except Exception:  # noqa: BLE001 - a diagnosis never changes a result
+        return error
+    if not found:
+        return error
+    kind, memory = found
+    if kind == "kernel":
+        text = (f"沙箱达到内存上限（MemoryMax={memory}），内核杀掉了沙箱里的进程（systemd 日志有记录）；"
+                f"进程以退出码 {ret} 结束，模型是否已经运行不确定。要给沙箱更多内存，设 MAKEWAND_SANDBOX_MEMORY_MAX。")
+    else:
+        text = (f"主机内存紧张，systemd-oomd 杀掉了沙箱里的进程（systemd 日志有记录）；"
+                f"进程以退出码 {ret} 结束，模型是否已经运行不确定。")
+    noted = ProcessExecutionError(text, getattr(error, "execution_status", "UNKNOWN"))
+    noted.memory_kill = kind
+    return noted
+
 
 def safe_which(bin_name: str, cwd: Optional[Union[str, Path]] = None) -> Optional[str]:
     """Resolve an executable binary safely without searching cwd on Windows.
@@ -517,6 +549,8 @@ def run_subprocess(
                         close_pipe(display_proc.stdin)
                     if display_proc is None or display_proc.poll() is not None:
                         error = ProcessExecutionError(f"Command returned exit code {ret}", "UNKNOWN") if ret else None
+                        if ret:
+                            error = _with_memory_kill(error, cmd, ret)
                         return result(ret, error)
 
             for key, _ in selector.select(timeout=min(0.05, remaining)):
