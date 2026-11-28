@@ -104,32 +104,38 @@ class RecordedLimitInEngineSelectionTests(_IsolatedState):
         with official_used_up("codex"):
             self.assertIn("limited", forced_engine_refusal("codex", {"codex": limited()}))
 
-    def test_selection_keeps_the_engine_and_ranks_it_after_the_others(self):
+    def test_the_recommendation_reaches_a_recorded_limit_engine_only_through_its_fallback(self):
         from makewand.engine_selection import select_optimal_engine_pair
-        # Claude has the highest coder score and Codex the highest reviewer score.
-        coders, _, meta = select_optimal_engine_pair("实现导出功能", tier="standard", cache=self.cache(claude=limited()))
-        self.assertGreater(len(coders), 1)
-        self.assertEqual(coders[-1], "claude")
-        self.assertTrue(any("claude 有额度受限的记录" in reason for reason in meta["reasons"]), meta["reasons"])
-        coders, reviewers, _ = select_optimal_engine_pair("实现导出功能", tier="standard", cache=self.cache(codex=limited()))
-        self.assertEqual(coders[0], "claude")
-        self.assertGreater(len(reviewers), 1)
-        self.assertEqual(reviewers[-1], "codex")
+        # An engine that scores is recommended ahead of one with a record, as before.
+        coders, reviewers, _ = select_optimal_engine_pair("实现导出功能", tier="standard", cache=self.cache(claude=limited()))
+        self.assertTrue(coders)
+        self.assertNotIn("claude", coders)
+        # Nothing scores: the engines with a record are selected instead of "nothing usable".
+        coders, reviewers, meta = select_optimal_engine_pair(
+            "实现导出功能", tier="standard", cache={engine: limited() for engine in CORE})
+        self.assertTrue(coders)
+        self.assertTrue(reviewers)
+        self.assertFalse(meta.get("no_usable_engines"))
+
+    def test_a_usable_engine_that_scores_nothing_still_comes_before_a_recorded_limit(self):
+        from makewand.engine_selection import select_optimal_engine_pair
+        # Codex is healthy but paced down below zero; Claude has only a record. The fallback
+        # orders by score, so the healthy engine stays first (review round 1).
+        paced = {engine: {"routing_boost": 0.0} for engine in CORE}
+        paced["codex"] = {"routing_boost": -5.0, "pacing_state": "over_burned", "reason": "fixture"}
+        cache = {"codex": entry(), "claude": limited()}
+        with patch("makewand.config.get_active_providers", return_value=["codex", "claude"]), \
+                patch("makewand.pacing.get_all_providers_pacing", return_value=paced):
+            coders, _, _ = select_optimal_engine_pair("实现导出功能", tier="standard", cache=cache)
+        self.assertEqual(coders, ["codex", "claude"])
 
     def test_selection_drops_an_engine_the_official_reading_shows_used_up(self):
         from makewand.engine_selection import select_optimal_engine_pair
-        with official_used_up("codex"):
-            coders, reviewers, _ = select_optimal_engine_pair("实现导出功能", tier="standard",
-                                                              cache=self.cache(codex=limited()))
-        self.assertNotIn("codex", coders)
-        self.assertNotIn("codex", reviewers)
-
-    def test_every_engine_with_a_recorded_limit_still_yields_a_selection(self):
-        from makewand.engine_selection import select_optimal_engine_pair
-        coders, _, meta = select_optimal_engine_pair(
-            "实现导出功能", tier="standard", cache={engine: limited() for engine in CORE})
-        self.assertTrue(coders)
-        self.assertFalse(meta.get("no_usable_engines"))
+        with official_used_up(*CORE):
+            coders, reviewers, meta = select_optimal_engine_pair(
+                "实现导出功能", tier="standard", cache={engine: limited() for engine in CORE})
+        self.assertEqual((coders, reviewers), ([], []))
+        self.assertTrue(meta.get("no_usable_engines"))
 
     def test_pacing_is_neutral_for_a_record_and_hard_for_an_official_reading(self):
         verdict = calculate_dynamic_pacing("claude", limited(resets_at="tomorrow"))
@@ -172,6 +178,12 @@ class RecordedLimitInReviewLadderTests(_IsolatedState):
             code, calls = self.run_review({"codex": limited(), "agy": limited()})
         self.assertEqual(code, orch.EXIT_PASSED)
         self.assertEqual(calls, {"codex": 0, "grok": 0, "agy": 1})
+
+    def test_a_record_cleared_by_a_redeemed_reset_does_not_move_codex_back(self):
+        with patch("makewand.model_quota.limit_cleared_by_reset", side_effect=lambda provider, info: provider == "codex"):
+            code, calls = self.run_review({"codex": limited(), "agy": entry()})
+        self.assertEqual(code, orch.EXIT_PASSED)
+        self.assertEqual(calls, {"codex": 1, "grok": 0, "agy": 0})
 
     def test_a_forced_reviewer_with_a_recorded_limit_runs(self):
         code, calls = self.run_review({"codex": limited(), "agy": entry()}, engine="codex")
