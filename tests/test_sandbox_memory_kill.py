@@ -234,6 +234,42 @@ class PreflightScopeTests(unittest.TestCase):
         self.assertNotEqual(names(launched), names(seen[0]))
 
 
+class PreflightScopeWithOwnPrefixTests(unittest.TestCase):
+    def test_a_launch_with_its_own_systemd_run_prefix_and_its_probe_use_two_names(self):
+        # Muse's guarded launch brings its own `systemd-run --slice=muse` prefix (command_prefix,
+        # apply_limits=False); its probe goes through the same preflight, sandboxed or not.
+        import contextlib
+        own = ["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--slice=muse", "--collect",
+               "--unit=makewand-sandbox-fedcba9876543210", "-p", "MemoryMax=16G", "--"]
+        for sandboxed in (True, False):
+            seen = []
+
+            def run(cmd, **_kwargs):
+                seen.append(list(cmd))
+                return 0, "", "", None
+
+            def fake_bwrap(cmd, **kwargs):
+                fd = kwargs.get("seccomp_fd")
+                return ["/usr/bin/bwrap", *(["--seccomp", str(fd)] if fd is not None else []), "--", *cmd]
+
+            with self.subTest(sandboxed=sandboxed), \
+                    patch("makewand.sandbox._trusted_system_binary", side_effect=binaries("systemd-run", "python3")), \
+                    patch("makewand.sandbox.seccomp_filter_context", side_effect=lambda **_k: contextlib.nullcontext((97, ()))), \
+                    patch("makewand.sandbox.wrap_bwrap", side_effect=fake_bwrap), \
+                    patch("makewand.sandbox.is_bwrap_available", return_value=sandboxed), \
+                    patch("makewand.sandbox.resolve_unsafe_host_exec", return_value=(True, "config-ack")), \
+                    patch("makewand.sandbox.audit_unsafe_host_exec"), \
+                    patch("makewand.sandbox.run_subprocess", side_effect=run):
+                with sandbox.provider_sandbox_launch("muse", ["muse", "exec", "x"], "/tmp", readonly=True,
+                                                     apply_limits=False, command_prefix=own) as launch:
+                    launched = list(launch.cmd)
+                names = lambda cmd: [arg for arg in cmd if str(arg).startswith("--unit=makewand-sandbox-")]
+                self.assertEqual(["--unit=makewand-sandbox-fedcba9876543210"], names(launched))
+                self.assertTrue(seen, "the socket probe ran")
+                self.assertEqual(1, len(names(seen[0])))
+                self.assertNotEqual(names(launched), names(seen[0]))
+
+
 class RunnerTests(unittest.TestCase):
     """run_subprocess asks for a diagnosis on a nonzero exit, harder on a signal exit."""
 
